@@ -14,6 +14,11 @@ endif()
 
 # Options
 
+# Import KOS_BASE from environment if not already provided
+if(DEFINED ENV{KOS_BASE} AND NOT DEFINED KOS_BASE)
+  set(KOS_BASE $ENV{KOS_BASE})
+endif()
+
 option(USE_SDL "Use NSDLDrv instead of WinDrv" ON)
 option(LOW_MEMORY "Conserve memory as much as possible" OFF)
 option(BUILD_UNREAL "Build the launcher" ON)
@@ -22,6 +27,7 @@ option(BUILD_SOFTDRV "Build SoftDrv (x86/MSVC only)" OFF)
 option(BUILD_NOPENGLDRV "Build NOpenGLDrv" OFF)
 option(BUILD_NOPENGLESDRV "Build NOpenGLESDrv" ON)
 option(BUILD_GLDCDRV "Build GLDCDrv (Dreamcast only)" OFF)
+option(BUILD_PVRDRV "Build PVRDrv (Dreamcast only)" OFF)
 option(BUILD_NULLSOUNDDRV "Build SoundDrv (Null driver)" ON)
 option(BUILD_NOPENALDRV "Build NOpenALDrv" ON)
 option(BUILD_WINDRV "Build WinDrv" OFF)
@@ -32,6 +38,13 @@ option(BUILD_STATIC "Link everything into a single binary" OFF)
 option(DREAMCAST_USE_FATFS "Try to load data from SD or IDE" OFF)
 option(DREAMCAST_USE_FILE_POOL "Use file handle pool (wrap stdio)" ON)
 option(DREAMCAST_NO_WHOLE_ARCHIVE "Use a hack to link only actually used code instead of using -whole-archive." OFF)
+option(DREAMCAST_BUILD_CDI "Create CDI image after building (uses mkdcdisc)" OFF)
+
+set(DREAMCAST_GAME_DATA "${CMAKE_SOURCE_DIR}/../gamedata" CACHE PATH "Path to Unreal game data root (contains System, Maps, etc)")
+set(DREAMCAST_IP_BIN "${CMAKE_SOURCE_DIR}/../gamedata/IP.BIN" CACHE FILEPATH "Path to IP.BIN for Dreamcast disc")
+set(DREAMCAST_CDI_OUTPUT "${CMAKE_SOURCE_DIR}/../unreal.cdi" CACHE FILEPATH "Output CDI image path")
+set(DREAMCAST_IP_TXT "${CMAKE_SOURCE_DIR}/ip.txt" CACHE FILEPATH "Path to ip.txt template for makeip")
+set(DREAMCAST_ELF_FILE "${CMAKE_BINARY_DIR}/${CMAKE_BUILD_TYPE}/Unreal.elf" CACHE FILEPATH "Path to Unreal ELF used for mkdcdisc")
 
 if(PLATFORM_DREAMCAST)
   set(BUILD_STATIC ON)
@@ -39,7 +52,8 @@ if(PLATFORM_DREAMCAST)
   set(LOW_MEMORY ON)
   set(BUILD_NOPENALDRV OFF)
   set(BUILD_NOPENGLESDRV OFF)
-  set(BUILD_GLDCDRV ON)
+  set(BUILD_GLDCDRV OFF)
+  set(BUILD_PVRDRV ON)
 endif()
 
 if(BUILD_STATIC)
@@ -195,7 +209,11 @@ else()
   elseif(NOT TARGET_IS_DREAMCAST)
     add_definitions(-DPLATFORM_CASE_SENSITIVE_FS)
   endif()
-  set(CMAKE_EXECUTABLE_SUFFIX ".bin")
+  if(TARGET_IS_DREAMCAST)
+    set(CMAKE_EXECUTABLE_SUFFIX ".elf")
+  else()
+    set(CMAKE_EXECUTABLE_SUFFIX ".bin")
+  endif()
 endif()
 
 if(USE_SDL)
@@ -327,9 +345,9 @@ if(BUILD_NOPENGLDRV)
   list(APPEND INSTALL_TARGETS NOpenGLDrv)
 endif()
 
-if(BUILD_GLDCDRV)
-  add_subdirectory(GLDCDrv)
-  list(APPEND INSTALL_TARGETS GLDCDrv)
+if(BUILD_PVRDRV)
+  add_subdirectory(PVRDrv)
+  list(APPEND INSTALL_TARGETS PVRDrv)
 endif()
 
 if(BUILD_NOPENGLESDRV)
@@ -376,3 +394,51 @@ foreach(TGT ${INSTALL_TARGETS})
 endforeach()
 
 install(FILES ${INSTALL_FILES} DESTINATION "${CMAKE_BINARY_DIR}/${CMAKE_BUILD_TYPE}")
+
+# Dreamcast CDI image generation
+if(TARGET_IS_DREAMCAST AND DREAMCAST_BUILD_CDI)
+  find_program(MKDCDISC mkdcdisc)
+  if(NOT MKDCDISC)
+    message(FATAL_ERROR "mkdcdisc not found in PATH but DREAMCAST_BUILD_CDI=ON")
+  endif()
+  if(NOT DREAMCAST_GAME_DATA OR NOT EXISTS "${DREAMCAST_GAME_DATA}")
+    message(FATAL_ERROR "DREAMCAST_GAME_DATA must point to the Unreal data directory when DREAMCAST_BUILD_CDI=ON")
+  endif()
+  if(NOT DREAMCAST_IP_TXT OR NOT EXISTS "${DREAMCAST_IP_TXT}")
+    message(FATAL_ERROR "DREAMCAST_IP_TXT must point to ip.txt when DREAMCAST_BUILD_CDI=ON")
+  endif()
+  if(NOT DREAMCAST_IP_BIN)
+    message(FATAL_ERROR "DREAMCAST_IP_BIN must not be empty when DREAMCAST_BUILD_CDI=ON")
+  endif()
+
+  if(NOT KOS_BASE)
+    message(FATAL_ERROR "KOS_BASE is not set; required to locate makeip")
+  endif()
+  set(MAKEIP_EXE "${KOS_BASE}/utils/makeip/makeip")
+  if(NOT EXISTS "${MAKEIP_EXE}")
+    message(FATAL_ERROR "makeip not found at ${MAKEIP_EXE}")
+  endif()
+
+  get_filename_component(DREAMCAST_IP_BIN_DIR "${DREAMCAST_IP_BIN}" DIRECTORY)
+
+  add_custom_command(OUTPUT "${DREAMCAST_IP_BIN}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${DREAMCAST_IP_BIN_DIR}"
+    COMMAND ${CMAKE_COMMAND} -E rm -f "${DREAMCAST_IP_BIN}"
+    COMMAND ${MAKEIP_EXE} "${DREAMCAST_IP_TXT}" "${DREAMCAST_IP_BIN}"
+    DEPENDS "${DREAMCAST_IP_TXT}"
+    COMMENT "Generating IP.BIN..."
+    VERBATIM
+  )
+
+  add_custom_target(ip_bin ALL
+    DEPENDS "${DREAMCAST_IP_BIN}"
+  )
+
+  add_custom_target(cdi
+    COMMAND ${CMAKE_COMMAND} -E echo "Creating CDI image..."
+    COMMAND ${MKDCDISC} -e "${DREAMCAST_ELF_FILE}" -D "${DREAMCAST_GAME_DATA}" -p "${DREAMCAST_IP_BIN}" -N -o "${DREAMCAST_CDI_OUTPUT}"
+    DEPENDS Unreal ip_bin
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    VERBATIM
+  )
+endif()
