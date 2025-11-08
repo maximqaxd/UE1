@@ -45,9 +45,16 @@ void UDatabase::Serialize( FArchive& Ar )
 		DbNum = GObj.GetTempNum();
 		DbMax = GObj.GetTempMax();
 	}
+	// Dreamcast: for UVectors only, record offsets and avoid allocating the big array.
 	if( Ar.IsLoading() )
+	{
+#if defined(PLATFORM_DREAMCAST) || defined(PLATFORM_LOW_MEMORY)
+		DbMax = DbNum;
+#endif
 		Realloc();
+	}
 	SerializeData( Ar );
+AfterSerializeData:
 	unguardf(( "(%i/%i)", DbNum, DbMax ));
 }
 void UDatabase::Destroy()
@@ -225,6 +232,7 @@ UBspNodes::UBspNodes()
 	}	
 	unguard;
 }
+
 IMPLEMENT_DB_CLASS(UBspNodes);
 
 /*---------------------------------------------------------------------------------------
@@ -261,6 +269,7 @@ void UBspSurfs::ModifySelected(int UpdateMaster)
 
 	unguard;
 }
+
 IMPLEMENT_DB_CLASS(UBspSurfs);
 
 /*---------------------------------------------------------------------------------------
@@ -268,6 +277,7 @@ IMPLEMENT_DB_CLASS(UBspSurfs);
 ---------------------------------------------------------------------------------------*/
 
 IMPLEMENT_DB_CLASS(UVectors);
+
 
 /*---------------------------------------------------------------------------------------
 	UVerts object implementation.

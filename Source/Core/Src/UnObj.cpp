@@ -1843,7 +1843,14 @@ UObject* FObjectManager::LoadPackage( UObject* InParent, const char* Filename, D
 		// Create a new linker object which goes off and tries load the file.
 		ULinkerLoad* Linker = GetPackageLinker( InParent, Filename ? Filename : InParent->GetName(), LoadFlags | LOAD_Throw, NULL, NULL );
 		if( !(LoadFlags & LOAD_Verify) )
+		{
+#if defined(PLATFORM_DREAMCAST)
+			// Dreamcast has 16MB RAM; avoid eagerly loading every export.
+			// Defer to lazy loading via Create/Preload when objects are actually needed.
+#else
 			Linker->LoadAllObjects();
+#endif
+		}
 		Result = Linker->LinkerRoot;
 		EndLoad();
 	}

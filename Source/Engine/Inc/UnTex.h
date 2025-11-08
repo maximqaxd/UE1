@@ -6,6 +6,9 @@
 		* Created by Tim Sweeney
 =============================================================================*/
 
+#include "UnLinker.h"
+
+
 /*-----------------------------------------------------------------------------
 	Constants.
 -----------------------------------------------------------------------------*/
@@ -182,6 +185,11 @@ struct ENGINE_API FMipmap
 	INT				USize,  VSize;	// Power of two tile dimensions.
 	BYTE			UBits,  VBits;	// Power of two tile bits.
 	TArray<BYTE>	DataArray;		// Data.
+#if defined(PLATFORM_DREAMCAST)
+	// Dreamcast: lazy streaming support (do not keep texture bytes in RAM)
+	INT             DCDataOffset;   // Byte offset in package file to mip data start
+	INT             DCDataSize;     // Size in bytes of mip data
+#endif
 	FMipmap()
 	{}
 	FMipmap( BYTE InUBits, BYTE InVBits )
@@ -197,9 +205,34 @@ struct ENGINE_API FMipmap
 	friend FArchive& operator<<( FArchive& Ar, FMipmap& M )
 	{
 		guard(FMipmap<<);
-		return Ar << M.DataArray << M.USize << M.VSize << M.UBits << M.VBits;
+#if defined(PLATFORM_DREAMCAST)
 		if( Ar.IsLoading() )
+		{
+			// Manually deserialize the data blob length (compact index) to capture its file offset, then skip the bytes.
+			INT Count = 0;
+			Ar << AR_INDEX(Count);
+			M.DCDataSize = Count;
+			if( Count > 0 )
+			{
+				// Unsafe cast by design in UE1: Ar is a file archive during package load.
+				FArchiveFileLoad* FL = (FArchiveFileLoad*)&Ar;
+				M.DCDataOffset = FL->Tell();
+				FL->Seek( FL->Tell() + Count );
+			}
+			else
+			{
+				M.DCDataOffset = 0;
+			}
+			Ar << M.USize << M.VSize << M.UBits << M.VBits;
+			M.DataArray.Empty();
 			M.DataPtr = NULL;
+			return Ar;
+		}
+#endif
+		Ar << M.DataArray << M.USize << M.VSize << M.UBits << M.VBits;
+		if( Ar.IsLoading() )
+			M.DataPtr = ( M.DataArray.Num() ? &M.DataArray(0) : NULL );
+		return Ar;
 		unguard;
 	}
 };
