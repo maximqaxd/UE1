@@ -18,6 +18,10 @@ target_include_directories(${PROJECT_NAME}
 
 target_link_libraries(${PROJECT_NAME} Engine Core)
 
+if(TARGET_IS_DREAMCAST)
+  target_link_libraries(${PROJECT_NAME} pthread)
+endif()
+
 if(TARGET_IS_WINDOWS)
   target_link_libraries(${PROJECT_NAME} ws2_32)
 endif()
