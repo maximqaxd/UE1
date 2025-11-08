@@ -98,7 +98,7 @@ void UTexture::GetInfo( FTextureInfo& TextureInfo, DOUBLE CurrentTime )
 	TextureInfo.Palette			= GetColors();
 	for( INT i=0; i<Mips.Num(); i++ )
 	{
-		Mips(i).DataPtr     = &Mips(i).DataArray(0);
+		Mips(i).DataPtr     = ( Mips(i).DataArray.Num() ? &Mips(i).DataArray(0) : NULL );
 		TextureInfo.Mips[i] = &Mips(i);
 	}
 	TextureInfo.Texture = this;

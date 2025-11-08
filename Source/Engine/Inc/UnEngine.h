@@ -58,6 +58,11 @@ class ENGINE_API UEngine : public USubsystem
 	virtual int edcamMode( UViewport* Viewport ) {return 0;}
 };
 
+#if defined(PLATFORM_DREAMCAST)
+// Dreamcast profiling: dump memory statistics
+ENGINE_API void DumpMemStatsDC( const char* Tag );
+#endif
+
 /*-----------------------------------------------------------------------------
 	The End.
 -----------------------------------------------------------------------------*/

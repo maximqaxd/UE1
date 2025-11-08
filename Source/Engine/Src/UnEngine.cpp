@@ -178,6 +178,80 @@ void UEngine::Serialize( FArchive& Ar )
 	unguardobj;
 }
 
+#if defined (PLATFORM_DREAMCAST)
+// ----------------------------------------------------------------------------
+// Dreamcast memory stats dump
+// ----------------------------------------------------------------------------
+extern "C" DWORD PVR_GetVRAMUsed();
+void DumpMemStatsDC( const char* Tag )
+{
+	guard(DumpMemStatsDC);
+	// Model arrays
+	DWORD SizeVectors=0, SizePoints=0, SizeNodes=0, SizeSurfs=0, SizeVerts=0;
+	ULevel* Level = NULL;
+	for( FObjectIterator ItLvl; ItLvl; ++ItLvl )
+	{
+		if( ItLvl->IsA( ULevel::StaticClass ) )
+		{
+			Level = (ULevel*)(UObject*)*ItLvl;
+			break;
+		}
+	}
+	if( Level && Level->Model )
+	{
+		if( Level->Model->Vectors ) SizeVectors = (DWORD)( Level->Model->Vectors->Num() * Level->Model->Vectors->GetClass()->ClassRecordSize );
+		if( Level->Model->Points  ) SizePoints  = (DWORD)( Level->Model->Points ->Num() * Level->Model->Points ->GetClass()->ClassRecordSize );
+		if( Level->Model->Nodes   ) SizeNodes   = (DWORD)( Level->Model->Nodes  ->Num() * Level->Model->Nodes  ->GetClass()->ClassRecordSize );
+		if( Level->Model->Surfs   ) SizeSurfs   = (DWORD)( Level->Model->Surfs  ->Num() * Level->Model->Surfs  ->GetClass()->ClassRecordSize );
+		if( Level->Model->Verts   ) SizeVerts   = (DWORD)( Level->Model->Verts  ->Num() * Level->Model->Verts  ->GetClass()->ClassRecordSize );
+	}
+
+	// Texture counts and CPU-resident bytes
+	INT TexCount = 0;
+	DWORD TexCPUBytes = 0;
+	for( FObjectIterator It; It; ++It )
+	{
+		if( It->IsA( UTexture::StaticClass ) )
+		{
+			UTexture* T = (UTexture*)(UObject*)*It;
+			for( INT i=0; i<T->Mips.Num(); ++i )
+				TexCPUBytes += (DWORD)T->Mips(i).DataArray.Num();
+			++TexCount;
+		}
+	}
+
+	// VRAM used 
+	DWORD TexVRAMBytes = PVR_GetVRAMUsed();
+
+	// Audio on/off: check if any audio subsystem exists
+	UBOOL bAudio = 0;
+	for( FObjectIterator ItAud; ItAud; ++ItAud )
+	{
+		if( ItAud->IsA( UAudioSubsystem::StaticClass ) )
+		{
+			bAudio = 1;
+			break;
+		}
+	}
+
+	// Collision hash presence
+	const UBOOL bCollision = (Level && Level->Hash)!=NULL;
+
+	// Cache stats
+	char CacheLine[256]="";
+	GCache.Status( CacheLine );
+
+	debugf( NAME_Log, "MemStats [%s]: Model Vectors=%u, Points=%u, Nodes=%u, Surfs=%u, Verts=%u",
+		Tag ? Tag : "", (unsigned)SizeVectors, (unsigned)SizePoints, (unsigned)SizeNodes, (unsigned)SizeSurfs, (unsigned)SizeVerts );
+	debugf( NAME_Log, "MemStats [%s]: Textures count=%d, CPU bytes=%u, VRAM est=%u",
+		Tag ? Tag : "", TexCount, (unsigned)TexCPUBytes, (unsigned)TexVRAMBytes );
+	debugf( NAME_Log, "MemStats [%s]: Audio=%s, CollisionHash=%s",
+		Tag ? Tag : "", bAudio ? "On" : "Off", bCollision ? "Present" : "None" );
+	debugf( NAME_Log, "MemStats [%s]: Cache: %s", Tag ? Tag : "", CacheLine );
+
+	unguard;
+}
+#endif
 /*-----------------------------------------------------------------------------
 	Input.
 -----------------------------------------------------------------------------*/
