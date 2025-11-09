@@ -432,9 +432,6 @@ class ULinkerLoad : public ULinker, public FArchiveFileLoad
 	// Variables.
 	DWORD LoadFlags;
 	INT FileSize;
-#if defined(PLATFORM_DREAMCAST)
-	TArray<UBOOL> DCSkipImport; // mark imports (top-level packages) to skip (e.g., audio)
-#endif
 
 	// Constructor; all errors here throw exceptions which are fully recoverable.
 	ULinkerLoad( UObject* InParent, const char* InFilename, DWORD InLoadFlags )
@@ -535,26 +532,6 @@ class ULinkerLoad : public ULinker, public FArchiveFileLoad
 		}
 		unguard;
 
-#if defined(PLATFORM_DREAMCAST)
-		// Precompute which imports correspond to audio packages (top-level) to avoid opening them.
-		if( ImportMap.Num() )
-		{
-			DCSkipImport.AddZeroed( ImportMap.Num() );
-			for( INT ii=0; ii<ImportMap.Num(); ++ii )
-			{
-				const FObjectImport& Imp = ImportMap(ii);
-				if( Imp.ClassName==NAME_Sound )
-				{
-					INT k = ii;
-					while( ImportMap(k).PackageIndex < 0 )
-						k = -ImportMap(k).PackageIndex - 1;
-					// 'k' should be the top-level package import (ClassName==NAME_Package)
-					if( k>=0 && k<ImportMap.Num() )
-						DCSkipImport(k) = 1;
-				}
-			}
-		}
-#endif
 
 		// Load export map.
 		guard(LoadExportMap);
@@ -626,24 +603,6 @@ class ULinkerLoad : public ULinker, public FArchiveFileLoad
 	{
 		guard(ULinkerLoad::VerifyImport);
 		FObjectImport& Import = ImportMap(i);
-#if defined(PLATFORM_DREAMCAST)
-		if( DCSkipImport.Num() )
-		{
-			INT top = i;
-			while( ImportMap(top).PackageIndex < 0 )
-				top = -ImportMap(top).PackageIndex - 1;
-			if( DCSkipImport(top) )
-				return; // skip whole package tree (prevents parent SourceLinker asserts)
-		}
-#endif
-#if defined(PLATFORM_DREAMCAST)
-		// On Dreamcast, avoid attempting to open audio packages when assets are removed.
-		// Do this EARLY to prevent GetPackageLinker() calls for Sound/Music classes.
-		if( Import.ClassName==NAME_Sound )
-		{
-			return; // leave Import unmapped; USound/UMusic are CLASS_SafeReplace
-		}
-#endif
 		if( Import.SourceIndex != -1 )
 		{
 			// Already verified.
