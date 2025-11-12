@@ -12,6 +12,8 @@
 #include <assert.h>
 #include <string.h>
 #include <stdarg.h>
+#include <kos/thread.h>
+#define MAIN_STACK_SIZE (32 * 1024)  
 #ifdef DREAMCAST_USE_FATFS
 extern "C" {
 #include <fatfs.h>
@@ -42,6 +44,18 @@ FExecHook GLocalHook;
 DLL_EXPORT FExec* GThisExecHook = &GLocalHook;
 
 #ifdef PLATFORM_DREAMCAST
+// fix thread stack underrun
+static void init_thread_stack(void) {
+    kthread_t *current = thd_get_current();
+    if (current) {
+        void *new_stack = malloc(MAIN_STACK_SIZE);
+        if (new_stack) {
+            current->stack = new_stack;
+            current->stack_size = MAIN_STACK_SIZE;
+            current->flags |= THD_OWNS_STACK;
+        }
+    }
+}
 
 // What dbgio device was active at startup
 DLL_EXPORT const char* GStartupDbgDev = nullptr;
@@ -234,6 +248,8 @@ int main( int argc, const char** argv )
 #endif
 
 #ifdef PLATFORM_DREAMCAST
+	// fix thread stack underrun
+	init_thread_stack();
 	// Redirect dbgio to the framebuffer if we're not already using dcload.
 	GStartupDbgDev = dbgio_dev_get();
 	if( !GStartupDbgDev || !appStrstr( GStartupDbgDev, "dcl" ) )
