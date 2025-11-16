@@ -27,8 +27,7 @@ void UDatabase::Empty()
 void UDatabase::Shrink()
 {
 	guard(UObject::Shrink);
-	DbMax = DbNum;
-	Realloc();
+	SetMax( DbNum );
 	unguardobj;
 }
 void UDatabase::Serialize( FArchive& Ar )
@@ -76,7 +75,12 @@ INT UDatabase::Add( INT NumToAdd )
 	if( DbNum + NumToAdd > DbMax )
 	{
 		// Reallocate.
+#if defined(PLATFORM_DREAMCAST)
+		// Very conservative growth for Dreamcast to reduce memory waste and OOM risk
+		DbMax += NumToAdd + 16 + (DbNum/16);  // Reduced further: minimal growth
+#else
 		DbMax += NumToAdd + 256 + (DbNum/4);
+#endif
 		Realloc();
 	}
 	DbNum += NumToAdd;

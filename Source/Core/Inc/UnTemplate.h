@@ -190,8 +190,8 @@ public:
 		if( (ArrayNum+=n)>ArrayMax )
 		{
 #ifdef PLATFORM_DREAMCAST
-			// More conservative growth for Dreamcast to reduce memory waste
-			ArrayMax = ArrayNum + (ArrayNum/8) + 16;  // Reduced from ArrayNum/4 + 32
+			// Very conservative growth for Dreamcast to reduce memory waste and OOM risk
+			ArrayMax = ArrayNum + (ArrayNum/16) + 8;  // Reduced further: minimal growth
 #else
 			ArrayMax = ArrayNum + ArrayNum/4 + 32;
 #endif
