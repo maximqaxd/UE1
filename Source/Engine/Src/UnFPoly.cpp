@@ -278,7 +278,11 @@ int FPoly::SplitWithNode
 {
 	guard(FPoly::SplitWithNode);
 	const FBspNode &Node = Model->Nodes->Element(iNode       );
+#ifdef PLATFORM_DREAMCAST
+	const FBspSurf &Surf = Model->Surfs->Element((INT)Node.iSurf  );
+#else
 	const FBspSurf &Surf = Model->Surfs->Element(Node.iSurf  );
+#endif
 
 	return SplitWithPlane
 	(

@@ -305,7 +305,9 @@ void UModel::Serialize( FArchive& Ar )
 	UPrimitive::Serialize( Ar );
 
 	Ar << Vectors << Points << Nodes << Surfs << Verts << Polys;
-	Ar << LightMap << LightBits;
+	Ar << LightMap;
+	Ar << LightBits;
+	
 	Ar << Bounds;
 	Ar << LeafHulls << Leaves << Lights << LeafZone << LeafLeaf;
 	if( Ar.Ver() <= 41 ) //oldver

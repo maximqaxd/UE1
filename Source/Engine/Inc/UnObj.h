@@ -234,6 +234,95 @@ struct ENGINE_API FPointRegion
 // is an index to a coplanar polygon in the Bsp.  All polygons that are iPlane
 // children can only have iPlane children themselves, not fronts or backs.
 //
+#if defined (PLATFORM_DREAMCAST)
+class FBspNode // 64 bytes
+{
+public:
+	enum {MAX_NODE_VERTICES=16};	// Max vertices in a Bsp node, pre clipping
+	enum {MAX_FINAL_VERTICES=24};	// Max vertices in a Bsp node, post clipping
+	enum {MANY_CHILDREN=8};			// A Bsp Node with this many children is occlusion-rejected carefully
+
+	// Persistent information.
+	FPlane			Plane;			// 16 Plane the node falls into (X, Y, Z, W).
+	QWORD			ZoneMask;		// 8  Bit mask for all zones at or below this node (up to 64).
+	INT				iVertPool;		// 4  Index of first vertex in vertex pool, =iTerrain if NumVertices==0 and NF_TerrainFront.
+	SWORD			iSurf;			// 2  Index to surface information.
+	union
+	{
+		struct
+		{
+			SWORD	iBack;			// 2  Index to node in front (in direction of Normal).
+			SWORD	iFront;			// 2  Index to node in back  (opposite direction as Normal).
+			SWORD	iPlane;			// 2  Index to next coplanar poly in coplanar list.
+		};
+		struct
+		{
+			SWORD	iChild[3];		// 6  Index representation of children.
+		};
+	};
+	SWORD				iCollisionBound;// 2  Collision bound.
+	SWORD				iRenderBound;	// 2  Rendering bound.
+	BYTE			iZone[2];		// 2  Visibility zone in 1=front, 0=back.
+	BYTE			NumVertices;	// 1  Number of vertices in node.
+	BYTE			NodeFlags;		// 1  Node flags.
+
+	// Valid in memory only.
+	SWORD				iLeaf[2];		// 4  Leaf in back and front, INDEX_NONE=not a leaf.
+
+	// Functions.
+	UBOOL IsCsg( DWORD ExtraFlags=0 ) const
+	{
+		return (NumVertices>0) && !(NodeFlags & (NF_IsNew | NF_NotCsg | ExtraFlags));
+	}
+	UBOOL ChildOutside( INT iChild, UBOOL Outside, DWORD ExtraFlags=0 ) const
+	{
+		return iChild ? (Outside || IsCsg(ExtraFlags)) : (Outside && !IsCsg(ExtraFlags));
+	}
+	friend FArchive& operator<<( FArchive& Ar, FBspNode& N )
+	{
+		guard(FBspNode<<);
+		Ar << N.Plane << N.ZoneMask << N.NodeFlags << AR_INDEX(N.iVertPool);
+		INT iSurf = 0, iChild0 = 0, iChild1 = 0, iChild2 = 0, iCollisionBound = 0, iRenderBound = 0;
+		if( Ar.IsSaving() )
+		{
+			iSurf = (INT)N.iSurf;
+			iChild0 = (INT)N.iChild[0];
+			iChild1 = (INT)N.iChild[1];
+			iChild2 = (INT)N.iChild[2];
+			iCollisionBound = (INT)N.iCollisionBound;
+			iRenderBound = (INT)N.iRenderBound;
+		}
+		Ar << AR_INDEX(iSurf) << AR_INDEX(iChild0) << AR_INDEX(iChild1) << AR_INDEX(iChild2);
+		Ar << AR_INDEX(iCollisionBound) << AR_INDEX(iRenderBound);
+		if( Ar.IsLoading() )
+		{
+			N.iSurf = (SWORD)iSurf;
+			N.iChild[0] = (SWORD)iChild0;
+			N.iChild[1] = (SWORD)iChild1;
+			N.iChild[2] = (SWORD)iChild2;
+			N.iCollisionBound = (SWORD)iCollisionBound;
+			N.iRenderBound = (SWORD)iRenderBound;
+		}
+		Ar << N.iZone[0] << N.iZone[1];
+		Ar << N.NumVertices;
+		// iLeaf was serialized directly as INT in original, now SWORD - convert to INT for serialization
+		INT iLeaf0 = 0, iLeaf1 = 0;
+		if( Ar.IsSaving() )
+		{
+			iLeaf0 = (INT)N.iLeaf[0];
+			iLeaf1 = (INT)N.iLeaf[1];
+		}
+		Ar << iLeaf0 << iLeaf1;
+		if( Ar.IsLoading() )
+		{
+			N.iLeaf[0] = (SWORD)iLeaf0;
+			N.iLeaf[1] = (SWORD)iLeaf1;
+		}
+		return Ar;
+		unguard;
+	}
+};
+#else
 class FBspNode // 64 bytes
 {
 public:
@@ -290,7 +379,7 @@ public:
 		unguard;
 	}
 };
-
+#endif
 //
 // Properties of a zone.
 //

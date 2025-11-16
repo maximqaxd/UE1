@@ -189,7 +189,12 @@ public:
 		INT Index=ArrayNum;
 		if( (ArrayNum+=n)>ArrayMax )
 		{
+#ifdef PLATFORM_DREAMCAST
+			// More conservative growth for Dreamcast to reduce memory waste
+			ArrayMax = ArrayNum + (ArrayNum/8) + 16;  // Reduced from ArrayNum/4 + 32
+#else
 			ArrayMax = ArrayNum + ArrayNum/4 + 32;
+#endif
 			Realloc( sizeof(T) );
 		}
 		return Index;

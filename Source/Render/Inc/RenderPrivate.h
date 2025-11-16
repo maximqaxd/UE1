@@ -502,8 +502,13 @@ class RENDER_API URender : public URenderBase
 	UBOOL Extra8Stats;
 
 	// OccludeBsp dynamics.
+#ifdef PLATFORM_DREAMCAST
+	enum {MAX_NODES  = 32768};
+	enum {MAX_POINTS = 64000};
+#else
 	enum {MAX_NODES  = 65536};
 	enum {MAX_POINTS = 128000};
+#endif
 	static struct FDynamicsCache
 	{
 		FDynamicItem* Dynamics[2];

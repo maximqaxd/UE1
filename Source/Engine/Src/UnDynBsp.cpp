@@ -157,7 +157,7 @@ public:
 
 private:
 #ifdef PLATFORM_LOW_MEMORY
-	enum {MAX_MOVING_BRUSH_POLYS=2048};  // Maximum moving brush polys per level.
+	enum {MAX_MOVING_BRUSH_POLYS=1024};  // Maximum moving brush polys per level.
 	enum {MAX_MOVING_BRUSH_ACTORS=256};  // Maximum moving brush actors per level.
 	enum {MAX_TOUCHING_ACTORS=256};		 // Maximum actors touched by a moving brush during update.
 #else
@@ -239,12 +239,73 @@ AActor** AllocDbActor( UDatabase* Res, char* Descr )
 // moving brush data from trashing it as a sparse array.  Returns
 // the number of active elements in the object.
 //
-static inline int ExpandDb( UDatabase* Res, int Slack=512 )
+static inline int ExpandDb( UDatabase* Res, int Slack=512, int ExactNeed=0 )
 {
 	guard(ExpandDb);
-
+#ifdef PLATFORM_DREAMCAST
+	// For Dreamcast, use minimal overhead. If ExactNeed is provided, allocate exactly that + small safety margin.
+	// Otherwise use minimal slack (much smaller than original).
+	if( ExactNeed > 0 )
+	{
+		// Align ExactNeed to 4-byte boundary (required for Dreamcast SH-4 alignment)
+		// This ensures arrays allocated for tracking (INT*, AActor**) are properly aligned
+		ExactNeed = (ExactNeed + 3) & ~3;  // Round up to nearest multiple of 4
+		
+		// Determine minimal slack for allocation arrays
+		int MinSlack;
+		if( Slack == 512 )
+			MinSlack = 64;   // Minimal slack for Nodes/Surfs
+		else if( Slack == 256 )
+			MinSlack = 32;   // Minimal slack for Verts
+		else if( Slack == 16384 )
+			MinSlack = 512;  // Minimal slack for Points/Vectors
+		else
+			MinSlack = 64;
+		
+		// Ensure we always have at least minimal space for allocation arrays
+		// This prevents GetMax() == GetNum() which causes 0-size allocations
+		int RequiredMin = Res->GetNum() + MinSlack;
+		
+		// Allocate exactly what's needed + small safety margin (10% or 32, whichever is larger)
+		int Needed = ExactNeed - Res->GetNum();
+		if( Needed > 0 )
+		{
+			int Safety = Max(32, Needed / 10);
+			// Align Safety to 4-byte boundary as well
+			Safety = (Safety + 3) & ~3;
+			int TargetMax = Max( ExactNeed + Safety, RequiredMin );
+			Res->SetMax( Max( Res->GetMax(), TargetMax) );
+			Res->Realloc();
+		}
+		else
+		{
+			// Even if no expansion needed, ensure minimal space for allocation arrays
+			if( Res->GetMax() < RequiredMin )
+			{
+				// Align RequiredMin to 4-byte boundary
+				RequiredMin = (RequiredMin + 3) & ~3;
+				Res->SetMax( RequiredMin );
+				Res->Realloc();
+			}
+		}
+	}
+	else
+	{
+		// Minimal slack for dynamic growth - much smaller than original
+		// Reduced slack for Dreamcast since BSP nodes are now smaller (SWORD instead of INT)
+		if( Slack == 512 )
+			Slack = 64;   // Minimal slack for Nodes/Surfs (was 192)
+		else if( Slack == 256 )
+			Slack = 32;   // Minimal slack for Verts (was 96)
+		else if( Slack == 16384 )
+			Slack = 512;  // Minimal slack for Points/Vectors (was 6144)
+		Res->SetMax( Max( Res->GetMax(), 2*Res->GetNum() + Slack) );
+		Res->Realloc();
+	}
+#else
 	Res->SetMax( Max( Res->GetMax(), 2*Res->GetNum() + Slack) );
 	Res->Realloc();
+#endif
 
 	return Res->GetNum();
 
@@ -305,18 +366,12 @@ FMovingBrushTracker::FMovingBrushTracker( ULevel* ThisLevel )
 	guard(FMovingBrushTracker::FMovingBrushTracker);
 
 	Level				= ThisLevel;
-
-	iTopNode			= ExpandDb(Level->Model->Nodes);
-	iTopSurf			= ExpandDb(Level->Model->Surfs);
-	iTopPoint			= ExpandDb(Level->Model->Points,16384);
-	iTopVector			= ExpandDb(Level->Model->Vectors,16384);
-	iTopVertPool		= ExpandDb(Level->Model->Verts);
-	iTopBrushMap		= 0;
-
+#if defined (PLATFORM_DREAMCAST)
 	// Note that all actors are unassimilated and count all movers.
 	INT i;
 	INT NumMovers = 0;
 	INT NumMoverPolys = 0;
+	INT TotalMoverVertices = 0;
 	for( i=0; i<Level->Num(); i++ )
 	{
 		AActor* Actor = Level->Actors(i);
@@ -327,12 +382,41 @@ FMovingBrushTracker::FMovingBrushTracker( ULevel* ThisLevel )
 			{
 				++NumMovers;
 				if( Actor->Brush && Actor->Brush->Polys )
-					NumMoverPolys += Actor->Brush->Polys->Num();
+				{
+					INT NumPolys = Actor->Brush->Polys->Num();
+					NumMoverPolys += NumPolys;
+					// Count total vertices across all moving brush polys for better estimation
+					for( INT j=0; j<NumPolys; j++ )
+						TotalMoverVertices += Actor->Brush->Polys->Element(j).NumVertices;
+				}
 			}
 		}
 	}
-
+#endif
 	debugf( NAME_Init, "%s has %d moving brushes with %d polys", Level->GetFullName(), NumMovers, NumMoverPolys );
+
+#if defined (PLATFORM_DREAMCAST)
+	INT EstNodes = NumMoverPolys * 6;      // Estimate 6 nodes per poly (conservative)
+	INT EstSurfs = NumMoverPolys;          // 1 surface per polygon
+	INT EstPoints = TotalMoverVertices * 2; // Estimate 2x vertices (accounting for splits)
+	INT EstVectors = EstSurfs * 3;         // 3 vectors per surface
+	INT EstVerts = TotalMoverVertices * 3; // Estimate 3x vertices in final BSP nodes
+
+	// Expand with exact needs + small safety margin (10% or 32, whichever is larger)
+	// This dramatically reduces memory overhead from 100KB+ to ~10% overhead maximum.
+	iTopNode			= ExpandDb(Level->Model->Nodes, 512, Level->Model->Nodes->GetNum() + EstNodes);
+	iTopSurf			= ExpandDb(Level->Model->Surfs, 512, Level->Model->Surfs->GetNum() + EstSurfs);
+	iTopPoint			= ExpandDb(Level->Model->Points, 16384, Level->Model->Points->GetNum() + EstPoints);
+	iTopVector			= ExpandDb(Level->Model->Vectors, 16384, Level->Model->Vectors->GetNum() + EstVectors);
+	iTopVertPool		= ExpandDb(Level->Model->Verts, 256, Level->Model->Verts->GetNum() + EstVerts);
+#else
+	iTopNode			= ExpandDb(Level->Model->Nodes);
+	iTopSurf			= ExpandDb(Level->Model->Surfs);
+	iTopPoint			= ExpandDb(Level->Model->Points,16384);
+	iTopVector			= ExpandDb(Level->Model->Vectors,16384);
+	iTopVertPool		= ExpandDb(Level->Model->Verts);
+#endif
+	iTopBrushMap		= 0;
 
 	BrushMapOwners		= (AActor **)MallocArray(MAX_MOVING_BRUSH_POLYS,AActor*,"BrushMapOwners");
 	for( i=0; i<MAX_MOVING_BRUSH_POLYS; i++ )
@@ -893,8 +977,13 @@ void FMovingBrushTracker::AddPolyFragment
 			goto Over3;
 
 		VertPool->iSide		          = INDEX_NONE;
+#ifdef PLATFORM_DREAMCAST
+		VertPool->pVertex	          = (SWORD)pVertex;
+		Level->Model->Points->Element((INT)VertPool->pVertex) = EdPoly->Vertex[i];
+#else
 		VertPool->pVertex	          = pVertex;
 		Level->Model->Points->Element(pVertex) = EdPoly->Vertex[i];
+#endif
 
 		VertPool++;
 	}
@@ -903,22 +992,59 @@ void FMovingBrushTracker::AddPolyFragment
 	// (Can't fail past this point).
 
 #if CHECK_ALL
+#ifdef PLATFORM_DREAMCAST
+	if		((IsFront==2)&&((INT)Parent->iPlane!=INDEX_NONE)) appError("iPlane exists");
+	else if ((IsFront==1)&&((INT)Parent->iFront!=INDEX_NONE)) appError("iFront exists");
+	else if ((IsFront==0)&&((INT)Parent->iBack !=INDEX_NONE)) appError("iBack exists");
+#else
 	if		((IsFront==2)&&(Parent->iPlane!=INDEX_NONE)) appError("iPlane exists");
 	else if ((IsFront==1)&&(Parent->iFront!=INDEX_NONE)) appError("iFront exists");
 	else if ((IsFront==0)&&(Parent->iBack !=INDEX_NONE)) appError("iBack exists");
 #endif
+#endif
 
+#ifdef PLATFORM_DREAMCAST
+	if		(IsFront==2) Parent->iPlane = (SWORD)iNode;
+	else if (IsFront==1) Parent->iFront = (SWORD)iNode;
+	else				 Parent->iBack  = (SWORD)iNode;
+#else
 	if		(IsFront==2) Parent->iPlane = iNode;
 	else if (IsFront==1) Parent->iFront = iNode;
 	else				 Parent->iBack  = iNode;
+#endif
 
+#ifdef PLATFORM_DREAMCAST
+	// On Dreamcast, iRenderBound is SWORD (2 bytes), not INT (4 bytes)
+	// We can't write INT directly to SWORD field through INT* pointer - it causes unaligned access
+	// Check if we're writing to MoverLink (INT) or iRenderBound (SWORD)
+	// MoverLink is in ABrush, iRenderBound is in FBspNode
+	// We can detect by checking if iActorNodePrevLink points to a SWORD field
+	// For now, we'll write as SWORD and cast the pointer appropriately
+	if( iActorNodePrevLink == (INT*)&AddActor->Brush->MoverLink )
+	{
+		// Writing to MoverLink (INT field) - safe to write INT
+		*iActorNodePrevLink = iNode;
+	}
+	else
+	{
+		// Writing to iRenderBound (SWORD field) - must write as SWORD
+		*((SWORD*)iActorNodePrevLink) = (SWORD)iNode;
+	}
+	iActorNodePrevLink = (INT*)&Node->iRenderBound;
+#else
 	*iActorNodePrevLink = iNode;
 	iActorNodePrevLink  = &Node->iRenderBound;
+#endif
 
 	return;
 
 	// Overflow handlers.
-	Over3:	while(--i >= 0) FreePointIndex((--VertPool)->pVertex);
+	Over3:	while(--i >= 0) 
+#ifdef PLATFORM_DREAMCAST
+			FreePointIndex((INT)(--VertPool)->pVertex);
+#else
+			FreePointIndex((--VertPool)->pVertex);
+#endif
 	Over2:	FreeNodeIndex(iNode);
 	Over1:	;
 #if CHECK_ALL
@@ -1136,7 +1262,21 @@ void FMovingBrushTracker::AddActorBrush( AActor* Actor )
 		unguard;
 		Poly++;
 	}
+#ifdef PLATFORM_DREAMCAST
+	// On Dreamcast, check if we're writing to MoverLink (INT) or iRenderBound (SWORD)
+	if( iActorNodePrevLink == (INT*)&Actor->Brush->MoverLink )
+	{
+		// Writing to MoverLink (INT field) - safe to write INT
+		*iActorNodePrevLink = INDEX_NONE;
+	}
+	else
+	{
+		// Writing to iRenderBound (SWORD field) - must write as SWORD
+		*((SWORD*)iActorNodePrevLink) = (SWORD)INDEX_NONE;
+	}
+#else
 	*iActorNodePrevLink = INDEX_NONE;
+#endif
 
 	// Tag all newly-added nodes as non-new.
 	INT iNode = *(INT*)&Brush->MoverLink;
@@ -1150,7 +1290,11 @@ void FMovingBrushTracker::AddActorBrush( AActor* Actor )
 #endif
 
 		Node->NodeFlags &= ~NF_IsNew;
+#ifdef PLATFORM_DREAMCAST
+		iNode = (INT)Node->iRenderBound;
+#else
 		iNode = Node->iRenderBound;
+#endif
 	}
 
 	Mark.Pop();
@@ -1201,9 +1345,15 @@ void FMovingBrushTracker::FlushActorBrush( AActor* Actor, INT Group )
 #endif
 
 		// Remove references to this node from its parents.
+#ifdef PLATFORM_DREAMCAST
+		if	   ( (INT)Parent->iFront==iNode ) Parent->iFront=(SWORD)INDEX_NONE;
+		else if( (INT)Parent->iBack ==iNode ) Parent->iBack =(SWORD)INDEX_NONE;
+		else if( (INT)Parent->iPlane==iNode ) Parent->iPlane=(SWORD)INDEX_NONE;
+#else
 		if	   ( Parent->iFront==iNode ) Parent->iFront=INDEX_NONE;
 		else if( Parent->iBack ==iNode ) Parent->iBack =INDEX_NONE;
 		else if( Parent->iPlane==iNode ) Parent->iPlane=INDEX_NONE;
+#endif
 #if CHECK_ALL
 		else appError( "Parent mismatch" );
 #endif
@@ -1212,24 +1362,41 @@ void FMovingBrushTracker::FlushActorBrush( AActor* Actor, INT Group )
 		// prevents them from being orphaned.
 		if( Group )
 		{
+#ifdef PLATFORM_DREAMCAST
+			if( (INT)Node->iFront!=INDEX_NONE )
+				ForceGroupFlush( (INT)Node->iFront );
+			if( (INT)Node->iBack !=INDEX_NONE )
+				ForceGroupFlush( (INT)Node->iBack );
+			if( (INT)Node->iPlane!=INDEX_NONE )
+				ForceGroupFlush( (INT)Node->iPlane );
+#else
 			if( Node->iFront!=INDEX_NONE )
 				ForceGroupFlush( Node->iFront );
 			if( Node->iBack !=INDEX_NONE )
 				ForceGroupFlush( Node->iBack );
 			if( Node->iPlane!=INDEX_NONE )
 				ForceGroupFlush( Node->iPlane );
+#endif
 		}
 
 		// Free all sporadic data.
 		FVert* VertPool = &Level->Model->Verts->Element(Node->iVertPool);
 		for( DWORD j=0; j<Node->NumVertices; j++ )
 		{
+#ifdef PLATFORM_DREAMCAST
+			FreePointIndex( (INT)VertPool->pVertex );
+#else
 			FreePointIndex( VertPool->pVertex );
+#endif
 			VertPool++;
 		}
 		FreeVertPoolIndex( Node->iVertPool, Node->NumVertices );
 		FreeNodeIndex( iNode );
+#ifdef PLATFORM_DREAMCAST
+		iNode = (INT)Node->iRenderBound;
+#else
 		iNode = Node->iRenderBound;
+#endif
 	}
 	Actor->Brush->MoverLink = INDEX_NONE;
 	unguard;
@@ -1287,12 +1454,21 @@ void FMovingBrushTracker::RemoveAllBrushes()
 	for( INT i=0; i<n; i++ )
 	{
 		FBspNode* Node = &Level->Model->Nodes(i);
+#ifdef PLATFORM_DREAMCAST
+		if( (INT)Node->iFront!=INDEX_NONE && (INT)Node->iFront>=n )
+			appErrorf( "Bad iFront %i",i );
+		if( (INT)Node->iBack !=INDEX_NONE && (INT)Node->iBack>=n )
+			appErrorf( "Bad iBack %i", i );
+		if( (INT)Node->iPlane!=INDEX_NONE && (INT)Node->iPlane>=n )
+			appErrorf( "Bad iPlane %i",i );
+#else
 		if( Node->iFront!=INDEX_NONE && Node->iFront>=n )
 			appErrorf( "Bad iFront %i",i );
 		if( Node->iBack !=INDEX_NONE && Node->iBack>=n )
 			appErrorf( "Bad iBack %i", i );
 		if( Node->iPlane!=INDEX_NONE && Node->iPlane>=n )
 			appErrorf( "Bad iPlane %i",i );
+#endif
 	}
 	unguard;
 #endif
