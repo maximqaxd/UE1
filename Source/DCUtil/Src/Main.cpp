@@ -2,7 +2,6 @@
 #include <stdio.h>
 
 #include "DCUtilPrivate.h"
-#include "../../Core/Src/UnLinker.h"
 
 extern CORE_API FGlobalPlatform GTempPlatform;
 extern DLL_IMPORT UBOOL GTickDue;
@@ -172,14 +171,34 @@ void FDCUtil::ConvertTexturePkg( const FString& PkgPath, UPackage* Pkg )
 		{
 			const BYTE OldFmt = It->Format;
 			const INT OldSize = It->MemUsage();
-			TotalPrevSize += OldSize;
-			if( FTextureConverter::AutoConvertTexture( *It ) )
+			UBOOL Modified = 0;
+
+			const UBOOL bFlatten = FTextureConverter::ShouldFlattenTexture( *It );
+			if( bFlatten )
+			{
+				FTextureConverter::FlattenToSolidWhite( *It );
+				const DWORD NewSize = It->MemUsage();
+				printf( "- Flattened '%s' to solid white (%d -> %d bytes)\n", It->GetName(), OldSize, NewSize );
+				Modified = 1;
+			}
+			else if( FTextureConverter::AutoConvertTexture( *It ) )
+			{
+				const DWORD NewSize = It->MemUsage();
+				if( OldFmt != It->Format )
+					printf( "- Converted '%s' from %d to %d (%d -> %d bytes)\n", It->GetName(), OldFmt, It->Format, OldSize, NewSize );
+				else
+					printf( "- Converted '%s' (%d -> %d bytes)\n", It->GetName(), OldSize, NewSize );
+				Modified = 1;
+			}
+
+			if( Modified )
 			{
 				const DWORD NewSize = It->MemUsage();
 				Changed = true;
-				printf( "- Converted '%s' from %d to %d (%d -> %d bytes)\n", It->GetName(), OldFmt, It->Format, OldSize, NewSize );
+				TotalPrevSize += OldSize;
 				TotalNewSize += NewSize;
 			}
+
 			if( It->Palette )
 				UnrefPalettes.RemoveItem( It->Palette );
 		}
@@ -195,20 +214,22 @@ void FDCUtil::ConvertSoundPkg( const FString& PkgPath, UPackage* Pkg )
 {
 	guard(ConvertSoundPkg);
 
-	printf( "Nuking sounds in '%s'\n", Pkg->GetName() );
+	printf( "Compressing sounds in '%s'\n", Pkg->GetName() );
 
 	UBOOL Changed = false;
 	for( TObjectIterator<USound> It; It; ++It )
 	{
-		// just nuke for now
 		if( It->IsIn( Pkg ) && It->Data.Num() )
 		{
-			const DWORD Size = It->MemUsage();
-			printf( "- Nuking '%s' (%u bytes)\n", It->GetName(), Size );
-			TotalPrevSize += Size;
-			TotalNewSize += Size - It->Data.Num();
-			It->Data.Empty();
-			Changed = true;
+			const DWORD OldSize = It->MemUsage();
+			if( FSoundCompressor::CompressUSound( *It ) )
+			{
+				const DWORD NewSize = It->MemUsage();
+				Changed = true;
+				printf( "- Compressed '%s' (%u -> %u bytes)\n", It->GetName(), OldSize, NewSize );
+				TotalPrevSize += OldSize;
+				TotalNewSize += NewSize;
+			}
 		}
 	}
 
@@ -241,6 +262,61 @@ void FDCUtil::ConvertMusicPkg(const FString &PkgPath, UPackage *Pkg)
 
 	if( Changed )
 		ChangedPackages.Add( PkgPath, Pkg );
+
+	unguard;
+}
+
+void FDCUtil::ConvertMeshPkg( const FString& PkgPath, UPackage* Pkg, const FMeshReducer::FOptions& Options )
+{
+	guard(ConvertMeshPkg);
+
+	printf( "Optimizing meshes in '%s'\n", Pkg->GetName() );
+
+	UBOOL Changed = false;
+
+	for( TObjectIterator<UMesh> It; It; ++It )
+	{
+		if( !It->IsIn( Pkg ) )
+		{
+			continue;
+		}
+
+		FMeshReductionStats Stats;
+		const UBOOL MeshChanged = FMeshReducer::Reduce( *It, Options, &Stats );
+
+		if( MeshChanged )
+		{
+			Changed = true;
+			printf( "- %s: verts %d -> %d, tris %d -> %d, frames %d -> %d\n",
+				*Stats.MeshName,
+				Stats.OriginalVerts, Stats.ReducedVerts,
+				Stats.OriginalTriangles, Stats.ReducedTriangles,
+				Stats.OriginalFrames, Stats.ReducedFrames );
+		}
+		else
+		{
+			printf( "- %s: no change (verts=%d, tris=%d, frames=%d)\n",
+				*Stats.MeshName,
+				Stats.OriginalVerts,
+				Stats.OriginalTriangles,
+				Stats.OriginalFrames );
+		}
+	}
+
+	if( Changed )
+	{
+		if( PackageSizeBefore.Find( Pkg ) == nullptr )
+		{
+			INT OldSize = appFSize( *PkgPath );
+			if( OldSize >= 0 )
+			{
+				PackageSizeBefore.Add( Pkg, OldSize );
+				TotalPrevSize += OldSize;
+			}
+		}
+
+		ChangedPackages.Add( PkgPath, Pkg );
+	}
 
 	unguard;
 }
@@ -278,6 +354,15 @@ void FDCUtil::CommitChanges()
 			// Try to keep the previous version in heritage list to maintain backwards compatibility
 			OldGuid = PackageGuids.Find( Pkg );
 			GObj.SavePackage( Pkg, nullptr, RF_Standalone, *PkgName, false, OldGuid );
+
+			if( QWORD* OldSizePtr = PackageSizeBefore.Find( Pkg ) )
+			{
+				INT NewSize = appFSize( *PkgName );
+				if( NewSize >= 0 )
+				{
+					TotalNewSize += NewSize;
+				}
+			}
 		}
 	}
 
@@ -329,6 +414,17 @@ void FDCUtil::Main( )
 		}
 		CommitChanges();
 	}
+	else if( Parse( Cmd, "CVTUMH=", Temp, sizeof( Temp ) - 1 ) )
+	{
+		ParsePackageArg( Temp, "../System/*.u" );
+		FMeshReducer::FOptions MeshOptions;
+		for( INT i = 0; i < LoadedPackages.Size(); ++i )
+		{
+			LoadedPackages.GetPair( i, PkgPath, Pkg );
+			ConvertMeshPkg( PkgPath, Pkg, MeshOptions );
+		}
+		CommitChanges();
+	}
 	else if( Parse( Cmd, "CVTALL=", Temp, sizeof( Temp ) - 1 ) )
 	{
 		if( Temp[0] == '*' && Temp[0] == 0 )
@@ -374,7 +470,7 @@ void FDCUtil::Main( )
 	}
 	else
 	{
-		printf( "Usage: dctool CVTUTX=<TEXPKG>\n" );
+		printf( "Usage: dctool CVTUTX=<TEXPKG> | CVTUAX=<SOUNDPKG> | CVTUMX=<MUSPKG> | CVTUMH=<UMESHPKG>\n" );
 	}
 
 	GIsRunning = 0;

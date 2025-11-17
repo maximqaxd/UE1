@@ -36,6 +36,88 @@ const char* FTextureConverter::Blacklist[] =
 	"UnrealI.MenuGfx.*"
 };
 
+namespace
+{
+
+static const FName FlattenPackages[] =
+{
+	FName("Female1Skins"),
+	FName("Male1Skins")
+};
+
+static UPackage* GetOuterPackage( UObject* Obj )
+{
+	while( Obj && !Obj->IsA( UPackage::StaticClass ) )
+	{
+		Obj = Obj->GetParent();
+	}
+	return Cast<UPackage>( Obj );
+}
+
+static UBOOL ShouldFlattenTextureInternal( UTexture* Texture )
+{
+	if( Texture == nullptr )
+	{
+		return 0;
+	}
+
+	UPackage* OuterPkg = GetOuterPackage( Texture );
+	if( OuterPkg == nullptr )
+	{
+		return 0;
+	}
+
+	const FName PackageName = OuterPkg->GetFName();
+	for( INT i = 0; i < ARRAY_COUNT( FlattenPackages ); ++i )
+	{
+		if( PackageName == FlattenPackages[i] )
+		{
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+static void FlattenTextureToSolidWhiteInternal( UTexture* Texture )
+{
+	if( Texture == nullptr )
+	{
+		return;
+	}
+
+	Texture->Format = TEXF_EXT_RGB565_TWID;
+	Texture->Palette = nullptr;
+	Texture->USize = Texture->VSize = 8;
+	Texture->UBits = 3;
+	Texture->VBits = 3;
+
+	if( Texture->Mips.Num() == 0 )
+	{
+		new( Texture->Mips ) FMipmap;
+	}
+	else if( Texture->Mips.Num() > 1 )
+	{
+		Texture->Mips.Remove( 1, Texture->Mips.Num() - 1 );
+	}
+
+	FMipmap& Mip = Texture->Mips(0);
+	Mip.USize = 8;
+	Mip.VSize = 8;
+	Mip.UBits = 3;
+	Mip.VBits = 3;
+	Mip.DataArray.SetNum( 8 * 8 * sizeof(_WORD) );
+
+	const _WORD Pixel = 0xFFFF;
+	_WORD* Dest = (_WORD*)&Mip.DataArray(0);
+	for( INT i = 0; i < 64; ++i )
+	{
+		Dest[i] = Pixel;
+	}
+}
+
+}
+
 UBOOL FTextureConverter::AutoConvertTexture( UTexture* InTexture )
 {
 	verify( InTexture );
@@ -216,14 +298,21 @@ void FTextureConverter::ConvertMip( FMipmap &Mip, const char* Filename )
 	}
 
 	// pvrtex is only available in executable form, so fuck it
+	const char* PvrtexPath = "pvrtex";
+
 	char Command[2048];
-	snprintf( Command, sizeof( Command ),
 #ifdef PLATFORM_WIN32
-		"pvrtex -i %s -o %s -r NEAR %s > NUL 2>&1",
+	snprintf( Command, sizeof( Command ), "%s -i %s -o %s -r NEAR %s > NUL 2>&1", PvrtexPath, Filename, TempPvrFile, FormatArgs );
 #else
-		"pvrtex -i %s -o %s -r NEAR %s > /dev/null 2>&1",
+	if( const char* KosBase = getenv( "KOS_BASE" ) )
+	{
+		snprintf( Command, sizeof( Command ), "%s/utils/pvrtex/pvrtex -i %s -o %s -r NEAR %s > /dev/null 2>&1", KosBase, Filename, TempPvrFile, FormatArgs );
+	}
+	else
+	{
+		snprintf( Command, sizeof( Command ), "%s -i %s -o %s -r NEAR %s > /dev/null 2>&1", PvrtexPath, Filename, TempPvrFile, FormatArgs );
+	}
 #endif
-		Filename, TempPvrFile, FormatArgs );
 	const INT Ret = system( Command );
 	if( Ret != 0 )
 		appErrorf( "pvrtex returned %d", Ret );
@@ -273,4 +362,14 @@ void FTextureConverter::ConvertMip( FMipmap &Mip, const char* Filename )
 		Mip.VSize = NewVSize;
 		Mip.VBits = FLogTwo(NewVSize);
 	}
+}
+
+UBOOL FTextureConverter::ShouldFlattenTexture( UTexture* Tex )
+{
+	return ShouldFlattenTextureInternal( Tex );
+}
+
+void FTextureConverter::FlattenToSolidWhite( UTexture* Tex )
+{
+	FlattenTextureToSolidWhiteInternal( Tex );
 }

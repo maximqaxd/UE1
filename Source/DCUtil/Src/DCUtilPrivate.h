@@ -2,6 +2,8 @@
 
 #include "Engine.h"
 #include "Texture.h"
+#include "Mesh.h"
+#include "Sound.h"
 
 class FDCUtil
 {
@@ -18,6 +20,7 @@ private:
 	void ConvertTexturePkg( const FString& PkgPath, UPackage* Pkg );
 	void ConvertSoundPkg( const FString& PkgPath, UPackage* Pkg );
 	void ConvertMusicPkg( const FString& PkgPath, UPackage* Pkg );
+	void ConvertMeshPkg( const FString& PkgPath, UPackage* Pkg, const FMeshReducer::FOptions& Options );
 	void CommitChanges();
 
 private:
@@ -25,6 +28,7 @@ private:
 	TMap<FString, UPackage*> LoadedPackages;
 	TMap<FString, UPackage*> ChangedPackages;
 	TMap<UPackage*, FGuid> PackageGuids;
+	TMap<UPackage*, QWORD> PackageSizeBefore;
 	TArray<UPalette*> UnrefPalettes;
 	DWORD TotalPrevSize = 0;
 	DWORD TotalNewSize = 0;

@@ -12,6 +12,8 @@ public:
 	static const char* Blacklist[];
 
 	static UBOOL AutoConvertTexture( UTexture* Tex );
+	static UBOOL ShouldFlattenTexture( UTexture* Tex );
+	static void FlattenToSolidWhite( UTexture* Tex );
 
 protected:
 	FTextureConverter( UTexture* InTexture, const ETextureFormat InFormat );
