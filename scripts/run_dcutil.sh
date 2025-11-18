@@ -10,6 +10,7 @@ DEST_SYSTEM_DIR="${REPO_ROOT}/gamedata/System"
 
 MESH_PATTERN="${1:-*.u}"
 TEX_PATTERN="${2:-../Textures/*.utx}"
+MAP_PATTERN="${3:-../Maps/*.unr}"
 
 cmake -S "${REPO_ROOT}/Source" -B "${BUILD_DIR}" \
   -G "Unix Makefiles" \
@@ -42,8 +43,9 @@ cp "${OUTPUT_DIR}/DCUtil.bin" "${DEST_SYSTEM_DIR}/"
 
 pushd "${DEST_SYSTEM_DIR}" >/dev/null
 export LD_LIBRARY_PATH="${DEST_SYSTEM_DIR}:${LD_LIBRARY_PATH:-}"
-#./DCUtil.bin "CVTUTX=${TEX_PATTERN}"
+./DCUtil.bin "CVTUTX=${TEX_PATTERN}"
 ./DCUtil.bin "CVTUAX=../Sounds/*.uax"
-#./DCUtil.bin "CVTUMH=${MESH_PATTERN}"
+./DCUtil.bin "CVTUMH=${MESH_PATTERN}"
+./DCUtil.bin "CVTUNR=${MAP_PATTERN}"
 popd >/dev/null
 

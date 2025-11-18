@@ -340,6 +340,32 @@ void FDCUtil::CommitChanges()
 		UnrefPalettes.Empty();
 	}
 
+	// Before garbage collection, ensure all level objects are marked to prevent collection
+	// This is critical for level packages where objects might not have RF_Standalone
+	for( INT i = 0; i < ChangedPackages.Size(); ++i )
+	{
+		FString PkgName;
+		UPackage* Pkg;
+		ChangedPackages.GetPair( i, PkgName, Pkg );
+		
+		// Check if this is a level package
+		ULevel* Level = FindObject<ULevel>( Pkg, "MyLevel" );
+		if( Level )
+		{
+			// Mark Level and all its objects to prevent garbage collection
+			Level->SetFlags( RF_Standalone );
+			if( Level->Model )
+				Level->Model->SetFlags( RF_Standalone );
+			// Mark all actors in the level
+			for( INT j = 0; j < Level->Num(); j++ )
+			{
+				if( Level->Actors(j) && Level->Actors(j)->IsIn( Pkg ) )
+					Level->Actors(j)->SetFlags( RF_Standalone );
+			}
+		}
+	}
+	
+	// Collect garbage, but keep all objects that might be in packages we're about to save
 	GObj.CollectGarbage( GSystem, RF_Intrinsic | RF_Standalone );
 
 	if( ChangedPackages.Size() )
@@ -353,15 +379,95 @@ void FDCUtil::CommitChanges()
 			ChangedPackages.GetPair( i, PkgName, Pkg );
 			// Try to keep the previous version in heritage list to maintain backwards compatibility
 			OldGuid = PackageGuids.Find( Pkg );
-			GObj.SavePackage( Pkg, nullptr, RF_Standalone, *PkgName, false, OldGuid );
-
+			
 			if( QWORD* OldSizePtr = PackageSizeBefore.Find( Pkg ) )
 			{
-				INT NewSize = appFSize( *PkgName );
-				if( NewSize >= 0 )
+				TotalPrevSize += *OldSizePtr;
+			}
+			
+			// For level packages (.unr), we need to save the Level object as Base
+			UObject* SaveBase = nullptr;
+			DWORD SaveFlags = RF_Standalone;
+			
+			// Check if this is a level package by looking for MyLevel
+			ULevel* Level = FindObject<ULevel>( Pkg, "MyLevel" );
+			if( Level )
+			{
+				// Ensure Level is properly set up and marked
+				if( !Level->Model )
 				{
-					TotalNewSize += NewSize;
+					printf( "  WARNING: Level '%s' has no Model, trying to reload...\n", Level->GetName() );
+					// Try to reload the level
+					Level = LoadObject<ULevel>( Pkg, "MyLevel", nullptr, LOAD_NoFail | LOAD_KeepImports, nullptr );
 				}
+				
+				if( Level && Level->Model )
+				{
+					Level->Modify();
+					if( !(Level->Model->GetFlags() & RF_Public) )
+						Level->Model->SetFlags( RF_Public );
+					Level->Model->Modify();
+					
+					for( INT i = 0; i < Level->Num(); i++ )
+					{
+						if( Level->Actors(i) && Level->Actors(i)->IsIn( Pkg ) )
+						{
+							if( !(Level->Actors(i)->GetFlags() & RF_Public) )
+								Level->Actors(i)->SetFlags( RF_Public );
+						}
+					}
+					
+					SaveBase = Level;
+					SaveFlags = 0; 
+				}
+				else
+				{
+					printf( "  ERROR: Level '%s' could not be properly loaded for saving\n", Pkg->GetName() );
+					continue;
+				}
+			}
+			
+			UBOOL SaveSuccess = GObj.SavePackage( Pkg, SaveBase, SaveFlags, *PkgName, false, OldGuid );
+			
+			if( !SaveSuccess )
+			{
+				printf( "  ERROR: Failed to save %s\n", *PkgName );
+				continue;
+			}
+
+			// Get new file size after saving
+			// Use absolute path to avoid path resolution issues
+			char AbsPath[512];
+			if( appGetcwd( AbsPath, sizeof(AbsPath) ) )
+			{
+				appStrcat( AbsPath, "/" );
+				appStrcat( AbsPath, *PkgName );
+			}
+			else
+			{
+				appStrcpy( AbsPath, *PkgName );
+			}
+			
+			INT NewSize = appFSize( AbsPath );
+			if( NewSize >= 0 )
+			{
+				TotalNewSize += NewSize;
+				if( QWORD* OldSizePtr = PackageSizeBefore.Find( Pkg ) )
+				{
+					INT SizeDiff = NewSize - (INT)*OldSizePtr;
+					printf( "  %s: %d -> %d bytes (%s%d bytes)\n", 
+						*PkgName, (INT)*OldSizePtr, NewSize, 
+						SizeDiff < 0 ? "-" : "+", SizeDiff < 0 ? -SizeDiff : SizeDiff );
+					
+					if( NewSize < 1000 && (INT)*OldSizePtr > 1000 )
+					{
+						printf( "    WARNING: File size is suspiciously small! Check if save actually completed.\n" );
+					}
+				}
+			}
+			else
+			{
+				printf( "  WARNING: Could not get file size for %s (tried: %s)\n", *PkgName, AbsPath );
 			}
 		}
 	}
@@ -468,9 +574,20 @@ void FDCUtil::Main( )
 		for( INT i = 0; i < Items.Num(); ++i )
 			printf( "- %s: %s (%d bytes)\n", Items(i).Obj->GetPathName(), Items(i).Obj->GetClassName(), Items(i).Size );
 	}
+	else if( Parse( Cmd, "CVTUNR=", Temp, sizeof( Temp ) - 1 ) )
+	{
+		ParsePackageArg( Temp, "../Maps/*.unr" );
+		printf( "Loaded %d map packages\n", LoadedPackages.Size() );
+		for( INT i = 0; i < LoadedPackages.Size(); ++i )
+		{
+			LoadedPackages.GetPair( i, PkgPath, Pkg );
+			ConvertMapPkg( PkgPath, Pkg );
+		}
+		CommitChanges();
+	}
 	else
 	{
-		printf( "Usage: dctool CVTUTX=<TEXPKG> | CVTUAX=<SOUNDPKG> | CVTUMX=<MUSPKG> | CVTUMH=<UMESHPKG>\n" );
+		printf( "Usage: dctool CVTUTX=<TEXPKG> | CVTUAX=<SOUNDPKG> | CVTUMX=<MUSPKG> | CVTUMH=<UMESHPKG> | CVTUNR=<MAPPKG>\n" );
 	}
 
 	GIsRunning = 0;
