@@ -3,11 +3,29 @@
 
 #include "PVRDrvPrivate.h"
 
+#define dcache_pref_block(a)	__builtin_prefetch(a)
+
 extern DLL_IMPORT const char* GStartupDbgDev;
+
+// Global PVR DR state 
 static pvr_dr_state_t GPVRDRState;
-static pvr_list_t GPVRCurrentList = (pvr_list_t)-1;
-static unsigned GPVRBegunMask = 0; // bit0 OP, bit1 PT, bit2 TR
-static INT GPVRDebugVertsLeft = 0; // per frame debug budget
+
+static int GPVRSrcBlend = PVR_BLEND_ONE;
+static int GPVRDstBlend = PVR_BLEND_ZERO;
+static int GPVRZFunction = PVR_DEPTHCMP_GEQUAL;
+static int GPVRZWrite = PVR_DEPTHWRITE_ENABLE;
+static int GPVRBlendEnabled = 0;
+static int GPVRCullMode = PVR_CULLING_NONE;
+
+struct FPVRRenderCallback
+{
+    virtual ~FPVRRenderCallback() {}
+    virtual void Execute() = 0;
+};
+
+static TArray<FPVRRenderCallback*> GPVROPCallbacks;
+static TArray<FPVRRenderCallback*> GPVRPTCallbacks;
+static TArray<FPVRRenderCallback*> GPVRTRCallbacks;
 
 // Software viewport matrix for PVR (row-major 4x4)
 static FLOAT GPVRScreenView[4][4];
@@ -136,54 +154,64 @@ static inline void PVRVertexSubmit( FLOAT X, FLOAT Y, FLOAT Z, FLOAT U, FLOAT V,
     pvr_dr_commit( Vtx );
 }
 
-static inline void SubmitTriangleFan( const FSceneNode* Frame, const FPVRClipVert* V, INT Count, UBOOL SubmitUV )
+static inline void SubmitTriangleFan( const FSceneNode* Frame, const FPVRClipVert* V, INT Count, UBOOL SubmitUV, UBOOL ReverseWinding = false )
 {
     if( Count < 3 )
         return;
-    for( INT j = 1; j < Count - 1; ++j )
+    dcache_pref_block(V);
+    if( ReverseWinding )
     {
-        FLOAT sx, sy, sz;
-        ProjectToScreenUE( Frame, V[0].X, V[0].Y, V[0].Z, sx, sy, sz );
-        if( SubmitUV ) PVRVertexSubmit( sx, sy, sz, V[0].U, V[0].V, V[0].ARGB, PVR_CMD_VERTEX );
-        else           PVRVertexSubmit( sx, sy, sz, 0.f,   0.f,   V[0].ARGB, PVR_CMD_VERTEX );
+        for( INT j = 1; j < Count - 1; ++j )
+        {
+            dcache_pref_block(&V[j + 1]);
+            FLOAT sx, sy, sz;
+            ProjectToScreenUE( Frame, V[0].X, V[0].Y, V[0].Z, sx, sy, sz );
+            if( SubmitUV ) PVRVertexSubmit( sx, sy, sz, V[0].U, V[0].V, V[0].ARGB, PVR_CMD_VERTEX );
+            else           PVRVertexSubmit( sx, sy, sz, 0.f,   0.f,   V[0].ARGB, PVR_CMD_VERTEX );
 
-        ProjectToScreenUE( Frame, V[j].X, V[j].Y, V[j].Z, sx, sy, sz );
-        if( SubmitUV ) PVRVertexSubmit( sx, sy, sz, V[j].U, V[j].V, V[j].ARGB, PVR_CMD_VERTEX );
-        else           PVRVertexSubmit( sx, sy, sz, 0.f,   0.f,   V[j].ARGB, PVR_CMD_VERTEX );
+            ProjectToScreenUE( Frame, V[j+1].X, V[j+1].Y, V[j+1].Z, sx, sy, sz );
+            if( SubmitUV ) PVRVertexSubmit( sx, sy, sz, V[j+1].U, V[j+1].V, V[j+1].ARGB, PVR_CMD_VERTEX );
+            else           PVRVertexSubmit( sx, sy, sz, 0.f,   0.f,   V[j+1].ARGB, PVR_CMD_VERTEX );
 
-        ProjectToScreenUE( Frame, V[j+1].X, V[j+1].Y, V[j+1].Z, sx, sy, sz );
-        if( SubmitUV ) PVRVertexSubmit( sx, sy, sz, V[j+1].U, V[j+1].V, V[j+1].ARGB, PVR_CMD_VERTEX_EOL );
-        else           PVRVertexSubmit( sx, sy, sz, 0.f,     0.f,     V[j+1].ARGB, PVR_CMD_VERTEX_EOL );
+            ProjectToScreenUE( Frame, V[j].X, V[j].Y, V[j].Z, sx, sy, sz );
+            if( SubmitUV ) PVRVertexSubmit( sx, sy, sz, V[j].U, V[j].V, V[j].ARGB, PVR_CMD_VERTEX_EOL );
+            else           PVRVertexSubmit( sx, sy, sz, 0.f,     0.f,     V[j].ARGB, PVR_CMD_VERTEX_EOL );
+        }
+    }
+    else
+    {
+        for( INT j = 1; j < Count - 1; ++j )
+        {
+            dcache_pref_block(&V[j + 1]);
+            FLOAT sx, sy, sz;
+            ProjectToScreenUE( Frame, V[0].X, V[0].Y, V[0].Z, sx, sy, sz );
+            if( SubmitUV ) PVRVertexSubmit( sx, sy, sz, V[0].U, V[0].V, V[0].ARGB, PVR_CMD_VERTEX );
+            else           PVRVertexSubmit( sx, sy, sz, 0.f,   0.f,   V[0].ARGB, PVR_CMD_VERTEX );
+
+            ProjectToScreenUE( Frame, V[j].X, V[j].Y, V[j].Z, sx, sy, sz );
+            if( SubmitUV ) PVRVertexSubmit( sx, sy, sz, V[j].U, V[j].V, V[j].ARGB, PVR_CMD_VERTEX );
+            else           PVRVertexSubmit( sx, sy, sz, 0.f,   0.f,   V[j].ARGB, PVR_CMD_VERTEX );
+
+            ProjectToScreenUE( Frame, V[j+1].X, V[j+1].Y, V[j+1].Z, sx, sy, sz );
+            if( SubmitUV ) PVRVertexSubmit( sx, sy, sz, V[j+1].U, V[j+1].V, V[j+1].ARGB, PVR_CMD_VERTEX_EOL );
+            else           PVRVertexSubmit( sx, sy, sz, 0.f,     0.f,     V[j+1].ARGB, PVR_CMD_VERTEX_EOL );
+        }
     }
 }
 
 
-static inline void EnsurePVRList( pvr_list_t List )
-{
-    // If already on desired list, nothing to do
-    if( GPVRCurrentList == List )
-        return;
 
-    // If desired list was already begun earlier this scene, we cannot reopen; keep current
-    const unsigned Bit = (List == PVR_LIST_OP_POLY) ? 1u : (List == PVR_LIST_PT_POLY) ? 2u : 4u;
-    if( GPVRBegunMask & Bit )
-        return;
-
-    // Close currently open list if any
-    if( GPVRCurrentList != (pvr_list_t)-1 )
-        pvr_list_finish();
-
-    // Open desired list
-    pvr_list_begin( List );
-    pvr_dr_init( &GPVRDRState );
-    GPVRCurrentList = List;
-    GPVRBegunMask |= Bit;
-}
-
+// Build polygon header using global render state 
 static inline void BuildPolyHeader( UPVRRenderDevice* RD, DWORD PolyFlags, const FTextureInfo* Info, pvr_poly_hdr_t& OutHdr, pvr_list_t& OutList, UBOOL ForceNoDepthTest = 0 )
 {
-    const UBOOL IsMasked = (PolyFlags & PF_Masked) != 0;
-    const UBOOL IsTrans  = (PolyFlags & (PF_Translucent|PF_Modulated|PF_Highlighted)) != 0;
+    DWORD AdjustedFlags = PolyFlags;
+    if( !(AdjustedFlags & (PF_Translucent|PF_Modulated)) && !RD->CurrentSceneNode.bIsSky )
+        AdjustedFlags |= PF_Occlude;
+    else if( AdjustedFlags & PF_Translucent )
+        AdjustedFlags &= ~PF_Masked;
+    
+    const UBOOL IsMasked = (AdjustedFlags & PF_Masked) != 0;
+    const UBOOL IsTrans  = (AdjustedFlags & (PF_Translucent|PF_Modulated|PF_Highlighted)) != 0;
     OutList = IsMasked ? PVR_LIST_PT_POLY : (IsTrans ? PVR_LIST_TR_POLY : PVR_LIST_OP_POLY);
 
     pvr_poly_cxt_t Cxt;
@@ -193,9 +221,9 @@ static inline void BuildPolyHeader( UPVRRenderDevice* RD, DWORD PolyFlags, const
         const INT VSize = Max( UPVRRenderDevice::MinTexSize, Info->VSize );
         int PvrFmt = (Info->Palette ? PVR_TXRFMT_ARGB1555 : PVR_TXRFMT_RGB565);
         if( Info->Format == TEXF_EXT_ARGB1555_VQ )
-            PvrFmt |= PVR_TXRFMT_TWIDDLED | PVR_TXRFMT_VQ_ENABLE; // VQ data is pre-twiddled
+            PvrFmt |= PVR_TXRFMT_VQ_ENABLE;
         else
-            PvrFmt |= PVR_TXRFMT_NONTWIDDLED; // we upload linear data
+            PvrFmt |= PVR_TXRFMT_NONTWIDDLED;
         pvr_poly_cxt_txr( &Cxt, OutList, PvrFmt, USize, VSize, RD->TexInfo.CurrentBind->Tex, RD->NoFiltering ? PVR_FILTER_NONE : PVR_FILTER_BILINEAR );
     }
     else
@@ -203,7 +231,6 @@ static inline void BuildPolyHeader( UPVRRenderDevice* RD, DWORD PolyFlags, const
         pvr_poly_cxt_col( &Cxt, OutList );
     }
 
-    // Depth, culling and blend defaults
     if( ForceNoDepthTest )
     {
         Cxt.depth.comparison = PVR_DEPTHCMP_ALWAYS;
@@ -211,28 +238,22 @@ static inline void BuildPolyHeader( UPVRRenderDevice* RD, DWORD PolyFlags, const
     }
     else
     {
-        // With z = 1/w, nearer has larger z; use GEQUAL and write on OP and PT
-        Cxt.depth.comparison = PVR_DEPTHCMP_GEQUAL;
-        Cxt.depth.write      = (OutList != PVR_LIST_TR_POLY);
+        Cxt.depth.comparison = GPVRZFunction;
+        Cxt.depth.write      = (OutList != PVR_LIST_TR_POLY) ? GPVRZWrite : PVR_DEPTHWRITE_DISABLE;
     }
-    Cxt.gen.culling      = PVR_CULLING_NONE; // GL path didn't use backface culling
-    if( OutList == PVR_LIST_TR_POLY )
+    Cxt.gen.culling = GPVRCullMode;
+    
+    if( AdjustedFlags & PF_Invisible )
     {
-        if( PolyFlags & PF_Translucent )
+        Cxt.blend.src = PVR_BLEND_ZERO;
+        Cxt.blend.dst = PVR_BLEND_ZERO;
+    }
+    else if( OutList == PVR_LIST_TR_POLY )
+    {
+        if( GPVRBlendEnabled )
         {
-            Cxt.blend.src = PVR_BLEND_SRCALPHA;
-            Cxt.blend.dst = PVR_BLEND_INVSRCALPHA;
-        }
-        else if( PolyFlags & PF_Modulated )
-        {
-            // Multiply dest by src (lightmaps): dst = dst * src
-            Cxt.blend.src = PVR_BLEND_DESTCOLOR;
-            Cxt.blend.dst = PVR_BLEND_ZERO;
-        }
-        else if( PolyFlags & PF_Highlighted )
-        {
-            Cxt.blend.src = PVR_BLEND_ONE;
-            Cxt.blend.dst = PVR_BLEND_INVSRCALPHA;
+            Cxt.blend.src = GPVRSrcBlend;
+            Cxt.blend.dst = GPVRDstBlend;
         }
         else
         {
@@ -240,6 +261,24 @@ static inline void BuildPolyHeader( UPVRRenderDevice* RD, DWORD PolyFlags, const
             Cxt.blend.dst = PVR_BLEND_ZERO;
         }
     }
+    else
+    {
+        Cxt.blend.src = PVR_BLEND_ONE;
+        Cxt.blend.dst = PVR_BLEND_ZERO;
+    }
+    
+    // Texture alpha and environment settings
+    if( OutList == PVR_LIST_TR_POLY )
+    {
+        Cxt.txr.alpha = PVR_TXRALPHA_ENABLE;
+        Cxt.txr.env  = PVR_TXRENV_MODULATEALPHA;
+    }
+    else
+    {
+        Cxt.txr.alpha = PVR_TXRALPHA_ENABLE;
+        Cxt.txr.env  = PVR_TXRENV_MODULATE;
+    }
+    
     Cxt.gen.fog_type = PVR_FOG_DISABLE;
 
     pvr_poly_compile( &OutHdr, &Cxt );
@@ -249,8 +288,8 @@ pvr_init_params_t params = {
 	2536 * 256,    /* vertex buffer */
 	0,             /* dma disabled for TA */
 	0,             /* fsaa off */
-	0,             /* keep PVR translucent autosort ON (or tune per need) */
-	2            /* OPB count: start with 8; only consider 2 after profiling */
+	0,             /* keep PVR translucent autosort OFF  */
+	2            /* OPB count: start with 2*/
 };
 
 /*-----------------------------------------------------------------------------
@@ -289,7 +328,7 @@ UBOOL UPVRRenderDevice::Init( UViewport* InViewport )
 	{
 		// try to drop back to whatever we had at startup first
 		if( !GStartupDbgDev || dbgio_dev_select( GStartupDbgDev ) < 0 )
-			dbgio_dev_select( "scif" );
+			dbgio_dev_select( "null" );
 	}
 
     pvr_init(&params);
@@ -371,14 +410,9 @@ void UPVRRenderDevice::Lock( FPlane FlashScale, FPlane FlashFog, FPlane ScreenCl
 {
 	guard(UPVRRenderDevice::Lock);
 
-	// Begin a new PVR scene and the per-list streams. Background clear via bg color.
-    pvr_wait_ready();
-    pvr_set_bg_color( ScreenClear.X, ScreenClear.Y, ScreenClear.Z );
-    pvr_scene_begin();
-    // Defer list begin until first submission; reset tracking
-    GPVRCurrentList = (pvr_list_t)-1;
-    GPVRBegunMask = 0;
-    GPVRDebugVertsLeft = 0; // set to e.g. 8 to dump
+	GPVROPCallbacks.Empty();
+	GPVRPTCallbacks.Empty();
+	GPVRTRCallbacks.Empty();
 
 	if( FlashScale != FPlane(0.5f, 0.5f, 0.5f, 0.0f) || FlashFog != FPlane(0.0f, 0.0f, 0.0f, 0.0f) )
 		ColorMod = FPlane( FlashFog.X, FlashFog.Y, FlashFog.Z, 1.f - Min( FlashScale.X * 2.f, 1.f ) );
@@ -397,23 +431,61 @@ void UPVRRenderDevice::Unlock( UBOOL Blit )
 
 	static DWORD Frame = 0;
 
-    // Finish any open list, then finish scene.
-    if( GPVRCurrentList != (pvr_list_t)-1 )
-        pvr_list_finish();
+	pvr_wait_ready();
+	pvr_set_bg_color( 0.f, 0.f, 0.f );
+	pvr_scene_begin();
+
+	// Render OP_POLY list
+	if( GPVROPCallbacks.Num() > 0 )
+	{
+		pvr_dr_init( &GPVRDRState );
+		pvr_list_begin( PVR_LIST_OP_POLY );
+		for( INT i = 0; i < GPVROPCallbacks.Num(); i++ )
+		{
+			GPVROPCallbacks(i)->Execute();
+			delete GPVROPCallbacks(i);
+		}
+		pvr_list_finish();
+	}
+
+	// Render PT_POLY list
+	if( GPVRPTCallbacks.Num() > 0 )
+	{
+		PVR_SET(0x11C, 64); // PT Alpha test value
+		pvr_dr_init( &GPVRDRState );
+		pvr_list_begin( PVR_LIST_PT_POLY );
+		for( INT i = 0; i < GPVRPTCallbacks.Num(); i++ )
+		{
+			GPVRPTCallbacks(i)->Execute();
+			delete GPVRPTCallbacks(i);
+		}
+		pvr_list_finish();
+	}
+
+	// Render TR_POLY list
+	if( GPVRTRCallbacks.Num() > 0 )
+	{
+		pvr_dr_init( &GPVRDRState );
+		pvr_list_begin( PVR_LIST_TR_POLY );
+		for( INT i = 0; i < GPVRTRCallbacks.Num(); i++ )
+		{
+			GPVRTRCallbacks(i)->Execute();
+			delete GPVRTRCallbacks(i);
+		}
+		pvr_list_finish();
+	}
+
 	pvr_scene_finish();
 
 	++Frame;
-	// One-shot after first scene
 	if( Frame == 1 )
 	{
 		DumpMemStatsDC( "after first scene" );
 	}
-	// Periodic
 	if( ( Frame & 0xff ) == 0 )
 	{
 		debugf( "Frame %d", Frame );
 		PrintMemStats();
-		// After ~256 frames
 		DumpMemStatsDC( "after several scenes" );
 	}
 
@@ -435,60 +507,50 @@ void UPVRRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& Surf
 	FLOAT UDot = Facet.MapCoords.XAxis | Facet.MapCoords.Origin;
 	FLOAT VDot = Facet.MapCoords.YAxis | Facet.MapCoords.Origin;
 
+	struct FDrawSurfaceCallback : public FPVRRenderCallback
+	{
+		pvr_poly_hdr_t Hdr;
+		FSceneNode* Frame;
+		TArray<FPVRClipVert> ClippedVerts;
+		UBOOL ReverseWinding;
+		
+		virtual void Execute() override
+		{
+			PVRHeaderSubmit( Hdr );
+			if( ClippedVerts.Num() >= 3 )
+			{
+				dcache_pref_block(&ClippedVerts(0));
+				if( ReverseWinding )
+				{
+					for( INT j = 1; j < ClippedVerts.Num() - 1; ++j )
+					{
+						dcache_pref_block(&ClippedVerts(j + 1));
+						FLOAT sx, sy, sz;
+						ProjectToScreenUE( Frame, ClippedVerts(0).X, ClippedVerts(0).Y, ClippedVerts(0).Z, sx, sy, sz );
+						PVRVertexSubmit( sx, sy, sz, ClippedVerts(0).U, ClippedVerts(0).V, ClippedVerts(0).ARGB, PVR_CMD_VERTEX );
+						ProjectToScreenUE( Frame, ClippedVerts(j+1).X, ClippedVerts(j+1).Y, ClippedVerts(j+1).Z, sx, sy, sz );
+						PVRVertexSubmit( sx, sy, sz, ClippedVerts(j+1).U, ClippedVerts(j+1).V, ClippedVerts(j+1).ARGB, PVR_CMD_VERTEX );
+						ProjectToScreenUE( Frame, ClippedVerts(j).X, ClippedVerts(j).Y, ClippedVerts(j).Z, sx, sy, sz );
+						PVRVertexSubmit( sx, sy, sz, ClippedVerts(j).U, ClippedVerts(j).V, ClippedVerts(j).ARGB, PVR_CMD_VERTEX_EOL );
+					}
+				}
+				else
+				{
+					SubmitTriangleFan( Frame, &ClippedVerts(0), ClippedVerts.Num(), 1 );
+				}
+			}
+		}
+	};
+
     // Draw base texture pass.
     SetBlend( Surface.PolyFlags );
     SetTexture( *Surface.Texture, ( Surface.PolyFlags & PF_Masked ), 0.f );
     {
         pvr_poly_hdr_t Hdr; pvr_list_t List;
         BuildPolyHeader( this, Surface.PolyFlags, Surface.Texture, Hdr, List );
-        EnsurePVRList( List );
 
         const DWORD White = 0xFFFFFFFFu;
-        for( FSavedPoly* Poly = Facet.Polys; Poly; Poly = Poly->Next )
-        {
-            FPVRClipVert In[64]; FPVRClipVert Clipped[64];
-            INT N = 0;
-            for( INT i = 0; i < Poly->NumPts && N < 64; i++ )
-            {
-                const FVector& V = Poly->Pts[i]->Point; // already in view space
-                In[N].X = V.X; In[N].Y = V.Y; In[N].Z = V.Z;
-                In[N].U = ( (Facet.MapCoords.XAxis | V) - UDot - TexInfo.UPan ) * TexInfo.UMult;
-                In[N].V = ( (Facet.MapCoords.YAxis | V) - VDot - TexInfo.VPan ) * TexInfo.VMult;
-                In[N].ARGB = White;
-                N++;
-            }
-            if( GPVRDebugVertsLeft > 0 )
-            {
-                debugf( "---- Frame/Coords ----" );
-                DebugDumpCoords( Frame->Coords );
-                debugf( "RProjZ=%.4f Aspect=%.4f FX=%.4f FY=%.4f", RProjZ, Aspect, (FLOAT)Frame->FX, (FLOAT)Frame->FY );
-                for( INT di=0; di<Min(N,3); ++di )
-                {
-                    debugf( "Pw[%d]", di ); DebugDumpVec( "view", In[di].X, In[di].Y, In[di].Z );
-                    FLOAT sx, sy, sz; ProjectToScreenUE( Frame, In[di].X, In[di].Y, In[di].Z, sx, sy, sz );
-                    debugf( "screen = (%.2f, %.2f, z=%.5f)", sx, sy, sz );
-                }
-                GPVRDebugVertsLeft--;
-            }
-            const INT C = ClipPolyNear( In, N, Clipped );
-            if( C < 3 )
-                continue;
-            PVRHeaderSubmit( Hdr );
-            SubmitTriangleFan( Frame, Clipped, C, 1 );
-        }
-    }
-
-	// Draw lightmap.
-	// @HACK: Unless this is the sky. See above.
-    if( Surface.LightMap && !CurrentSceneNode.bIsSky )
-    {
-        SetBlend( PF_Modulated );
-        SetTexture( *Surface.LightMap, 0, -0.5f );
-        pvr_poly_hdr_t Hdr; pvr_list_t List;
-        BuildPolyHeader( this, PF_Modulated | (Surface.PolyFlags & PF_Masked), Surface.LightMap, Hdr, List );
-        EnsurePVRList( List );
-
-        const DWORD White = 0xFFFFFFFFu;
+        const UBOOL ReverseWinding = (Frame->Mirror < 0.0f);
         for( FSavedPoly* Poly = Facet.Polys; Poly; Poly = Poly->Next )
         {
             FPVRClipVert In[64]; FPVRClipVert Clipped[64];
@@ -505,35 +567,115 @@ void UPVRRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& Surf
             const INT C = ClipPolyNear( In, N, Clipped );
             if( C < 3 )
                 continue;
-            PVRHeaderSubmit( Hdr );
-            SubmitTriangleFan( Frame, Clipped, C, 1 );
+            
+            FDrawSurfaceCallback* CB = new FDrawSurfaceCallback;
+            CB->Hdr = Hdr;
+            CB->Frame = Frame;
+            CB->ReverseWinding = ReverseWinding;
+            CB->ClippedVerts.Empty();
+            for( INT i = 0; i < C; i++ )
+                CB->ClippedVerts.AddItem( Clipped[i] );
+            
+            // Add to appropriate list
+            if( List == PVR_LIST_OP_POLY )
+                GPVROPCallbacks.AddItem( CB );
+            else if( List == PVR_LIST_PT_POLY )
+                GPVRPTCallbacks.AddItem( CB );
+            else
+                GPVRTRCallbacks.AddItem( CB );
+        }
+    }
+
+	// Draw lightmap.
+	// @HACK: Unless this is the sky. See above.
+    if( Surface.LightMap && !CurrentSceneNode.bIsSky )
+    {
+        SetBlend( PF_Modulated );
+        SetTexture( *Surface.LightMap, 0, -0.5f );
+        pvr_poly_hdr_t Hdr; pvr_list_t List;
+        BuildPolyHeader( this, PF_Modulated | (Surface.PolyFlags & PF_Masked), Surface.LightMap, Hdr, List );
+
+        const DWORD White = 0xFFFFFFFFu;
+        const UBOOL ReverseWinding = (Frame->Mirror < 0.0f);
+        for( FSavedPoly* Poly = Facet.Polys; Poly; Poly = Poly->Next )
+        {
+            FPVRClipVert In[64]; FPVRClipVert Clipped[64];
+            INT N = 0;
+            for( INT i = 0; i < Poly->NumPts && N < 64; i++ )
+            {
+                const FVector& V = Poly->Pts[i]->Point;
+                In[N].X = V.X; In[N].Y = V.Y; In[N].Z = V.Z;
+                In[N].U = ( (Facet.MapCoords.XAxis | V) - UDot - TexInfo.UPan ) * TexInfo.UMult;
+                In[N].V = ( (Facet.MapCoords.YAxis | V) - VDot - TexInfo.VPan ) * TexInfo.VMult;
+                In[N].ARGB = White;
+                N++;
+            }
+            const INT C = ClipPolyNear( In, N, Clipped );
+            if( C < 3 )
+                continue;
+            
+            FDrawSurfaceCallback* CB = new FDrawSurfaceCallback;
+            CB->Hdr = Hdr;
+            CB->Frame = Frame;
+            CB->ReverseWinding = ReverseWinding;
+            CB->ClippedVerts.Empty();
+            for( INT i = 0; i < C; i++ )
+                CB->ClippedVerts.AddItem( Clipped[i] );
+            
+            if( List == PVR_LIST_OP_POLY )
+                GPVROPCallbacks.AddItem( CB );
+            else if( List == PVR_LIST_PT_POLY )
+                GPVRPTCallbacks.AddItem( CB );
+            else
+                GPVRTRCallbacks.AddItem( CB );
         }
     }
 
 	// Draw fog.
-	/*
 	if( Surface.FogMap )
 	{
-		SetBlend( PF_Highlighted );
-		if( Surface.PolyFlags & PF_Masked )
-			glDepthFunc( GL_EQUAL );
-		SetTexture( *Surface.FogMap, 0, -0.5f );
+		const DWORD FogFlags = PF_Highlighted | (Surface.PolyFlags & PF_Masked);
+		SetBlend( FogFlags );
+		SetTexture( *Surface.FogMap, ( Surface.PolyFlags & PF_Masked ), -0.5f );
+
+		pvr_poly_hdr_t Hdr; pvr_list_t List;
+		BuildPolyHeader( this, FogFlags, Surface.FogMap, Hdr, List );
+
+		const DWORD White = 0xFFFFFFFFu;
+		const UBOOL ReverseWinding = (Frame->Mirror < 0.0f);
 		for( FSavedPoly* Poly = Facet.Polys; Poly; Poly = Poly->Next )
 		{
-			glBegin( GL_TRIANGLE_FAN );
-			for( INT i = 0; i < Poly->NumPts; i++ )
+			FPVRClipVert In[64]; FPVRClipVert Clipped[64];
+			INT N = 0;
+			for( INT i = 0; i < Poly->NumPts && N < 64; i++ )
 			{
-				FLOAT U = Facet.MapCoords.XAxis | Poly->Pts[i]->Point;
-				FLOAT V = Facet.MapCoords.YAxis | Poly->Pts[i]->Point;
-				glTexCoord2f( (U-UDot-TexInfo.UPan)*TexInfo.UMult, (V-VDot-TexInfo.VPan)*TexInfo.VMult );
-				glVertex3f( Poly->Pts[i]->Point.X, Poly->Pts[i]->Point.Y, Poly->Pts[i]->Point.Z );
+				const FVector& V = Poly->Pts[i]->Point;
+				In[N].X = V.X; In[N].Y = V.Y; In[N].Z = V.Z;
+				In[N].U = ( (Facet.MapCoords.XAxis | V) - UDot - TexInfo.UPan ) * TexInfo.UMult;
+				In[N].V = ( (Facet.MapCoords.YAxis | V) - VDot - TexInfo.VPan ) * TexInfo.VMult;
+				In[N].ARGB = White;
+				N++;
 			}
-			glEnd();
+			const INT C = ClipPolyNear( In, N, Clipped );
+			if( C < 3 )
+				continue;
+			
+			FDrawSurfaceCallback* CB = new FDrawSurfaceCallback;
+			CB->Hdr = Hdr;
+			CB->Frame = Frame;
+			CB->ReverseWinding = ReverseWinding;
+			CB->ClippedVerts.Empty();
+			for( INT i = 0; i < C; i++ )
+				CB->ClippedVerts.AddItem( Clipped[i] );
+			
+			if( List == PVR_LIST_OP_POLY )
+				GPVROPCallbacks.AddItem( CB );
+			else if( List == PVR_LIST_PT_POLY )
+				GPVRPTCallbacks.AddItem( CB );
+			else
+				GPVRTRCallbacks.AddItem( CB );
 		}
-		if( Surface.PolyFlags & PF_Masked )
-			glDepthFunc( GL_LEQUAL );
 	}
-	*/
 
 	unguard;
 }
@@ -551,8 +693,29 @@ void UPVRRenderDevice::DrawGouraudPolygon( FSceneNode* Frame, FTextureInfo& Text
 	// Build header for textured gouraud fan
     pvr_poly_hdr_t Hdr; pvr_list_t List;
     BuildPolyHeader( this, PolyFlags, &Texture, Hdr, List );
-	EnsurePVRList( List );
-	PVRHeaderSubmit( Hdr );
+
+	struct FDrawGouraudCallback : public FPVRRenderCallback
+	{
+		pvr_poly_hdr_t Hdr;
+		FSceneNode* Frame;
+		TArray<FPVRClipVert> ClippedVerts;
+		
+		virtual void Execute() override
+		{
+			PVRHeaderSubmit( Hdr );
+			if( ClippedVerts.Num() >= 3 )
+			{
+				for( INT i = 0; i < ClippedVerts.Num(); i++ )
+				{
+					const FPVRClipVert& Vtx = ClippedVerts(i);
+					FLOAT SX, SY, SZ;
+					ProjectToScreenUE( Frame, Vtx.X, Vtx.Y, Vtx.Z, SX, SY, SZ );
+					const unsigned Flags = (i == ClippedVerts.Num() - 1) ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
+					PVRVertexSubmit( SX, SY, SZ, Vtx.U, Vtx.V, Vtx.ARGB, Flags );
+				}
+			}
+		}
+	};
 
     {
         FPVRClipVert In[64]; FPVRClipVert Clipped[64];
@@ -574,14 +737,19 @@ void UPVRRenderDevice::DrawGouraudPolygon( FSceneNode* Frame, FTextureInfo& Text
         const INT C = ClipPolyNear( In, N, Clipped );
         if( C >= 3 )
         {
+            FDrawGouraudCallback* CB = new FDrawGouraudCallback;
+            CB->Hdr = Hdr;
+            CB->Frame = Frame;
+            CB->ClippedVerts.Empty();
             for( INT i = 0; i < C; i++ )
-            {
-                const FPVRClipVert& Vtx = Clipped[i];
-                FLOAT SX, SY, SZ;
-                ProjectToScreenUE( Frame, Vtx.X, Vtx.Y, Vtx.Z, SX, SY, SZ );
-                const unsigned Flags = (i == C - 1) ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
-                PVRVertexSubmit( SX, SY, SZ, Vtx.U, Vtx.V, Vtx.ARGB, Flags );
-            }
+                CB->ClippedVerts.AddItem( Clipped[i] );
+            
+            if( List == PVR_LIST_OP_POLY )
+                GPVROPCallbacks.AddItem( CB );
+            else if( List == PVR_LIST_PT_POLY )
+                GPVRPTCallbacks.AddItem( CB );
+            else
+                GPVRTRCallbacks.AddItem( CB );
         }
     }
 
@@ -590,8 +758,7 @@ void UPVRRenderDevice::DrawGouraudPolygon( FSceneNode* Frame, FTextureInfo& Text
 	{
         pvr_poly_hdr_t FogHdr; pvr_list_t FogList;
         BuildPolyHeader( this, PF_Highlighted, nullptr, FogHdr, FogList );
-        EnsurePVRList( FogList );
-        PVRHeaderSubmit( FogHdr );
+        
         FPVRClipVert InF[64]; FPVRClipVert ClipF[64];
         INT NF = 0;
         for( INT i = 0; i < NumPts && NF < 64; i++ )
@@ -606,13 +773,21 @@ void UPVRRenderDevice::DrawGouraudPolygon( FSceneNode* Frame, FTextureInfo& Text
             NF++;
         }
         const INT CF = ClipPolyNear( InF, NF, ClipF );
-        for( INT i = 0; i < CF; i++ )
+        if( CF >= 3 )
         {
-            const FPVRClipVert& Vtx = ClipF[i];
-            FLOAT SX, SY, SZ;
-            ProjectToScreenUE( Frame, Vtx.X, Vtx.Y, Vtx.Z, SX, SY, SZ );
-            const unsigned Flags = (i == CF - 1) ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
-            PVRVertexSubmit( SX, SY, SZ, 0.f, 0.f, Vtx.ARGB, Flags );
+            FDrawGouraudCallback* FogCB = new FDrawGouraudCallback;
+            FogCB->Hdr = FogHdr;
+            FogCB->Frame = Frame;
+            FogCB->ClippedVerts.Empty();
+            for( INT i = 0; i < CF; i++ )
+                FogCB->ClippedVerts.AddItem( ClipF[i] );
+            
+            if( FogList == PVR_LIST_OP_POLY )
+                GPVROPCallbacks.AddItem( FogCB );
+            else if( FogList == PVR_LIST_PT_POLY )
+                GPVRPTCallbacks.AddItem( FogCB );
+            else
+                GPVRTRCallbacks.AddItem( FogCB );
         }
 	}
 
@@ -627,14 +802,54 @@ void UPVRRenderDevice::DrawTile( FSceneNode* Frame, FTextureInfo& Texture, FLOAT
 	TexInfo.bIsTile = true;
 
 	SetSceneNode( Frame );
-	SetBlend( PolyFlags );
+	
+	const UBOOL IsUITile = (Span == NULL);
+	DWORD TileFlags = PolyFlags;
+	if( IsUITile && !(TileFlags & (PF_Translucent|PF_Modulated|PF_Highlighted)) )
+	{
+		TileFlags |= PF_Translucent;
+		TileFlags &= ~PF_Occlude;
+	}
+	
+	SetBlend( TileFlags );
 	SetTexture( Texture, ( PolyFlags & PF_Masked ), 0.f );
 
-    pvr_poly_hdr_t Hdr; pvr_list_t List;
-    // UI tiles should ignore depth to avoid fighting with world and among tiles
-    BuildPolyHeader( this, PolyFlags, &Texture, Hdr, List, /*ForceNoDepthTest=*/1 );
-	EnsurePVRList( List );
-	PVRHeaderSubmit( Hdr );
+	pvr_poly_hdr_t Hdr;
+	pvr_list_t List;
+	BuildPolyHeader( this, TileFlags, &Texture, Hdr, List, /*ForceNoDepthTest=*/1 );
+	
+	if( IsUITile && (TileFlags & PF_Translucent) )
+	{
+		// Modify the header blend mode directly for UI tiles
+		// This is a hack but necessary since BuildPolyHeader uses global state
+		// We need to recompile with proper alpha blend mode
+		pvr_poly_cxt_t Cxt;
+		if( TexInfo.CurrentBind && TexInfo.CurrentBind->Tex )
+		{
+			const INT USize = Max( UPVRRenderDevice::MinTexSize, Texture.USize );
+			const INT VSize = Max( UPVRRenderDevice::MinTexSize, Texture.VSize );
+			int PvrFmt = (Texture.Palette ? PVR_TXRFMT_ARGB1555 : PVR_TXRFMT_RGB565);
+			if( Texture.Format == TEXF_EXT_ARGB1555_VQ )
+				PvrFmt |= PVR_TXRFMT_TWIDDLED | PVR_TXRFMT_VQ_ENABLE;
+			else
+				PvrFmt |= PVR_TXRFMT_NONTWIDDLED;
+			pvr_poly_cxt_txr( &Cxt, PVR_LIST_TR_POLY, PvrFmt, USize, VSize, TexInfo.CurrentBind->Tex, NoFiltering ? PVR_FILTER_NONE : PVR_FILTER_BILINEAR );
+		}
+		else
+		{
+			pvr_poly_cxt_col( &Cxt, PVR_LIST_TR_POLY );
+		}
+		Cxt.depth.comparison = PVR_DEPTHCMP_ALWAYS;
+		Cxt.depth.write = PVR_DEPTHWRITE_DISABLE;
+		Cxt.gen.culling = GPVRCullMode;
+		Cxt.blend.src = PVR_BLEND_SRCALPHA;
+		Cxt.blend.dst = PVR_BLEND_INVSRCALPHA;
+		Cxt.txr.alpha = PVR_TXRALPHA_ENABLE;
+		Cxt.txr.env = PVR_TXRENV_MODULATEALPHA;
+		Cxt.gen.fog_type = PVR_FOG_DISABLE;
+		pvr_poly_compile( &Hdr, &Cxt );
+		List = PVR_LIST_TR_POLY;
+	}
 
 	const DWORD ARGB = (PolyFlags & PF_Modulated)
 		? 0xFFFFFFFFu
@@ -648,19 +863,38 @@ void UPVRRenderDevice::DrawTile( FSceneNode* Frame, FTextureInfo& Texture, FLOAT
 	const FLOAT U1 = (U+UL) * TexInfo.UMult;
 	const FLOAT V1 = (V+VL) * TexInfo.VMult;
 
-    // Submit as two independent triangles (no strips in DR): A,B,C and A,C,D
-    const FLOAT Ax = X,        Ay = Y;        const FLOAT Au = U0, Av = V0;
-    const FLOAT Bx = X + XL,   By = Y;        const FLOAT Bu = U1, Bv = V0;
-    const FLOAT Cx = X + XL,   Cy = Y + YL;   const FLOAT Cu = U1, Cv = V1;
-    const FLOAT Dx = X,        Dy = Y + YL;   const FLOAT Du = U0, Dv = V1;
+	struct FDrawTileCallback : public FPVRRenderCallback
+	{
+		pvr_poly_hdr_t Hdr;
+		FSceneNode* Frame;
+		FLOAT Ax, Ay, Bx, By, Cx, Cy, Dx, Dy;
+		FLOAT Au, Av, Bu, Bv, Cu, Cv, Du, Dv;
+		FLOAT Z;
+		DWORD ARGB;
+		
+		virtual void Execute() override
+		{
+			PVRHeaderSubmit( Hdr );
+			PVRVertexSubmit( Ax, Ay, Z, Au, Av, ARGB, PVR_CMD_VERTEX );
+			PVRVertexSubmit( Bx, By, Z, Bu, Bv, ARGB, PVR_CMD_VERTEX );
+			PVRVertexSubmit( Cx, Cy, Z, Cu, Cv, ARGB, PVR_CMD_VERTEX_EOL );
+			PVRVertexSubmit( Ax, Ay, Z, Au, Av, ARGB, PVR_CMD_VERTEX );
+			PVRVertexSubmit( Cx, Cy, Z, Cu, Cv, ARGB, PVR_CMD_VERTEX );
+			PVRVertexSubmit( Dx, Dy, Z, Du, Dv, ARGB, PVR_CMD_VERTEX_EOL );
+		}
+	};
 
-    PVRVertexSubmit( Ax, Ay, Z, Au, Av, ARGB, PVR_CMD_VERTEX );
-    PVRVertexSubmit( Bx, By, Z, Bu, Bv, ARGB, PVR_CMD_VERTEX );
-    PVRVertexSubmit( Cx, Cy, Z, Cu, Cv, ARGB, PVR_CMD_VERTEX_EOL );
+	FDrawTileCallback* CB = new FDrawTileCallback;
+	CB->Hdr = Hdr;
+	CB->Frame = Frame;
+	CB->Ax = X;        CB->Ay = Y;        CB->Au = U0; CB->Av = V0;
+	CB->Bx = X + XL;   CB->By = Y;        CB->Bu = U1; CB->Bv = V0;
+	CB->Cx = X + XL;   CB->Cy = Y + YL;   CB->Cu = U1; CB->Cv = V1;
+	CB->Dx = X;        CB->Dy = Y + YL;   CB->Du = U0; CB->Dv = V1;
+	CB->Z = Z;
+	CB->ARGB = ARGB;
 
-    PVRVertexSubmit( Ax, Ay, Z, Au, Av, ARGB, PVR_CMD_VERTEX );
-    PVRVertexSubmit( Cx, Cy, Z, Cu, Cv, ARGB, PVR_CMD_VERTEX );
-    PVRVertexSubmit( Dx, Dy, Z, Du, Dv, ARGB, PVR_CMD_VERTEX_EOL );
+	GPVRTRCallbacks.AddItem( CB );
 
 	TexInfo.bIsTile = false;
 
@@ -690,8 +924,6 @@ void UPVRRenderDevice::EndFlash( )
     pvr_poly_hdr_t Hdr; pvr_list_t List;
     // Fullscreen flash should ignore depth
     BuildPolyHeader( this, PF_Highlighted, nullptr, Hdr, List, /*ForceNoDepthTest=*/1 );
-	EnsurePVRList( List );
-	PVRHeaderSubmit( Hdr );
 
 	const BYTE A = (BYTE)Clamp<INT>(appRound(ColorMod.W * 255.f), 0, 255);
 	const BYTE R = (BYTE)Clamp<INT>(appRound(ColorMod.X * 255.f), 0, 255);
@@ -703,14 +935,32 @@ void UPVRRenderDevice::EndFlash( )
 	const FLOAT H = (FLOAT)Viewport->SizeY;
 	const FLOAT Z = 1.f;
 
-    // Two independent triangles for fullscreen quad
-    PVRVertexSubmit( 0.f, 0.f, Z, 0.f, 0.f, ARGB, PVR_CMD_VERTEX );
-    PVRVertexSubmit( W,   0.f, Z, 0.f, 0.f, ARGB, PVR_CMD_VERTEX );
-    PVRVertexSubmit( W,   H,   Z, 0.f, 0.f, ARGB, PVR_CMD_VERTEX_EOL );
+	// Create callback for flash (always TR_POLY for 2D)
+	struct FEndFlashCallback : public FPVRRenderCallback
+	{
+		pvr_poly_hdr_t Hdr;
+		FLOAT W, H, Z;
+		DWORD ARGB;
+		
+		virtual void Execute() override
+		{
+			PVRHeaderSubmit( Hdr );
+			PVRVertexSubmit( 0.f, 0.f, Z, 0.f, 0.f, ARGB, PVR_CMD_VERTEX );
+			PVRVertexSubmit( W,   0.f, Z, 0.f, 0.f, ARGB, PVR_CMD_VERTEX );
+			PVRVertexSubmit( W,   H,   Z, 0.f, 0.f, ARGB, PVR_CMD_VERTEX_EOL );
+			PVRVertexSubmit( 0.f, 0.f, Z, 0.f, 0.f, ARGB, PVR_CMD_VERTEX );
+			PVRVertexSubmit( W,   H,   Z, 0.f, 0.f, ARGB, PVR_CMD_VERTEX );
+			PVRVertexSubmit( 0.f, H,   Z, 0.f, 0.f, ARGB, PVR_CMD_VERTEX_EOL );
+		}
+	};
 
-    PVRVertexSubmit( 0.f, 0.f, Z, 0.f, 0.f, ARGB, PVR_CMD_VERTEX );
-    PVRVertexSubmit( W,   H,   Z, 0.f, 0.f, ARGB, PVR_CMD_VERTEX );
-    PVRVertexSubmit( 0.f, H,   Z, 0.f, 0.f, ARGB, PVR_CMD_VERTEX_EOL );
+	FEndFlashCallback* CB = new FEndFlashCallback;
+	CB->Hdr = Hdr;
+	CB->W = W;
+	CB->H = H;
+	CB->Z = Z;
+	CB->ARGB = ARGB;
+	GPVRTRCallbacks.AddItem( CB );
 
 	unguard;
 }
@@ -812,7 +1062,38 @@ void UPVRRenderDevice::SetBlend( DWORD PolyFlags, UBOOL InverseOrder )
 	else if( PolyFlags & PF_Translucent )
 		PolyFlags &= ~PF_Masked;
 
-	// Record current flags; BuildPolyHeader will translate them into PVR header state.
+	// Update global render state 
+	if( PolyFlags & PF_Translucent )
+	{
+		GPVRBlendEnabled = 1;
+		GPVRSrcBlend = PVR_BLEND_ONE;
+		GPVRDstBlend = PVR_BLEND_ONE; // Approximate GL_ONE_MINUS_SRC_COLOR
+	}
+	else if( PolyFlags & PF_Modulated )
+	{
+		GPVRBlendEnabled = 1;
+		GPVRSrcBlend = PVR_BLEND_DESTCOLOR;
+		GPVRDstBlend = PVR_BLEND_ZERO;
+	}
+	else if( PolyFlags & PF_Highlighted )
+	{
+		GPVRBlendEnabled = 1;
+		GPVRSrcBlend = PVR_BLEND_ONE;
+		GPVRDstBlend = PVR_BLEND_INVSRCALPHA;
+	}
+	else
+	{
+		GPVRBlendEnabled = 0;
+		GPVRSrcBlend = PVR_BLEND_ONE;
+		GPVRDstBlend = PVR_BLEND_ZERO;
+	}
+
+	if( PolyFlags & PF_Occlude )
+		GPVRZWrite = PVR_DEPTHWRITE_ENABLE;
+	else
+		GPVRZWrite = PVR_DEPTHWRITE_DISABLE;
+
+	// Record current flags
 	CurrentPolyFlags = PolyFlags;
 
 	unguard;
