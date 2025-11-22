@@ -503,8 +503,8 @@ class RENDER_API URender : public URenderBase
 
 	// OccludeBsp dynamics.
 #ifdef PLATFORM_DREAMCAST
-	enum {MAX_NODES  = 32768};
-	enum {MAX_POINTS = 64000};
+	enum {MAX_NODES  = 30000};
+	enum {MAX_POINTS = 30000};
 #else
 	enum {MAX_NODES  = 65536};
 	enum {MAX_POINTS = 128000};
