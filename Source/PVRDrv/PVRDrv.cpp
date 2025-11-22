@@ -1073,7 +1073,7 @@ void UPVRRenderDevice::SetBlend( DWORD PolyFlags, UBOOL InverseOrder )
 	{
 		GPVRBlendEnabled = 1;
 		GPVRSrcBlend = PVR_BLEND_DESTCOLOR;
-		GPVRDstBlend = PVR_BLEND_ZERO;
+		GPVRDstBlend = PVR_BLEND_DESTCOLOR;
 	}
 	else if( PolyFlags & PF_Highlighted )
 	{
