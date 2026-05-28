@@ -22,6 +22,7 @@ private:
 	void ConvertMusicPkg( const FString& PkgPath, UPackage* Pkg );
 	void ConvertMeshPkg( const FString& PkgPath, UPackage* Pkg, const FMeshReducer::FOptions& Options );
 	void ConvertMapPkg( const FString& PkgPath, UPackage* Pkg );
+	void AnalyzeMapLimits( const char* MapGlob );
 	void CommitChanges();
 
 private:

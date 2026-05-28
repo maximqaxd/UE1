@@ -12,6 +12,10 @@
 =============================================================================*/
 
 #include "DCUtilPrivate.h"
+#include <dirent.h>
+#include <errno.h>
+#include <unistd.h>
+#include <stdlib.h>
 
 /*-----------------------------------------------------------------------------
 	RLE Compression for LightBits
@@ -268,216 +272,637 @@ void FDCUtil::ConvertMapPkg( const FString& PkgPath, UPackage* Pkg )
 }
 
 /*-----------------------------------------------------------------------------
-	AnalyzeBSPStructures: Analyze BSP data structures for compression opportunities
+	AnalyzeMapLimits: Full per-array analysis of every .unr map.
+	For each BSP array, reports element count, current RAM cost,
+	max index value, whether SWORD (16-bit signed, max 32767) or
+	WORD (16-bit unsigned, max 65535) is sufficient, and projected
+	savings from the proposed compressed struct layout.
 -----------------------------------------------------------------------------*/
 
-void FDCUtil::AnalyzeBSPStructures( UModel* Model, DWORD& OutTotalSize, DWORD& OutSavings, UBOOL& OutCanCompress )
+struct FArrayStats
 {
-	guard(AnalyzeBSPStructures);
-	
-	OutTotalSize = 0;
-	OutSavings = 0;
-	OutCanCompress = false;
-	
-	if( !Model )
-		return;
-	
-	// Don't print per-model analysis - aggregate for map summary
-	
-	// Skip BSP Nodes - already compressed for Dreamcast
-	
-	// Analyze BSP Surfaces
-	if( Model->Surfs && Model->Surfs->GetData() && Model->Surfs->Num() > 0 )
-	{
-		INT SurfCount = Model->Surfs->Num();
-		DWORD TotalSurfSize = SurfCount * sizeof(FBspSurf);
-		
-		// Check index ranges
-		INT MaxPBase = 0, MaxVNormal = 0, MaxVTextureU = 0, MaxVTextureV = 0;
-		INT MaxILightMap = 0, MaxIBrushPoly = 0;
-		
-		for( INT i = 0; i < SurfCount; i++ )
-		{
-			FBspSurf& Surf = Model->Surfs->Element(i);
-			if( Surf.pBase > MaxPBase ) MaxPBase = Surf.pBase;
-			if( Surf.vNormal > MaxVNormal ) MaxVNormal = Surf.vNormal;
-			if( Surf.vTextureU > MaxVTextureU ) MaxVTextureU = Surf.vTextureU;
-			if( Surf.vTextureV > MaxVTextureV ) MaxVTextureV = Surf.vTextureV;
-			if( Surf.iLightMap > MaxILightMap ) MaxILightMap = Surf.iLightMap;
-			if( Surf.iBrushPoly > MaxIBrushPoly ) MaxIBrushPoly = Surf.iBrushPoly;
-		}
-		
-		// Check compression opportunities
-		UBOOL CanUseSWORD = (MaxPBase <= 32767 && MaxVNormal <= 32767 && 
-		                     MaxVTextureU <= 32767 && MaxVTextureV <= 32767 &&
-		                     MaxILightMap <= 32767 && MaxIBrushPoly <= 32767);
-		UBOOL CanUseWORD = (MaxPBase <= 65535 && MaxVNormal <= 65535);
-		
-		if( CanUseSWORD )
-		{
-			DWORD SavedBytes = SurfCount * 6 * 2; // 6 INT fields -> SWORD = 2 bytes saved each
-			OutSavings += SavedBytes;
-			OutCanCompress = true;
-		}
-		else if( CanUseWORD )
-		{
-			DWORD SavedBytes = SurfCount * 2 * 2; // 2 INT fields -> WORD = 2 bytes saved each
-			OutSavings += SavedBytes;
-			OutCanCompress = true;
-		}
-		OutTotalSize += TotalSurfSize;
-	}
-	
-	// Analyze Vectors (skip if data not accessible - UVectors may have special layout)
-	if( Model->Vectors && Model->Vectors->GetData() && Model->Vectors->Num() > 0 )
-	{
-		INT VectorCount = Model->Vectors->Num();
-		DWORD TotalVectorSize = VectorCount * sizeof(FVector);
-		OutTotalSize += TotalVectorSize;
-		
-		// Skip compression analysis for Vectors - UVectors may have special memory layout
-		// that causes issues when accessing Element() on Dreamcast
-	}
-	
-	// Analyze Points (skip on Dreamcast - UVectors may have special memory layout)
-	// Just count the size, don't try to analyze compression opportunities
-	if( Model->Points && Model->Points->Num() > 0 )
-	{
-		INT PointCount = Model->Points->Num();
-		DWORD TotalPointSize = PointCount * sizeof(FVector);
-		OutTotalSize += TotalPointSize;
-		// Skip compression analysis for Points - UVectors may have special memory layout
-		// that causes issues when accessing Element()
-	}
-	
-	// Skip Verts analysis
-	
-	// Add Nodes size to total
-	if( Model->Nodes ) 
-		OutTotalSize += Model->Nodes->Num() * sizeof(FBspNode);
-	
-	unguard;
-}
+	INT Count;
+	INT MaxSlack;
+	INT ElemSize;
+	INT MaxIndex;
+	const char* Name;
 
-/*-----------------------------------------------------------------------------
-	AnalyzeMaps: Analyze map packages for BSP compression opportunities
------------------------------------------------------------------------------*/
-
-// Summary structure for map analysis
-struct FMapAnalysisSummary
-{
-	FString MapName;
-	DWORD TotalSize;
-	DWORD PotentialSavings;
-	UBOOL CanCompress;
+	DWORD CurrentBytes() const { return (DWORD)Count * ElemSize; }
+	DWORD SlackBytes()   const { return (DWORD)MaxSlack * ElemSize; }
 };
 
-void FDCUtil::AnalyzeMaps( const char* MapDir )
+struct FFieldRange
 {
-	guard(AnalyzeMaps);
-	
-	printf( "Analyzing maps in '%s' for BSP compression opportunities...\n\n", MapDir );
-	
-	// Load all .unr files in the directory
-	char Pattern[2048];
-	snprintf( Pattern, sizeof(Pattern), "%s/*.unr", MapDir );
-	
-	TArray<FString> Files = appFindFiles( Pattern );
-	
+	const char* Name;
+	INT Max;
+	INT Min;
+	UBOOL FitsSWORD() const { return Max <= 32767 && Min >= -32768; }
+	UBOOL FitsWORD()  const { return Max <= 65535 && Min >= 0; }
+	UBOOL FitsBYTE()  const { return Max <= 255   && Min >= 0; }
+};
+
+struct FMapReport
+{
+	char MapName[128];
+
+	INT NumNodes, NumSurfs, NumVerts, NumVectors, NumPoints;
+	INT NumLightMaps, NumLightBits, NumBounds, NumLeafHulls, NumLeaves, NumLights;
+	INT NumActors, NumTextures;
+
+	DWORD CurrentTotalBytes;
+	DWORD ProposedTotalBytes;
+	DWORD SavingsBytes;
+
+	INT NumFieldOverflows;
+	char OverflowFields[2048];
+
+	// Per-field max/min for this map
+	INT NodeIVertPoolMax;
+	INT SurfPBaseMax, SurfVNormalMax, SurfVTextureUMax, SurfVTextureVMax;
+	INT SurfILightMapMax, SurfIBrushPolyMax;
+	INT VertPVertexMax, VertISideMax;
+	INT VertPVertexMin, VertISideMin;
+};
+
+static void AnalyzeLevelModel( UModel* Model, FMapReport& R )
+{
+	// --- Nodes ---
+	if( Model->Nodes && Model->Nodes->Num() > 0 )
+	{
+		const INT N = Model->Nodes->Num();
+		R.NumNodes = N;
+
+		FFieldRange NodeFields[] = {
+			{ "Node.iSurf",            0, 0 },
+			{ "Node.iBack",            0, -1 },
+			{ "Node.iFront",           0, -1 },
+			{ "Node.iPlane",           0, -1 },
+			{ "Node.iCollisionBound",  0, -1 },
+			{ "Node.iRenderBound",     0, -1 },
+			{ "Node.iVertPool",        0, 0 },
+			{ "Node.iLeaf[0]",         0, -1 },
+			{ "Node.iLeaf[1]",         0, -1 },
+		};
+
+		for( INT i = 0; i < N; i++ )
+		{
+			FBspNode& Node = Model->Nodes->Element(i);
+			// On DC build these are already SWORD, but the .unr file stores INT.
+			// We read via the desktop struct layout (INT fields).
+			INT iSurf = Node.iSurf;
+			INT iBack = Node.iBack;
+			INT iFront = Node.iFront;
+			INT iPlane = Node.iPlane;
+			INT iColl = Node.iCollisionBound;
+			INT iRend = Node.iRenderBound;
+			INT iVP   = Node.iVertPool;
+			INT iL0   = Node.iLeaf[0];
+			INT iL1   = Node.iLeaf[1];
+
+			if( iSurf > NodeFields[0].Max ) NodeFields[0].Max = iSurf;
+			if( iSurf < NodeFields[0].Min ) NodeFields[0].Min = iSurf;
+			if( iBack > NodeFields[1].Max ) NodeFields[1].Max = iBack;
+			if( iBack < NodeFields[1].Min ) NodeFields[1].Min = iBack;
+			if( iFront > NodeFields[2].Max ) NodeFields[2].Max = iFront;
+			if( iFront < NodeFields[2].Min ) NodeFields[2].Min = iFront;
+			if( iPlane > NodeFields[3].Max ) NodeFields[3].Max = iPlane;
+			if( iPlane < NodeFields[3].Min ) NodeFields[3].Min = iPlane;
+			if( iColl > NodeFields[4].Max ) NodeFields[4].Max = iColl;
+			if( iColl < NodeFields[4].Min ) NodeFields[4].Min = iColl;
+			if( iRend > NodeFields[5].Max ) NodeFields[5].Max = iRend;
+			if( iRend < NodeFields[5].Min ) NodeFields[5].Min = iRend;
+			if( iVP   > NodeFields[6].Max ) NodeFields[6].Max = iVP;
+			if( iVP   < NodeFields[6].Min ) NodeFields[6].Min = iVP;
+			if( iL0   > NodeFields[7].Max ) NodeFields[7].Max = iL0;
+			if( iL0   < NodeFields[7].Min ) NodeFields[7].Min = iL0;
+			if( iL1   > NodeFields[8].Max ) NodeFields[8].Max = iL1;
+			if( iL1   < NodeFields[8].Min ) NodeFields[8].Min = iL1;
+		}
+
+		// Current: FBspNode = 48 bytes on DC (SWORD indices already), 64 on desktop
+		// Proposed keeps the same 48-byte DC layout. iVertPool stays INT.
+		// Check if iVertPool could also be SWORD (saves 2 more bytes per node).
+		const DWORD CurNodeBytes = (DWORD)N * sizeof(FBspNode);
+		R.CurrentTotalBytes += CurNodeBytes;
+		R.ProposedTotalBytes += CurNodeBytes; // already compressed on DC
+
+		for( INT f = 0; f < 9; f++ )
+		{
+			if( !NodeFields[f].FitsSWORD() )
+			{
+				R.NumFieldOverflows++;
+				char Tmp[256];
+				snprintf( Tmp, sizeof(Tmp), "  OVERFLOW: %s max=%d min=%d (SWORD limit +-32767)\n",
+					NodeFields[f].Name, NodeFields[f].Max, NodeFields[f].Min );
+				appStrcat( R.OverflowFields, Tmp );
+			}
+		}
+
+		R.NodeIVertPoolMax = NodeFields[6].Max;
+
+		// Check if iVertPool fits SWORD for additional savings
+		if( NodeFields[6].FitsSWORD() )
+		{
+			DWORD Saved = (DWORD)N * 2; // INT->SWORD = 2 bytes saved
+			R.ProposedTotalBytes -= Saved;
+			R.SavingsBytes += Saved;
+		}
+		else
+		{
+			R.NumFieldOverflows++;
+			char Tmp[256];
+			snprintf( Tmp, sizeof(Tmp), "  NOTE: Node.iVertPool max=%d, stays INT (no extra saving)\n",
+				NodeFields[6].Max );
+			appStrcat( R.OverflowFields, Tmp );
+		}
+	}
+
+	// --- Surfs ---
+	if( Model->Surfs && Model->Surfs->Num() > 0 )
+	{
+		const INT N = Model->Surfs->Num();
+		R.NumSurfs = N;
+
+		FFieldRange SurfFields[] = {
+			{ "Surf.pBase",      0, 0 },
+			{ "Surf.vNormal",    0, 0 },
+			{ "Surf.vTextureU",  0, 0 },
+			{ "Surf.vTextureV",  0, 0 },
+			{ "Surf.iLightMap",  0, -1 },
+			{ "Surf.iBrushPoly", 0, -1 },
+		};
+
+		for( INT i = 0; i < N; i++ )
+		{
+			FBspSurf& S = Model->Surfs->Element(i);
+			if( S.pBase     > SurfFields[0].Max ) SurfFields[0].Max = S.pBase;
+			if( S.pBase     < SurfFields[0].Min ) SurfFields[0].Min = S.pBase;
+			if( S.vNormal   > SurfFields[1].Max ) SurfFields[1].Max = S.vNormal;
+			if( S.vNormal   < SurfFields[1].Min ) SurfFields[1].Min = S.vNormal;
+			if( S.vTextureU > SurfFields[2].Max ) SurfFields[2].Max = S.vTextureU;
+			if( S.vTextureU < SurfFields[2].Min ) SurfFields[2].Min = S.vTextureU;
+			if( S.vTextureV > SurfFields[3].Max ) SurfFields[3].Max = S.vTextureV;
+			if( S.vTextureV < SurfFields[3].Min ) SurfFields[3].Min = S.vTextureV;
+			if( S.iLightMap > SurfFields[4].Max ) SurfFields[4].Max = S.iLightMap;
+			if( S.iLightMap < SurfFields[4].Min ) SurfFields[4].Min = S.iLightMap;
+			if( S.iBrushPoly> SurfFields[5].Max ) SurfFields[5].Max = S.iBrushPoly;
+			if( S.iBrushPoly< SurfFields[5].Min ) SurfFields[5].Min = S.iBrushPoly;
+		}
+
+		// Current: FBspSurf = 40 bytes (6 INT index fields = 24 bytes of indices)
+		// Proposed: 6 INT -> SWORD = saves 12 bytes per surf -> 28 bytes
+		const DWORD CurBytes = (DWORD)N * 40;
+		R.CurrentTotalBytes += CurBytes;
+
+		R.SurfPBaseMax = SurfFields[0].Max;
+		R.SurfVNormalMax = SurfFields[1].Max;
+		R.SurfVTextureUMax = SurfFields[2].Max;
+		R.SurfVTextureVMax = SurfFields[3].Max;
+		R.SurfILightMapMax = SurfFields[4].Max;
+		R.SurfIBrushPolyMax = SurfFields[5].Max;
+
+		// Per-field savings: each field that fits SWORD saves 2 bytes per surf
+		DWORD SurfSaved = 0;
+		for( INT f = 0; f < 6; f++ )
+		{
+			if( SurfFields[f].FitsSWORD() )
+			{
+				SurfSaved += (DWORD)N * 2;
+			}
+			else
+			{
+				R.NumFieldOverflows++;
+				char Tmp[256];
+				snprintf( Tmp, sizeof(Tmp), "  OVERFLOW: %s max=%d min=%d (SWORD=+-32767, WORD=%s)\n",
+					SurfFields[f].Name, SurfFields[f].Max, SurfFields[f].Min,
+					SurfFields[f].FitsWORD() ? "fits" : "NO" );
+				appStrcat( R.OverflowFields, Tmp );
+			}
+		}
+		R.ProposedTotalBytes += CurBytes - SurfSaved;
+		R.SavingsBytes += SurfSaved;
+	}
+
+	// --- Verts ---
+	if( Model->Verts && Model->Verts->Num() > 0 )
+	{
+		const INT N = Model->Verts->Num();
+		R.NumVerts = N;
+
+		INT MaxPVertex = 0, MinPVertex = 0;
+		INT MaxISide = 0, MinISide = -1;
+
+		for( INT i = 0; i < N; i++ )
+		{
+			FVert& V = Model->Verts->Element(i);
+			if( V.pVertex > MaxPVertex ) MaxPVertex = V.pVertex;
+			if( V.pVertex < MinPVertex ) MinPVertex = V.pVertex;
+			if( V.iSide   > MaxISide )   MaxISide = V.iSide;
+			if( V.iSide   < MinISide )   MinISide = V.iSide;
+		}
+
+		// Current: FVert = 8 bytes (2x INT)
+		// Proposed: 2x SWORD = 4 bytes -> 50% reduction
+		const DWORD CurBytes = (DWORD)N * 8;
+		R.CurrentTotalBytes += CurBytes;
+
+		R.VertPVertexMax = MaxPVertex;
+		R.VertPVertexMin = MinPVertex;
+		R.VertISideMax = MaxISide;
+		R.VertISideMin = MinISide;
+
+		UBOOL PVertFits = (MaxPVertex <= 32767 && MinPVertex >= -32768);
+		UBOOL ISideFits = (MaxISide <= 32767 && MinISide >= -32768);
+
+		if( PVertFits && ISideFits )
+		{
+			DWORD Saved = (DWORD)N * 4;
+			R.ProposedTotalBytes += CurBytes - Saved;
+			R.SavingsBytes += Saved;
+		}
+		else
+		{
+			R.ProposedTotalBytes += CurBytes;
+			if( !PVertFits )
+			{
+				R.NumFieldOverflows++;
+				UBOOL PVertWord = (MaxPVertex <= 65535 && MinPVertex >= 0);
+				char Tmp[256];
+				snprintf( Tmp, sizeof(Tmp), "  OVERFLOW: Vert.pVertex max=%d min=%d (SWORD=NO, WORD=%s)\n",
+					MaxPVertex, MinPVertex, PVertWord ? "fits" : "NO" );
+				appStrcat( R.OverflowFields, Tmp );
+			}
+			if( !ISideFits )
+			{
+				R.NumFieldOverflows++;
+				UBOOL ISideWord = (MaxISide <= 65535 && MinISide >= 0);
+				char Tmp[256];
+				snprintf( Tmp, sizeof(Tmp), "  OVERFLOW: Vert.iSide max=%d min=%d (SWORD=NO, WORD=%s)\n",
+					MaxISide, MinISide, ISideWord ? "fits" : "NO" );
+				appStrcat( R.OverflowFields, Tmp );
+			}
+		}
+	}
+
+	// --- Vectors & Points (FVector = 12 bytes, no index compression possible) ---
+	if( Model->Vectors && Model->Vectors->Num() > 0 )
+	{
+		R.NumVectors = Model->Vectors->Num();
+		const DWORD Bytes = (DWORD)R.NumVectors * 12;
+		R.CurrentTotalBytes += Bytes;
+		R.ProposedTotalBytes += Bytes;
+	}
+	if( Model->Points && Model->Points->Num() > 0 )
+	{
+		R.NumPoints = Model->Points->Num();
+		const DWORD Bytes = (DWORD)R.NumPoints * 12;
+		R.CurrentTotalBytes += Bytes;
+		R.ProposedTotalBytes += Bytes;
+	}
+
+	// --- LightMap index array ---
+	// FLightMapIndex = 40 bytes (INT DataOffset, INT iLightActors, FVector Pan, 2xFLOAT, 2xINT, 2xBYTE)
+	R.NumLightMaps = Model->LightMap.Num();
+	if( R.NumLightMaps > 0 )
+	{
+		const DWORD Bytes = (DWORD)R.NumLightMaps * 40;
+		R.CurrentTotalBytes += Bytes;
+		R.ProposedTotalBytes += Bytes;
+	}
+
+	// --- LightBits ---
+	R.NumLightBits = Model->LightBits.Num();
+	if( R.NumLightBits > 0 )
+	{
+		R.CurrentTotalBytes += (DWORD)R.NumLightBits;
+		R.ProposedTotalBytes += (DWORD)R.NumLightBits;
+	}
+
+	// --- Bounds (FBox = 28 bytes: 2xFVector + BYTE flags + padding) ---
+	R.NumBounds = Model->Bounds.Num();
+	if( R.NumBounds > 0 )
+	{
+		const DWORD Bytes = (DWORD)R.NumBounds * sizeof(FBox);
+		R.CurrentTotalBytes += Bytes;
+		R.ProposedTotalBytes += Bytes;
+	}
+
+	// --- LeafHulls (TArray<INT>) ---
+	R.NumLeafHulls = Model->LeafHulls.Num();
+	if( R.NumLeafHulls > 0 )
+	{
+		const DWORD Bytes = (DWORD)R.NumLeafHulls * 4;
+		R.CurrentTotalBytes += Bytes;
+		R.ProposedTotalBytes += Bytes;
+	}
+
+	// --- Leaves (FLeaf = 20 bytes: 3xINT + QWORD) ---
+	R.NumLeaves = Model->Leaves.Num();
+	if( R.NumLeaves > 0 )
+	{
+		const DWORD Bytes = (DWORD)R.NumLeaves * 20;
+		R.CurrentTotalBytes += Bytes;
+		R.ProposedTotalBytes += Bytes;
+	}
+
+	// --- Lights ---
+	R.NumLights = Model->Lights.Num();
+}
+
+void FDCUtil::AnalyzeMapLimits( const char* MapGlob )
+{
+	guard(AnalyzeMapLimits);
+
+	printf( "=======================================================================\n" );
+	printf( " Dreamcast BSP Compression Limit Analysis\n" );
+	printf( " Proposed: FBspSurf INT->SWORD, FVert INT->SWORD\n" );
+	printf( " SWORD range: -32768..32767  (INDEX_NONE = -1 fits)\n" );
+	printf( "=======================================================================\n\n" );
+
+	TArray<FString> Files = appFindFiles( MapGlob );
 	if( Files.Num() == 0 )
 	{
-		printf( "No .unr files found in '%s'\n", MapDir );
+		printf( "No .unr files found matching '%s'\n", MapGlob );
 		return;
 	}
-	
+
 	printf( "Found %d map files\n\n", Files.Num() );
-	
-	// Collect summary data
-	TArray<FMapAnalysisSummary> Summary;
-	
-	// Analyze each map
+
+	// Extract directory from glob
+	char Dir[2048];
+	appStrcpy( Dir, MapGlob );
+	char* Slash = strrchr( Dir, '/' );
+	if( !Slash ) Slash = strrchr( Dir, '\\' );
+	if( Slash ) *(Slash + 1) = 0;
+	else Dir[0] = 0;
+
+	TArray<FMapReport> Reports;
+	INT TotalOverflowMaps = 0;
+
 	for( INT i = 0; i < Files.Num(); i++ )
 	{
 		char FullPath[2048];
-		snprintf( FullPath, sizeof(FullPath), "%s/%s", MapDir, *Files(i) );
-		
+		snprintf( FullPath, sizeof(FullPath), "%s%s", Dir, *Files(i) );
+
+		printf( "[%d/%d] %s: loading...", i + 1, Files.Num(), *Files(i) ); fflush( stdout );
+
 		UPackage* Pkg = Cast<UPackage>( GObj.LoadPackage( nullptr, FullPath, LOAD_KeepImports ) );
 		if( !Pkg )
 		{
-			printf( "Failed to load: %s\n", FullPath );
+			printf( " FAILED\n" );
 			continue;
 		}
-		
-		FMapAnalysisSummary MapSummary;
-		MapSummary.MapName = Files(i);
-		MapSummary.TotalSize = 0;
-		MapSummary.PotentialSavings = 0;
-		MapSummary.CanCompress = false;
-		
-		// Load the level and analyze all models in the package
-		ULevel* Level = LoadObject<ULevel>( Pkg, "MyLevel", nullptr, LOAD_NoFail | LOAD_KeepImports, nullptr );
-		
-		// Analyze all UModel objects in the package (main level + brush models)
-		// Use try-catch to handle any memory access issues
-		try
+		printf( " pkg ok..."); fflush( stdout );
+
+		ULevel* Level = LoadObject<ULevel>( Pkg, "MyLevel", nullptr, LOAD_KeepImports, nullptr );
+		if( !Level || !Level->Model )
 		{
-			for( TObjectIterator<UModel> It; It; ++It )
-			{
-				UModel* Model = *It;
-				
-				if( !Model || !Model->IsIn( Pkg ) )
-					continue;
-				
-				DWORD ModelSize = 0, ModelSavings = 0;
-				UBOOL ModelCanCompress = false;
-				AnalyzeBSPStructures( Model, ModelSize, ModelSavings, ModelCanCompress );
-				MapSummary.TotalSize += ModelSize;
-				MapSummary.PotentialSavings += ModelSavings;
-				if( ModelCanCompress ) MapSummary.CanCompress = true;
-			}
+			printf( " no level model, skip\n" );
+			GObj.ResetLoaders( Pkg );
+			continue;
 		}
-		catch( char* Error )
-		{
-			printf( "  ERROR analyzing models in '%s': %s\n", *Files(i), Error ? Error : "Unknown error" );
-		}
-		
-		Summary.AddItem( MapSummary );
-		
-		// Reset loaders to free memory and avoid double-free issues
+		printf( " level ok..."); fflush( stdout );
+
+		FMapReport R;
+		appMemset( &R, 0, sizeof(R) );
+		appStrncpy( R.MapName, *Files(i), sizeof(R.MapName) - 1 );
+		R.MapName[sizeof(R.MapName) - 1] = 0;
+		R.OverflowFields[0] = 0;
+
+		R.NumActors = Level->Num();
+		printf( " actors=%d...", R.NumActors ); fflush( stdout );
+
+		// Count textures in package
+		for( TObjectIterator<UTexture> It; It; ++It )
+			if( It->IsIn( Pkg ) )
+				R.NumTextures++;
+		printf( " tex=%d...", R.NumTextures ); fflush( stdout );
+
+		AnalyzeLevelModel( Level->Model, R );
+		printf( " analyzed..."); fflush( stdout );
+
+		if( R.NumFieldOverflows > 0 )
+			TotalOverflowMaps++;
+
+		printf( " pre-add..."); fflush( stdout );
+		Reports.AddItem( R );
+		printf( " added..."); fflush( stdout );
 		GObj.ResetLoaders( Pkg );
+		printf( " done\n" ); fflush( stdout );
 	}
-	
-	// Print summary
-	printf( "\n" );
-	printf( "================================================================================\n" );
-	printf( "SUMMARY: BSP Compression Analysis\n" );
-	printf( "================================================================================\n" );
-	printf( "%-30s %12s %12s %10s %12s\n", "Map Name", "Size (bytes)", "Savings", "Compress?", "Reduction %" );
-	printf( "--------------------------------------------------------------------------------\n" );
-	
-	DWORD GrandTotalSize = 0;
-	DWORD GrandTotalSavings = 0;
-	
-	for( INT i = 0; i < Summary.Num(); i++ )
+
+	// --- Detailed per-map report ---
+	for( INT i = 0; i < Reports.Num(); i++ )
 	{
-		FMapAnalysisSummary& S = Summary(i);
-		GrandTotalSize += S.TotalSize;
-		GrandTotalSavings += S.PotentialSavings;
-		
-		FLOAT ReductionPercent = S.TotalSize > 0 ? (100.0f * S.PotentialSavings / S.TotalSize) : 0.0f;
-		const char* CompressStr = S.CanCompress ? "YES" : "NO";
-		
-		printf( "%-30s %12u %12u %10s %11.1f%%\n", 
-			*S.MapName, S.TotalSize, S.PotentialSavings, CompressStr, ReductionPercent );
+		FMapReport& R = Reports(i);
+		printf( "-----------------------------------------------------------------------\n" );
+		printf( " %s\n", R.MapName );
+		printf( "-----------------------------------------------------------------------\n" );
+		printf( "  Nodes:     %6d  (%7u KB)    Surfs:    %6d  (%7u KB)\n",
+			R.NumNodes, (R.NumNodes * (DWORD)sizeof(FBspNode)) / 1024,
+			R.NumSurfs, (R.NumSurfs * 40u) / 1024 );
+		printf( "  Verts:     %6d  (%7u KB)    Vectors:  %6d  (%7u KB)\n",
+			R.NumVerts, (R.NumVerts * 8u) / 1024,
+			R.NumVectors, (R.NumVectors * 12u) / 1024 );
+		printf( "  Points:    %6d  (%7u KB)    LightMap: %6d  (%7u KB)\n",
+			R.NumPoints, (R.NumPoints * 12u) / 1024,
+			R.NumLightMaps, (R.NumLightMaps * 40u) / 1024 );
+		printf( "  LightBits: %6d  (%7u KB)    Bounds:   %6d  (%7u KB)\n",
+			R.NumLightBits, (DWORD)R.NumLightBits / 1024,
+			R.NumBounds, (R.NumBounds * (DWORD)sizeof(FBox)) / 1024 );
+		printf( "  LeafHulls: %6d  (%7u KB)    Leaves:   %6d  (%7u KB)\n",
+			R.NumLeafHulls, (R.NumLeafHulls * 4u) / 1024,
+			R.NumLeaves, (R.NumLeaves * 20u) / 1024 );
+		printf( "  Actors:    %6d                 Textures: %6d\n",
+			R.NumActors, R.NumTextures );
+		printf( "\n" );
+		printf( "  Current BSP RAM:  %8u bytes (%u KB)\n", R.CurrentTotalBytes, R.CurrentTotalBytes / 1024 );
+		printf( "  Proposed BSP RAM: %8u bytes (%u KB)\n", R.ProposedTotalBytes, R.ProposedTotalBytes / 1024 );
+		printf( "  Savings:          %8u bytes (%u KB, %.1f%%)\n",
+			R.SavingsBytes, R.SavingsBytes / 1024,
+			R.CurrentTotalBytes > 0 ? (100.0f * R.SavingsBytes / R.CurrentTotalBytes) : 0.0f );
+
+		if( R.NumFieldOverflows > 0 )
+		{
+			printf( "\n  *** %d FIELD(S) EXCEED SWORD LIMIT ***\n", R.NumFieldOverflows );
+			printf( "%s", R.OverflowFields );
+		}
+		else
+		{
+			printf( "  All fields fit in SWORD range.\n" );
+		}
+		printf( "\n" );
 	}
-	
-	printf( "--------------------------------------------------------------------------------\n" );
-	printf( "%-30s %12u %12u %10s %11.1f%%\n", 
-		"TOTAL", GrandTotalSize, GrandTotalSavings, 
-		GrandTotalSavings > 0 ? "YES" : "NO",
-		GrandTotalSize > 0 ? (100.0f * GrandTotalSavings / GrandTotalSize) : 0.0f );
-	printf( "================================================================================\n" );
-	
+
+	// --- Summary table ---
+	printf( "=======================================================================\n" );
+	printf( " SUMMARY\n" );
+	printf( "=======================================================================\n" );
+	printf( "%-32s %7s %7s %7s %7s %6s %s\n",
+		"Map", "Nodes", "Surfs", "Verts", "CurKB", "SaveKB", "Status" );
+	printf( "-----------------------------------------------------------------------\n" );
+
+	DWORD GrandCurrent = 0, GrandProposed = 0, GrandSavings = 0;
+	for( INT i = 0; i < Reports.Num(); i++ )
+	{
+		FMapReport& R = Reports(i);
+		GrandCurrent += R.CurrentTotalBytes;
+		GrandProposed += R.ProposedTotalBytes;
+		GrandSavings += R.SavingsBytes;
+
+		printf( "%-32s %7d %7d %7d %7u %6u %s\n",
+			R.MapName,
+			R.NumNodes, R.NumSurfs, R.NumVerts,
+			R.CurrentTotalBytes / 1024,
+			R.SavingsBytes / 1024,
+			R.NumFieldOverflows > 0 ? "OVERFLOW" : "OK" );
+	}
+
+	printf( "-----------------------------------------------------------------------\n" );
+	printf( "%-32s %7s %7s %7s %7u %6u\n",
+		"TOTAL", "", "", "",
+		GrandCurrent / 1024,
+		GrandSavings / 1024 );
+	printf( "=======================================================================\n" );
+	printf( "\n" );
+	printf( "Maps analyzed: %d\n", Reports.Num() );
+	printf( "Maps with SWORD overflows: %d\n", TotalOverflowMaps );
+	printf( "Total current BSP RAM:  %u KB (%.1f MB)\n", GrandCurrent / 1024, GrandCurrent / (1024.0f * 1024.0f) );
+	printf( "Total proposed BSP RAM: %u KB (%.1f MB)\n", GrandProposed / 1024, GrandProposed / (1024.0f * 1024.0f) );
+	printf( "Total savings:          %u KB (%.1f MB, %.1f%%)\n",
+		GrandSavings / 1024, GrandSavings / (1024.0f * 1024.0f),
+		GrandCurrent > 0 ? (100.0f * GrandSavings / GrandCurrent) : 0.0f );
+
+	if( TotalOverflowMaps > 0 )
+		printf( "\nWARNING: %d map(s) have fields that exceed SWORD limits!\n", TotalOverflowMaps );
+	else
+		printf( "\nAll maps fit within SWORD limits. Compression is safe to apply.\n" );
+
+	// --- Global worst-case per-field analysis ---
+	printf( "\n=======================================================================\n" );
+	printf( " GLOBAL WORST-CASE FIELD RANGES (across all %d maps)\n", Reports.Num() );
+	printf( "=======================================================================\n" );
+
+	INT GMaxIVertPool = 0;
+	INT GMaxPBase = 0, GMaxVNormal = 0, GMaxVTexU = 0, GMaxVTexV = 0;
+	INT GMaxILightMap = 0, GMaxIBrushPoly = 0;
+	INT GMaxPVertex = 0, GMinPVertex = 0, GMaxISide = 0, GMinISide = 0;
+	INT GMaxNodes = 0, GMaxSurfs = 0, GMaxVerts = 0, GMaxPoints = 0, GMaxVectors = 0;
+
+	for( INT i = 0; i < Reports.Num(); i++ )
+	{
+		FMapReport& R = Reports(i);
+		if( R.NodeIVertPoolMax > GMaxIVertPool ) GMaxIVertPool = R.NodeIVertPoolMax;
+		if( R.SurfPBaseMax > GMaxPBase ) GMaxPBase = R.SurfPBaseMax;
+		if( R.SurfVNormalMax > GMaxVNormal ) GMaxVNormal = R.SurfVNormalMax;
+		if( R.SurfVTextureUMax > GMaxVTexU ) GMaxVTexU = R.SurfVTextureUMax;
+		if( R.SurfVTextureVMax > GMaxVTexV ) GMaxVTexV = R.SurfVTextureVMax;
+		if( R.SurfILightMapMax > GMaxILightMap ) GMaxILightMap = R.SurfILightMapMax;
+		if( R.SurfIBrushPolyMax > GMaxIBrushPoly ) GMaxIBrushPoly = R.SurfIBrushPolyMax;
+		if( R.VertPVertexMax > GMaxPVertex ) GMaxPVertex = R.VertPVertexMax;
+		if( R.VertPVertexMin < GMinPVertex ) GMinPVertex = R.VertPVertexMin;
+		if( R.VertISideMax > GMaxISide ) GMaxISide = R.VertISideMax;
+		if( R.VertISideMin < GMinISide ) GMinISide = R.VertISideMin;
+		if( R.NumNodes > GMaxNodes ) GMaxNodes = R.NumNodes;
+		if( R.NumSurfs > GMaxSurfs ) GMaxSurfs = R.NumSurfs;
+		if( R.NumVerts > GMaxVerts ) GMaxVerts = R.NumVerts;
+		if( R.NumPoints > GMaxPoints ) GMaxPoints = R.NumPoints;
+		if( R.NumVectors > GMaxVectors ) GMaxVectors = R.NumVectors;
+	}
+
+	printf( "\n  Array counts (worst case):\n" );
+	printf( "    Nodes:   %6d    Surfs:   %6d    Verts:   %6d\n", GMaxNodes, GMaxSurfs, GMaxVerts );
+	printf( "    Points:  %6d    Vectors: %6d\n", GMaxPoints, GMaxVectors );
+
+	printf( "\n  %-28s %10s %10s  %s  %s  %s\n", "Field", "Max", "Min", "SWORD", "WORD", " Recommendation" );
+	printf( "  -------------------------------------------------------------------------------------\n" );
+
+	#define FIELD_ROW(name, mx, mn) \
+		printf( "  %-28s %10d %10d  %s   %s   %s\n", name, mx, mn, \
+			((mx) <= 32767 && (mn) >= -32768) ? " OK " : "FAIL", \
+			((mx) <= 65535 && (mn) >= 0)      ? " OK " : "FAIL", \
+			((mx) <= 32767 && (mn) >= -32768) ? "-> SWORD" : \
+			((mx) <= 65535 && (mn) >= 0)      ? "-> WORD" : "keep INT" )
+
+	FIELD_ROW( "Node.iVertPool", GMaxIVertPool, 0 );
+	FIELD_ROW( "Surf.pBase", GMaxPBase, 0 );
+	FIELD_ROW( "Surf.vNormal", GMaxVNormal, 0 );
+	FIELD_ROW( "Surf.vTextureU", GMaxVTexU, 0 );
+	FIELD_ROW( "Surf.vTextureV", GMaxVTexV, 0 );
+	FIELD_ROW( "Surf.iLightMap", GMaxILightMap, -1 );
+	FIELD_ROW( "Surf.iBrushPoly", GMaxIBrushPoly, -1 );
+	FIELD_ROW( "Vert.pVertex", GMaxPVertex, GMinPVertex );
+	FIELD_ROW( "Vert.iSide", GMaxISide, GMinISide );
+
+	#undef FIELD_ROW
+
+	// --- Dump full report to file ---
+	{
+		const char* ReportPath = "../../analyze_report.txt";
+		FILE* F = fopen( ReportPath, "w" );
+		if( F )
+		{
+			fprintf( F, "Dreamcast BSP Compression Limit Analysis\n" );
+			fprintf( F, "=========================================\n\n" );
+
+			for( INT i = 0; i < Reports.Num(); i++ )
+			{
+				FMapReport& R = Reports(i);
+				fprintf( F, "-----------------------------------------------------------------------\n" );
+				fprintf( F, " %s\n", R.MapName );
+				fprintf( F, "-----------------------------------------------------------------------\n" );
+				fprintf( F, "  Nodes:     %6d  (%7u KB)    Surfs:    %6d  (%7u KB)\n",
+					R.NumNodes, (R.NumNodes * (DWORD)sizeof(FBspNode)) / 1024,
+					R.NumSurfs, (R.NumSurfs * 40u) / 1024 );
+				fprintf( F, "  Verts:     %6d  (%7u KB)    Vectors:  %6d  (%7u KB)\n",
+					R.NumVerts, (R.NumVerts * 8u) / 1024,
+					R.NumVectors, (R.NumVectors * 12u) / 1024 );
+				fprintf( F, "  Points:    %6d  (%7u KB)    LightMap: %6d  (%7u KB)\n",
+					R.NumPoints, (R.NumPoints * 12u) / 1024,
+					R.NumLightMaps, (R.NumLightMaps * 40u) / 1024 );
+				fprintf( F, "  LightBits: %6d  (%7u KB)    Bounds:   %6d  (%7u KB)\n",
+					R.NumLightBits, (DWORD)R.NumLightBits / 1024,
+					R.NumBounds, (R.NumBounds * (DWORD)sizeof(FBox)) / 1024 );
+				fprintf( F, "  LeafHulls: %6d  (%7u KB)    Leaves:   %6d  (%7u KB)\n",
+					R.NumLeafHulls, (R.NumLeafHulls * 4u) / 1024,
+					R.NumLeaves, (R.NumLeaves * 20u) / 1024 );
+				fprintf( F, "  Actors:    %6d                 Textures: %6d\n",
+					R.NumActors, R.NumTextures );
+				fprintf( F, "  Current BSP RAM:  %8u bytes (%u KB)\n", R.CurrentTotalBytes, R.CurrentTotalBytes / 1024 );
+				fprintf( F, "  Proposed BSP RAM: %8u bytes (%u KB)\n", R.ProposedTotalBytes, R.ProposedTotalBytes / 1024 );
+				fprintf( F, "  Savings:          %8u bytes (%u KB, %.1f%%)\n",
+					R.SavingsBytes, R.SavingsBytes / 1024,
+					R.CurrentTotalBytes > 0 ? (100.0f * R.SavingsBytes / R.CurrentTotalBytes) : 0.0f );
+				fprintf( F, "  Surf field max: pBase=%d vNormal=%d vTexU=%d vTexV=%d iLightMap=%d iBrushPoly=%d\n",
+					R.SurfPBaseMax, R.SurfVNormalMax, R.SurfVTextureUMax, R.SurfVTextureVMax,
+					R.SurfILightMapMax, R.SurfIBrushPolyMax );
+				fprintf( F, "  Vert field max: pVertex=%d (min=%d) iSide=%d (min=%d)\n",
+					R.VertPVertexMax, R.VertPVertexMin, R.VertISideMax, R.VertISideMin );
+				fprintf( F, "  Node.iVertPool max: %d\n", R.NodeIVertPoolMax );
+				if( R.NumFieldOverflows > 0 )
+					fprintf( F, "%s", R.OverflowFields );
+				fprintf( F, "\n" );
+			}
+
+			fprintf( F, "\nGlobal worst-case: Node.iVertPool=%d Surf.pBase=%d vNormal=%d vTexU=%d vTexV=%d iLM=%d iBP=%d\n",
+				GMaxIVertPool, GMaxPBase, GMaxVNormal, GMaxVTexU, GMaxVTexV, GMaxILightMap, GMaxIBrushPoly );
+			fprintf( F, "Global worst-case: Vert.pVertex=%d..%d Vert.iSide=%d..%d\n",
+				GMinPVertex, GMaxPVertex, GMinISide, GMaxISide );
+			fprintf( F, "\nTotal current:  %u KB (%.1f MB)\n", GrandCurrent / 1024, GrandCurrent / (1024.0f * 1024.0f) );
+			fprintf( F, "Total proposed: %u KB (%.1f MB)\n", GrandProposed / 1024, GrandProposed / (1024.0f * 1024.0f) );
+			fprintf( F, "Total savings:  %u KB (%.1f MB, %.1f%%)\n",
+				GrandSavings / 1024, GrandSavings / (1024.0f * 1024.0f),
+				GrandCurrent > 0 ? (100.0f * GrandSavings / GrandCurrent) : 0.0f );
+
+			fclose( F );
+			printf( "\nFull report written to: %s\n", ReportPath );
+		}
+		else
+		{
+			printf( "\nWARNING: Could not write report file to %s\n", ReportPath );
+		}
+	}
+
 	unguard;
 }
 

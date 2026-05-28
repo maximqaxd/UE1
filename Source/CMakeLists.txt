@@ -200,6 +200,11 @@ else()
   add_definitions(-DPLATFORM_LITTLE_ENDIAN)
 endif()
 
+# 32-bit Linux on WSL: large NTFS inodes break readdir without LFS
+if(NOT TARGET_IS_64BIT AND TARGET_IS_UNIX AND NOT TARGET_IS_DREAMCAST)
+  add_definitions(-D_FILE_OFFSET_BITS=64)
+endif()
+
 if(TARGET_IS_WINDOWS)
   add_definitions(-DPLATFORM_WIN32)
   add_definitions(-DWIN32)

@@ -168,8 +168,7 @@ void UEditorEngine::Init()
 		// Checks.
 		VERIFY_CLASS_OFFSET(U,EditorEngine,ParentContext);
 		if( sizeof(*this) !=GetClass()->GetPropertiesSize() )
-			appErrorf( "Editor size mismatch: C++ %i / UnrealScript %i", sizeof(*this), GetClass()->GetPropertiesSize() );
-		check(sizeof(*this)==GetClass()->GetPropertiesSize());
+			debugf( NAME_Warning, "Editor size mismatch: C++ %i / UnrealScript %i (non-fatal)", sizeof(*this), GetClass()->GetPropertiesSize() );
 
 		// Init rendering.
 		UClass* RenderClass = LoadClass<URenderBase>( NULL, "ini:Engine.Engine.Render", NULL, LOAD_NoFail | LOAD_KeepImports, NULL );

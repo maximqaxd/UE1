@@ -1,0 +1,972 @@
+Dreamcast BSP Compression Limit Analysis
+=========================================
+
+-----------------------------------------------------------------------
+ Bluff.unr
+-----------------------------------------------------------------------
+  Nodes:      23398  (   1462 KB)    Surfs:      9209  (    359 KB)
+  Verts:     342686  (   2677 KB)    Vectors:    2475  (     29 KB)
+  Points:     34058  (    399 KB)    LightMap:   8720  (    340 KB)
+  LightBits: 2086609  (   2037 KB)    Bounds:    10894  (    297 KB)
+  LeafHulls:  81152  (    317 KB)    Leaves:     9159  (    178 KB)
+  Actors:      3690                 Textures:      0
+  Current BSP RAM:   8293945 bytes (8099 KB)
+  Proposed BSP RAM:  8183437 bytes (7991 KB)
+  Savings:            110508 bytes (107 KB, 1.3%)
+  Surf field max: pBase=7877 vNormal=2474 vTexU=2474 vTexV=2471 iLightMap=8719 iBrushPoly=160
+  Vert field max: pVertex=47890 (min=0) iSide=49544 (min=-1)
+  Node.iVertPool max: 342681
+  OVERFLOW: Node.iCollisionBound max=81139 min=-1 (SWORD limit +-32767)
+  OVERFLOW: Node.iVertPool max=342681 min=0 (SWORD limit +-32767)
+  NOTE: Node.iVertPool max=342681, stays INT (no extra saving)
+  OVERFLOW: Vert.pVertex max=47890 min=0 (SWORD=NO, WORD=fits)
+  OVERFLOW: Vert.iSide max=49544 min=-1 (SWORD=NO, WORD=NO)
+
+-----------------------------------------------------------------------
+ Ceremony.unr
+-----------------------------------------------------------------------
+  Nodes:      12244  (    765 KB)    Surfs:      4611  (    180 KB)
+  Verts:     162703  (   1271 KB)    Vectors:    1585  (     18 KB)
+  Points:     16871  (    197 KB)    LightMap:   4097  (    160 KB)
+  LightBits: 1072668  (   1047 KB)    Bounds:     5165  (    141 KB)
+  LeafHulls:  42390  (    165 KB)    Leaves:     4077  (     79 KB)
+  Actors:      2821                 Textures:      0
+  Current BSP RAM:   4123420 bytes (4026 KB)
+  Proposed BSP RAM:  3417276 bytes (3337 KB)
+  Savings:            706144 bytes (689 KB, 17.1%)
+  Surf field max: pBase=3847 vNormal=1583 vTexU=1584 vTexV=1576 iLightMap=4096 iBrushPoly=106
+  Vert field max: pVertex=21853 (min=0) iSide=26254 (min=-1)
+  Node.iVertPool max: 162697
+  OVERFLOW: Node.iCollisionBound max=42376 min=-1 (SWORD limit +-32767)
+  OVERFLOW: Node.iVertPool max=162697 min=0 (SWORD limit +-32767)
+  NOTE: Node.iVertPool max=162697, stays INT (no extra saving)
+
+-----------------------------------------------------------------------
+ Chizra.unr
+-----------------------------------------------------------------------
+  Nodes:      17493  (   1093 KB)    Surfs:      7245  (    283 KB)
+  Verts:     249754  (   1951 KB)    Vectors:     859  (     10 KB)
+  Points:     25276  (    296 KB)    LightMap:   6738  (    263 KB)
+  LightBits: 1414399  (   1381 KB)    Bounds:     7505  (    205 KB)
+  LeafHulls:  61406  (    239 KB)    Leaves:     5918  (    115 KB)
+  Actors:      4095                 Textures:      0
+  Current BSP RAM:   5979047 bytes (5838 KB)
+  Proposed BSP RAM:  5892107 bytes (5754 KB)
+  Savings:             86940 bytes (84 KB, 1.5%)
+  Surf field max: pBase=6022 vNormal=849 vTexU=858 vTexV=857 iLightMap=6737 iBrushPoly=78
+  Vert field max: pVertex=34143 (min=0) iSide=37537 (min=-1)
+  Node.iVertPool max: 249749
+  OVERFLOW: Node.iCollisionBound max=61392 min=-1 (SWORD limit +-32767)
+  OVERFLOW: Node.iVertPool max=249749 min=0 (SWORD limit +-32767)
+  NOTE: Node.iVertPool max=249749, stays INT (no extra saving)
+  OVERFLOW: Vert.pVertex max=34143 min=0 (SWORD=NO, WORD=fits)
+  OVERFLOW: Vert.iSide max=37537 min=-1 (SWORD=NO, WORD=NO)
+
+-----------------------------------------------------------------------
+ Dark.unr
+-----------------------------------------------------------------------
+  Nodes:      11087  (    692 KB)    Surfs:      4828  (    188 KB)
+  Verts:     176051  (   1375 KB)    Vectors:    1445  (     16 KB)
+  Points:     18265  (    214 KB)    LightMap:   4565  (    178 KB)
+  LightBits: 5440533  (   5313 KB)    Bounds:     5695  (    155 KB)
+  LeafHulls:  50553  (    197 KB)    Leaves:     4019  (     78 KB)
+  Actors:      2584                 Textures:      0
+  Current BSP RAM:   8612801 bytes (8410 KB)
+  Proposed BSP RAM:  7850661 bytes (7666 KB)
+  Savings:            762140 bytes (744 KB, 8.8%)
+  Surf field max: pBase=3795 vNormal=1439 vTexU=1444 vTexV=1440 iLightMap=4564 iBrushPoly=90
+  Vert field max: pVertex=26605 (min=0) iSide=23622 (min=-1)
+  Node.iVertPool max: 176046
+  OVERFLOW: Node.iCollisionBound max=50540 min=-1 (SWORD limit +-32767)
+  OVERFLOW: Node.iVertPool max=176046 min=0 (SWORD limit +-32767)
+  NOTE: Node.iVertPool max=176046, stays INT (no extra saving)
+
+-----------------------------------------------------------------------
+ DasaCellars.unr
+-----------------------------------------------------------------------
+  Nodes:      17429  (   1089 KB)    Surfs:      7171  (    280 KB)
+  Verts:     269603  (   2106 KB)    Vectors:     592  (      6 KB)
+  Points:     25943  (    304 KB)    LightMap:   6766  (    264 KB)
+  LightBits: 439119  (    428 KB)    Bounds:     8382  (    229 KB)
+  LeafHulls:  68640  (    268 KB)    Leaves:     6315  (    123 KB)
+  Actors:      3260                 Textures:      0
+  Current BSP RAM:   5222855 bytes (5100 KB)
+  Proposed BSP RAM:  5136803 bytes (5016 KB)
+  Savings:             86052 bytes (84 KB, 1.6%)
+  Surf field max: pBase=5971 vNormal=591 vTexU=590 vTexV=591 iLightMap=6765 iBrushPoly=191
+  Vert field max: pVertex=36930 (min=0) iSide=37979 (min=-1)
+  Node.iVertPool max: 269598
+  OVERFLOW: Node.iCollisionBound max=68627 min=-1 (SWORD limit +-32767)
+  OVERFLOW: Node.iVertPool max=269598 min=0 (SWORD limit +-32767)
+  NOTE: Node.iVertPool max=269598, stays INT (no extra saving)
+  OVERFLOW: Vert.pVertex max=36930 min=0 (SWORD=NO, WORD=fits)
+  OVERFLOW: Vert.iSide max=37979 min=-1 (SWORD=NO, WORD=NO)
+
+-----------------------------------------------------------------------
+ DasaPass.unr
+-----------------------------------------------------------------------
+  Nodes:       7274  (    454 KB)    Surfs:      3108  (    121 KB)
+  Verts:     114130  (    891 KB)    Vectors:     932  (     10 KB)
+  Points:     11209  (    131 KB)    LightMap:   2920  (    114 KB)
+  LightBits: 258489  (    252 KB)    Bounds:     3552  (     97 KB)
+  LeafHulls:  25947  (    101 KB)    Leaves:     2939  (     57 KB)
+  Actors:      1528                 Textures:      0
+  Current BSP RAM:   2285901 bytes (2232 KB)
+  Proposed BSP RAM:  1792085 bytes (1750 KB)
+  Savings:            493816 bytes (482 KB, 21.6%)
+  Surf field max: pBase=2649 vNormal=930 vTexU=931 vTexV=928 iLightMap=2919 iBrushPoly=95
+  Vert field max: pVertex=16016 (min=0) iSide=15537 (min=-1)
+  Node.iVertPool max: 114124
+  OVERFLOW: Node.iVertPool max=114124 min=0 (SWORD limit +-32767)
+  NOTE: Node.iVertPool max=114124, stays INT (no extra saving)
+
+-----------------------------------------------------------------------
+ DCrater.unr
+-----------------------------------------------------------------------
+  Nodes:       3062  (    191 KB)    Surfs:      1526  (     59 KB)
+  Verts:      43290  (    338 KB)    Vectors:    1187  (     13 KB)
+  Points:      4405  (     51 KB)    LightMap:   1499  (     58 KB)
+  LightBits: 2730849  (   2666 KB)    Bounds:     1699  (     46 KB)
+  LeafHulls:  13503  (     52 KB)    Leaves:     1334  (     26 KB)
+  Actors:       787                 Textures:      0
+  Current BSP RAM:   3589505 bytes (3505 KB)
+  Proposed BSP RAM:  3398033 bytes (3318 KB)
+  Savings:            191472 bytes (186 KB, 5.3%)
+  Surf field max: pBase=1290 vNormal=1183 vTexU=1185 vTexV=1186 iLightMap=1498 iBrushPoly=456
+  Vert field max: pVertex=6465 (min=0) iSide=6244 (min=-1)
+  Node.iVertPool max: 43285
+  OVERFLOW: Node.iVertPool max=43285 min=0 (SWORD limit +-32767)
+  NOTE: Node.iVertPool max=43285, stays INT (no extra saving)
+
+-----------------------------------------------------------------------
+ Dig.unr
+-----------------------------------------------------------------------
+  Nodes:      15211  (    950 KB)    Surfs:      6758  (    263 KB)
+  Verts:     217403  (   1698 KB)    Vectors:    3004  (     35 KB)
+  Points:     21929  (    256 KB)    LightMap:   6316  (    246 KB)
+  LightBits: 1269404  (   1239 KB)    Bounds:     6663  (    182 KB)
+  LeafHulls:  58890  (    230 KB)    Leaves:     4730  (     92 KB)
+  Actors:      3876                 Textures:      0
+  Current BSP RAM:   5321012 bytes (5196 KB)
+  Proposed BSP RAM:  5239916 bytes (5117 KB)
+  Savings:             81096 bytes (79 KB, 1.5%)
+  Surf field max: pBase=5698 vNormal=3002 vTexU=3001 vTexV=3003 iLightMap=6315 iBrushPoly=104
+  Vert field max: pVertex=29081 (min=0) iSide=33855 (min=-1)
+  Node.iVertPool max: 217396
+  OVERFLOW: Node.iCollisionBound max=58877 min=-1 (SWORD limit +-32767)
+  OVERFLOW: Node.iVertPool max=217396 min=0 (SWORD limit +-32767)
+  NOTE: Node.iVertPool max=217396, stays INT (no extra saving)
+  OVERFLOW: Vert.iSide max=33855 min=-1 (SWORD=NO, WORD=NO)
+
+-----------------------------------------------------------------------
+ DKNightOp.unr
+-----------------------------------------------------------------------
+  Nodes:       1555  (     97 KB)    Surfs:       726  (     28 KB)
+  Verts:      21762  (    170 KB)    Vectors:     153  (      1 KB)
+  Points:      2229  (     26 KB)    LightMap:    726  (     28 KB)
+  LightBits:    576  (      0 KB)    Bounds:      800  (     21 KB)
+  LeafHulls:   8434  (     32 KB)    Leaves:      458  (      8 KB)
+  Actors:       561                 Textures:      0
+  Current BSP RAM:    426152 bytes (416 KB)
+  Proposed BSP RAM:   327282 bytes (319 KB)
+  Savings:             98870 bytes (96 KB, 23.2%)
+  Surf field max: pBase=592 vNormal=152 vTexU=129 vTexV=148 iLightMap=725 iBrushPoly=32
+  Vert field max: pVertex=2723 (min=0) iSide=3495 (min=-1)
+  Node.iVertPool max: 21754
+
+-----------------------------------------------------------------------
+ DmAriza.unr
+-----------------------------------------------------------------------
+  Nodes:       2747  (    171 KB)    Surfs:       871  (     34 KB)
+  Verts:      36771  (    287 KB)    Vectors:     436  (      5 KB)
+  Points:      3868  (     45 KB)    LightMap:    837  (     32 KB)
+  LightBits: 200857  (    196 KB)    Bounds:     1103  (     30 KB)
+  LeafHulls:   8249  (     32 KB)    Leaves:      939  (     18 KB)
+  Actors:       886                 Textures:      0
+  Current BSP RAM:    873461 bytes (852 KB)
+  Proposed BSP RAM:   715925 bytes (699 KB)
+  Savings:            157536 bytes (153 KB, 18.0%)
+  Surf field max: pBase=723 vNormal=430 vTexU=434 vTexV=429 iLightMap=836 iBrushPoly=152
+  Vert field max: pVertex=4991 (min=0) iSide=5991 (min=-1)
+  Node.iVertPool max: 36759
+  OVERFLOW: Node.iVertPool max=36759 min=0 (SWORD limit +-32767)
+  NOTE: Node.iVertPool max=36759, stays INT (no extra saving)
+
+-----------------------------------------------------------------------
+ DmCurse.unr
+-----------------------------------------------------------------------
+  Nodes:       3040  (    190 KB)    Surfs:      1610  (     62 KB)
+  Verts:      44342  (    346 KB)    Vectors:     230  (      2 KB)
+  Points:      4586  (     53 KB)    LightMap:   1481  (     57 KB)
+  LightBits: 188755  (    184 KB)    Bounds:     1408  (     38 KB)
+  LeafHulls:  11867  (     46 KB)    Leaves:     1046  (     20 KB)
+  Actors:      1632                 Textures:      0
+  Current BSP RAM:   1027295 bytes (1003 KB)
+  Proposed BSP RAM:   830607 bytes (811 KB)
+  Savings:            196688 bytes (192 KB, 19.1%)
+  Surf field max: pBase=1299 vNormal=227 vTexU=228 vTexV=229 iLightMap=1480 iBrushPoly=70
+  Vert field max: pVertex=6558 (min=0) iSide=6497 (min=-1)
+  Node.iVertPool max: 44337
+  OVERFLOW: Node.iVertPool max=44337 min=0 (SWORD limit +-32767)
+  NOTE: Node.iVertPool max=44337, stays INT (no extra saving)
+
+-----------------------------------------------------------------------
+ DmDeathFan.unr
+-----------------------------------------------------------------------
+  Nodes:       1101  (     68 KB)    Surfs:       397  (     15 KB)
+  Verts:      16242  (    126 KB)    Vectors:     109  (      1 KB)
+  Points:      1532  (     17 KB)    LightMap:    337  (     13 KB)
+  LightBits:  52034  (     50 KB)    Bounds:      480  (     13 KB)
+  LeafHulls:   4507  (     17 KB)    Leaves:      307  (      5 KB)
+  Actors:       680                 Textures:      0
+  Current BSP RAM:    339094 bytes (331 KB)
+  Proposed BSP RAM:   267160 bytes (260 KB)
+  Savings:             71934 bytes (70 KB, 21.2%)
+  Surf field max: pBase=308 vNormal=107 vTexU=103 vTexV=108 iLightMap=336 iBrushPoly=24
+  Vert field max: pVertex=2109 (min=0) iSide=2586 (min=-1)
+  Node.iVertPool max: 16236
+
+-----------------------------------------------------------------------
+ DmDeck16.unr
+-----------------------------------------------------------------------
+  Nodes:       1660  (    103 KB)    Surfs:       795  (     31 KB)
+  Verts:      24922  (    194 KB)    Vectors:     153  (      1 KB)
+  Points:      2423  (     28 KB)    LightMap:    772  (     30 KB)
+  LightBits: 194931  (    190 KB)    Bounds:      823  (     22 KB)
+  LeafHulls:   6529  (     25 KB)    Leaves:      595  (     11 KB)
+  Actors:      1163                 Textures:      0
+  Current BSP RAM:    655199 bytes (639 KB)
+  Proposed BSP RAM:   542651 bytes (529 KB)
+  Savings:            112548 bytes (109 KB, 17.2%)
+  Surf field max: pBase=623 vNormal=151 vTexU=152 vTexV=146 iLightMap=771 iBrushPoly=21
+  Vert field max: pVertex=3427 (min=0) iSide=3569 (min=-1)
+  Node.iVertPool max: 24917
+
+-----------------------------------------------------------------------
+ DMElsinore.unr
+-----------------------------------------------------------------------
+  Nodes:       4607  (    287 KB)    Surfs:      2137  (     83 KB)
+  Verts:      62932  (    491 KB)    Vectors:     467  (      5 KB)
+  Points:      6956  (     81 KB)    LightMap:   2017  (     78 KB)
+  LightBits: 571643  (    558 KB)    Bounds:     2202  (     60 KB)
+  LeafHulls:  19639  (     76 KB)    Leaves:     1528  (     29 KB)
+  Actors:      1600                 Textures:      0
+  Current BSP RAM:   1795955 bytes (1753 KB)
+  Proposed BSP RAM:  1518583 bytes (1482 KB)
+  Savings:            277372 bytes (270 KB, 15.4%)
+  Surf field max: pBase=1748 vNormal=465 vTexU=465 vTexV=466 iLightMap=2016 iBrushPoly=80
+  Vert field max: pVertex=9318 (min=0) iSide=9860 (min=-1)
+  Node.iVertPool max: 62924
+  OVERFLOW: Node.iVertPool max=62924 min=0 (SWORD limit +-32767)
+  NOTE: Node.iVertPool max=62924, stays INT (no extra saving)
+
+-----------------------------------------------------------------------
+ DMfith.unr
+-----------------------------------------------------------------------
+  Nodes:       1337  (     83 KB)    Surfs:       678  (     26 KB)
+  Verts:      18690  (    146 KB)    Vectors:     119  (      1 KB)
+  Points:      2020  (     23 KB)    LightMap:    645  (     25 KB)
+  LightBits:  32048  (     31 KB)    Bounds:      599  (     16 KB)
+  LeafHulls:   5163  (     20 KB)    Leaves:      463  (      9 KB)
+  Actors:       573                 Textures:      0
+  Current BSP RAM:    392408 bytes (383 KB)
+  Proposed BSP RAM:   306838 bytes (299 KB)
+  Savings:             85570 bytes (83 KB, 21.8%)
+  Surf field max: pBase=578 vNormal=116 vTexU=117 vTexV=118 iLightMap=644 iBrushPoly=139
+  Vert field max: pVertex=2606 (min=0) iSide=3015 (min=-1)
+  Node.iVertPool max: 18685
+
+-----------------------------------------------------------------------
+ DmHealPod.unr
+-----------------------------------------------------------------------
+  Nodes:       1698  (    106 KB)    Surfs:       791  (     30 KB)
+  Verts:      22905  (    178 KB)    Vectors:     163  (      1 KB)
+  Points:      2359  (     27 KB)    LightMap:    763  (     29 KB)
+  LightBits: 245863  (    240 KB)    Bounds:      768  (     21 KB)
+  LeafHulls:   7378  (     28 KB)    Leaves:      507  (      9 KB)
+  Actors:       851                 Textures:      0
+  Current BSP RAM:    691355 bytes (675 KB)
+  Proposed BSP RAM:   586847 bytes (573 KB)
+  Savings:            104508 bytes (102 KB, 15.1%)
+  Surf field max: pBase=610 vNormal=162 vTexU=150 vTexV=159 iLightMap=762 iBrushPoly=34
+  Vert field max: pVertex=3082 (min=0) iSide=3891 (min=-1)
+  Node.iVertPool max: 22898
+
+-----------------------------------------------------------------------
+ DmMorbias.unr
+-----------------------------------------------------------------------
+  Nodes:       1054  (     65 KB)    Surfs:       538  (     21 KB)
+  Verts:      19187  (    149 KB)    Vectors:     240  (      2 KB)
+  Points:      1512  (     17 KB)    LightMap:    519  (     20 KB)
+  LightBits: 163821  (    159 KB)    Bounds:      558  (     15 KB)
+  LeafHulls:   4660  (     18 KB)    Leaves:      386  (      7 KB)
+  Actors:       419                 Textures:      0
+  Current BSP RAM:    490061 bytes (478 KB)
+  Proposed BSP RAM:   404749 bytes (395 KB)
+  Savings:             85312 bytes (83 KB, 17.4%)
+  Surf field max: pBase=461 vNormal=224 vTexU=238 vTexV=239 iLightMap=518 iBrushPoly=47
+  Vert field max: pVertex=2519 (min=0) iSide=2200 (min=-1)
+  Node.iVertPool max: 19172
+
+-----------------------------------------------------------------------
+ DmRadikus.unr
+-----------------------------------------------------------------------
+  Nodes:       4230  (    264 KB)    Surfs:      1981  (     77 KB)
+  Verts:      64154  (    501 KB)    Vectors:     395  (      4 KB)
+  Points:      6767  (     79 KB)    LightMap:   1757  (     68 KB)
+  LightBits: 179513  (    175 KB)    Bounds:     2027  (     55 KB)
+  LeafHulls:  18321  (     71 KB)    Leaves:     1326  (     25 KB)
+  Actors:       920                 Textures:      0
+  Current BSP RAM:   1355489 bytes (1323 KB)
+  Proposed BSP RAM:  1075101 bytes (1049 KB)
+  Savings:            280388 bytes (273 KB, 20.7%)
+  Surf field max: pBase=6766 vNormal=387 vTexU=376 vTexV=394 iLightMap=1756 iBrushPoly=54
+  Vert field max: pVertex=8907 (min=0) iSide=9397 (min=-1)
+  Node.iVertPool max: 64147
+  OVERFLOW: Node.iVertPool max=64147 min=0 (SWORD limit +-32767)
+  NOTE: Node.iVertPool max=64147, stays INT (no extra saving)
+
+-----------------------------------------------------------------------
+ DmTundra.unr
+-----------------------------------------------------------------------
+  Nodes:       2926  (    182 KB)    Surfs:       958  (     37 KB)
+  Verts:      40672  (    317 KB)    Vectors:     674  (      7 KB)
+  Points:      4229  (     49 KB)    LightMap:    903  (     35 KB)
+  LightBits: 261439  (    255 KB)    Bounds:     1252  (     34 KB)
+  LeafHulls:  11493  (     44 KB)    Leaves:      858  (     16 KB)
+  Actors:       627                 Textures:      0
+  Current BSP RAM:   1005543 bytes (981 KB)
+  Proposed BSP RAM:   831359 bytes (811 KB)
+  Savings:            174184 bytes (170 KB, 17.3%)
+  Surf field max: pBase=884 vNormal=672 vTexU=646 vTexV=673 iLightMap=902 iBrushPoly=107
+  Vert field max: pVertex=5752 (min=0) iSide=6483 (min=-1)
+  Node.iVertPool max: 40666
+  OVERFLOW: Node.iVertPool max=40666 min=0 (SWORD limit +-32767)
+  NOTE: Node.iVertPool max=40666, stays INT (no extra saving)
+
+-----------------------------------------------------------------------
+ Dug.unr
+-----------------------------------------------------------------------
+  Nodes:       5919  (    369 KB)    Surfs:      2951  (    115 KB)
+  Verts:      81202  (    634 KB)    Vectors:     396  (      4 KB)
+  Points:      8739  (    102 KB)    LightMap:   2798  (    109 KB)
+  LightBits: 945694  (    923 KB)    Bounds:     2710  (     74 KB)
+  LeafHulls:  24227  (     94 KB)    Leaves:     1815  (     35 KB)
+  Actors:      2683                 Textures:      0
+  Current BSP RAM:   2522794 bytes (2463 KB)
+  Proposed BSP RAM:  2162574 bytes (2111 KB)
+  Savings:            360220 bytes (351 KB, 14.3%)
+  Surf field max: pBase=2566 vNormal=394 vTexU=386 vTexV=395 iLightMap=2797 iBrushPoly=31
+  Vert field max: pVertex=11374 (min=0) iSide=13234 (min=-1)
+  Node.iVertPool max: 81196
+  OVERFLOW: Node.iVertPool max=81196 min=0 (SWORD limit +-32767)
+  NOTE: Node.iVertPool max=81196, stays INT (no extra saving)
+
+-----------------------------------------------------------------------
+ endgame.unr
+-----------------------------------------------------------------------
+  Nodes:       6319  (    394 KB)    Surfs:      2748  (    107 KB)
+  Verts:     100264  (    783 KB)    Vectors:    1977  (     23 KB)
+  Points:      9530  (    111 KB)    LightMap:   2626  (    102 KB)
+  LightBits: 176486  (    172 KB)    Bounds:     3387  (     92 KB)
+  LeafHulls:  24698  (     96 KB)    Leaves:     2624  (     51 KB)
+  Actors:      1468                 Textures:      0
+  Current BSP RAM:   1982166 bytes (1935 KB)
+  Proposed BSP RAM:  1548134 bytes (1511 KB)
+  Savings:            434032 bytes (423 KB, 21.9%)
+  Surf field max: pBase=2402 vNormal=1971 vTexU=1972 vTexV=1976 iLightMap=2625 iBrushPoly=456
+  Vert field max: pVertex=15477 (min=0) iSide=13550 (min=-1)
+  Node.iVertPool max: 100259
+  OVERFLOW: Node.iVertPool max=100259 min=0 (SWORD limit +-32767)
+  NOTE: Node.iVertPool max=100259, stays INT (no extra saving)
+
+-----------------------------------------------------------------------
+ Entry.unr
+-----------------------------------------------------------------------
+  Nodes:        261  (     16 KB)    Surfs:       120  (      4 KB)
+  Verts:       3809  (     29 KB)    Vectors:     110  (      1 KB)
+  Points:       353  (      4 KB)    LightMap:    114  (      4 KB)
+  LightBits:   2048  (      2 KB)    Bounds:      119  (      3 KB)
+  LeafHulls:    940  (      3 KB)    Leaves:       84  (      1 KB)
+  Actors:        42                 Textures:      0
+  Current BSP RAM:     72912 bytes (71 KB)
+  Proposed BSP RAM:    55714 bytes (54 KB)
+  Savings:             17198 bytes (16 KB, 23.6%)
+  Surf field max: pBase=100 vNormal=107 vTexU=108 vTexV=109 iLightMap=113 iBrushPoly=34
+  Vert field max: pVertex=495 (min=0) iSide=609 (min=-1)
+  Node.iVertPool max: 3804
+
+-----------------------------------------------------------------------
+ ExtremeBeg.unr
+-----------------------------------------------------------------------
+  Nodes:       1546  (     96 KB)    Surfs:      1078  (     42 KB)
+  Verts:      27139  (    212 KB)    Vectors:     174  (      2 KB)
+  Points:      2257  (     26 KB)    LightMap:   1015  (     39 KB)
+  LightBits: 101908  (     99 KB)    Bounds:      733  (     20 KB)
+  LeafHulls:   6864  (     26 KB)    Leaves:      417  (      8 KB)
+  Actors:       761                 Textures:      0
+  Current BSP RAM:    587176 bytes (573 KB)
+  Proposed BSP RAM:   462592 bytes (451 KB)
+  Savings:            124584 bytes (121 KB, 21.2%)
+  Surf field max: pBase=789 vNormal=171 vTexU=173 vTexV=167 iLightMap=1014 iBrushPoly=31
+  Vert field max: pVertex=3180 (min=0) iSide=3205 (min=-1)
+  Node.iVertPool max: 27127
+
+-----------------------------------------------------------------------
+ ExtremeCore.unr
+-----------------------------------------------------------------------
+  Nodes:       5651  (    353 KB)    Surfs:      2929  (    114 KB)
+  Verts:      91747  (    716 KB)    Vectors:     843  (      9 KB)
+  Points:      7912  (     92 KB)    LightMap:   2723  (    106 KB)
+  LightBits: 690972  (    674 KB)    Bounds:     2835  (     77 KB)
+  LeafHulls:  25475  (     99 KB)    Leaves:     1810  (     35 KB)
+  Actors:      5358                 Textures:      0
+  Current BSP RAM:   2335232 bytes (2280 KB)
+  Proposed BSP RAM:  1933096 bytes (1887 KB)
+  Savings:            402136 bytes (392 KB, 17.2%)
+  Surf field max: pBase=2388 vNormal=822 vTexU=842 vTexV=841 iLightMap=2722 iBrushPoly=69
+  Vert field max: pVertex=11202 (min=0) iSide=11829 (min=-1)
+  Node.iVertPool max: 91740
+  OVERFLOW: Node.iVertPool max=91740 min=0 (SWORD limit +-32767)
+  NOTE: Node.iVertPool max=91740, stays INT (no extra saving)
+
+-----------------------------------------------------------------------
+ ExtremeDark.unr
+-----------------------------------------------------------------------
+  Nodes:      10185  (    636 KB)    Surfs:      5198  (    203 KB)
+  Verts:     167948  (   1312 KB)    Vectors:    1269  (     14 KB)
+  Points:     14398  (    168 KB)    LightMap:   5092  (    198 KB)
+  LightBits: 132706  (    129 KB)    Bounds:     5058  (    138 KB)
+  LeafHulls:  44916  (    175 KB)    Leaves:     3312  (     64 KB)
+  Actors:      2166                 Textures:      0
+  Current BSP RAM:   3115262 bytes (3042 KB)
+  Proposed BSP RAM:  2381094 bytes (2325 KB)
+  Savings:            734168 bytes (716 KB, 23.6%)
+  Surf field max: pBase=4326 vNormal=1268 vTexU=1266 vTexV=1267 iLightMap=5091 iBrushPoly=69
+  Vert field max: pVertex=21062 (min=0) iSide=21219 (min=-1)
+  Node.iVertPool max: 167942
+  OVERFLOW: Node.iCollisionBound max=44905 min=-1 (SWORD limit +-32767)
+  OVERFLOW: Node.iVertPool max=167942 min=0 (SWORD limit +-32767)
+  NOTE: Node.iVertPool max=167942, stays INT (no extra saving)
+
+-----------------------------------------------------------------------
+ ExtremeDGen.unr
+-----------------------------------------------------------------------
+  Nodes:       1392  (     87 KB)    Surfs:       542  (     21 KB)
+  Verts:      22277  (    174 KB)    Vectors:     469  (      5 KB)
+  Points:      2103  (     24 KB)    LightMap:    524  (     20 KB)
+  LightBits:  54935  (     53 KB)    Bounds:      638  (     17 KB)
+  LeafHulls:   5692  (     22 KB)    Leaves:      408  (      7 KB)
+  Actors:       586                 Textures:      0
+  Current BSP RAM:    444535 bytes (434 KB)
+  Proposed BSP RAM:   346139 bytes (338 KB)
+  Savings:             98396 bytes (96 KB, 22.1%)
+  Surf field max: pBase=471 vNormal=463 vTexU=467 vTexV=468 iLightMap=523 iBrushPoly=153
+  Vert field max: pVertex=2894 (min=0) iSide=3153 (min=-1)
+  Node.iVertPool max: 22270
+
+-----------------------------------------------------------------------
+ ExtremeEnd.unr
+-----------------------------------------------------------------------
+  Nodes:       2999  (    187 KB)    Surfs:      2003  (     78 KB)
+  Verts:      52402  (    409 KB)    Vectors:     507  (      5 KB)
+  Points:      4473  (     52 KB)    LightMap:   1990  (     77 KB)
+  LightBits: 278285  (    271 KB)    Bounds:     1593  (     43 KB)
+  LeafHulls:  12609  (     49 KB)    Leaves:     1167  (     22 KB)
+  Actors:       937                 Textures:      0
+  Current BSP RAM:   1227297 bytes (1198 KB)
+  Proposed BSP RAM:   993653 bytes (970 KB)
+  Savings:            233644 bytes (228 KB, 19.0%)
+  Surf field max: pBase=1572 vNormal=473 vTexU=496 vTexV=506 iLightMap=1989 iBrushPoly=28
+  Vert field max: pVertex=6759 (min=0) iSide=5966 (min=-1)
+  Node.iVertPool max: 52397
+  OVERFLOW: Node.iVertPool max=52397 min=0 (SWORD limit +-32767)
+  NOTE: Node.iVertPool max=52397, stays INT (no extra saving)
+
+-----------------------------------------------------------------------
+ ExtremeGen.unr
+-----------------------------------------------------------------------
+  Nodes:       1131  (     70 KB)    Surfs:       468  (     18 KB)
+  Verts:      18338  (    143 KB)    Vectors:     332  (      3 KB)
+  Points:      1722  (     20 KB)    LightMap:    453  (     17 KB)
+  LightBits:  96181  (     93 KB)    Bounds:      579  (     15 KB)
+  LeafHulls:   4277  (     16 KB)    Leaves:      453  (      8 KB)
+  Actors:       694                 Textures:      0
+  Current BSP RAM:    419137 bytes (409 KB)
+  Proposed BSP RAM:   337907 bytes (329 KB)
+  Savings:             81230 bytes (79 KB, 19.4%)
+  Surf field max: pBase=427 vNormal=326 vTexU=330 vTexV=331 iLightMap=452 iBrushPoly=118
+  Vert field max: pVertex=2675 (min=0) iSide=2400 (min=-1)
+  Node.iVertPool max: 18330
+
+-----------------------------------------------------------------------
+ ExtremeLab.unr
+-----------------------------------------------------------------------
+  Nodes:       9277  (    579 KB)    Surfs:      4584  (    179 KB)
+  Verts:     149444  (   1167 KB)    Vectors:    1152  (     13 KB)
+  Points:     13079  (    153 KB)    LightMap:   4331  (    169 KB)
+  LightBits: 399719  (    390 KB)    Bounds:     4651  (    127 KB)
+  LeafHulls:  40833  (    159 KB)    Leaves:     3095  (     60 KB)
+  Actors:      2446                 Textures:      0
+  Current BSP RAM:   3071831 bytes (2999 KB)
+  Proposed BSP RAM:  2419047 bytes (2362 KB)
+  Savings:            652784 bytes (637 KB, 21.3%)
+  Surf field max: pBase=3957 vNormal=1142 vTexU=1150 vTexV=1151 iLightMap=4330 iBrushPoly=58
+  Vert field max: pVertex=19783 (min=0) iSide=19332 (min=-1)
+  Node.iVertPool max: 149434
+  OVERFLOW: Node.iCollisionBound max=40821 min=-1 (SWORD limit +-32767)
+  OVERFLOW: Node.iVertPool max=149434 min=0 (SWORD limit +-32767)
+  NOTE: Node.iVertPool max=149434, stays INT (no extra saving)
+
+-----------------------------------------------------------------------
+ Gateway.unr
+-----------------------------------------------------------------------
+  Nodes:      11987  (    749 KB)    Surfs:      4636  (    181 KB)
+  Verts:     158926  (   1241 KB)    Vectors:    2872  (     33 KB)
+  Points:     15703  (    184 KB)    LightMap:   4210  (    164 KB)
+  LightBits: 342661  (    334 KB)    Bounds:     5772  (    157 KB)
+  LeafHulls:  56704  (    221 KB)    Leaves:     3910  (     76 KB)
+  Actors:       685                 Textures:      0
+  Current BSP RAM:   3424609 bytes (3344 KB)
+  Proposed BSP RAM:  2733273 bytes (2669 KB)
+  Savings:            691336 bytes (675 KB, 20.2%)
+  Surf field max: pBase=3793 vNormal=2870 vTexU=2871 vTexV=2867 iLightMap=4209 iBrushPoly=159
+  Vert field max: pVertex=21410 (min=0) iSide=25972 (min=-1)
+  Node.iVertPool max: 158921
+  OVERFLOW: Node.iCollisionBound max=56691 min=-1 (SWORD limit +-32767)
+  OVERFLOW: Node.iVertPool max=158921 min=0 (SWORD limit +-32767)
+  NOTE: Node.iVertPool max=158921, stays INT (no extra saving)
+
+-----------------------------------------------------------------------
+ Harobed.unr
+-----------------------------------------------------------------------
+  Nodes:       5198  (    324 KB)    Surfs:      2597  (    101 KB)
+  Verts:      86250  (    673 KB)    Vectors:    1069  (     12 KB)
+  Points:      8364  (     98 KB)    LightMap:   2483  (     96 KB)
+  LightBits: 1594234  (   1556 KB)    Bounds:     2779  (     75 KB)
+  LeafHulls:  20316  (     79 KB)    Leaves:     2174  (     42 KB)
+  Actors:      1341                 Textures:      0
+  Current BSP RAM:   3135858 bytes (3062 KB)
+  Proposed BSP RAM:  2759694 bytes (2695 KB)
+  Savings:            376164 bytes (367 KB, 12.0%)
+  Surf field max: pBase=2231 vNormal=1067 vTexU=1065 vTexV=1068 iLightMap=2482 iBrushPoly=203
+  Vert field max: pVertex=12943 (min=0) iSide=10482 (min=-1)
+  Node.iVertPool max: 86245
+  OVERFLOW: Node.iVertPool max=86245 min=0 (SWORD limit +-32767)
+  NOTE: Node.iVertPool max=86245, stays INT (no extra saving)
+
+-----------------------------------------------------------------------
+ IsvDeck1.unr
+-----------------------------------------------------------------------
+  Nodes:      10243  (    640 KB)    Surfs:      4571  (    178 KB)
+  Verts:     151384  (   1182 KB)    Vectors:     875  (     10 KB)
+  Points:     14998  (    175 KB)    LightMap:   4253  (    166 KB)
+  LightBits: 1022357  (    998 KB)    Bounds:     5358  (    146 KB)
+  LeafHulls:  42135  (    164 KB)    Leaves:     4228  (     82 KB)
+  Actors:      2698                 Textures:      0
+  Current BSP RAM:   3835541 bytes (3745 KB)
+  Proposed BSP RAM:  3175153 bytes (3100 KB)
+  Savings:            660388 bytes (644 KB, 17.2%)
+  Surf field max: pBase=3799 vNormal=873 vTexU=874 vTexV=872 iLightMap=4252 iBrushPoly=77
+  Vert field max: pVertex=21526 (min=0) iSide=22375 (min=-1)
+  Node.iVertPool max: 151377
+  OVERFLOW: Node.iCollisionBound max=42122 min=-1 (SWORD limit +-32767)
+  OVERFLOW: Node.iVertPool max=151377 min=0 (SWORD limit +-32767)
+  NOTE: Node.iVertPool max=151377, stays INT (no extra saving)
+
+-----------------------------------------------------------------------
+ IsvKran32.unr
+-----------------------------------------------------------------------
+  Nodes:      17448  (   1090 KB)    Surfs:      8148  (    318 KB)
+  Verts:     281522  (   2199 KB)    Vectors:    1130  (     13 KB)
+  Points:     26450  (    309 KB)    LightMap:   7288  (    284 KB)
+  LightBits: 1863228  (   1819 KB)    Bounds:     9237  (    252 KB)
+  LeafHulls:  67232  (    262 KB)    Leaves:     7865  (    153 KB)
+  Actors:      3345                 Textures:      0
+  Current BSP RAM:   6865340 bytes (6704 KB)
+  Proposed BSP RAM:  6767564 bytes (6608 KB)
+  Savings:             97776 bytes (95 KB, 1.4%)
+  Surf field max: pBase=26449 vNormal=901 vTexU=1129 vTexV=1127 iLightMap=7287 iBrushPoly=53
+  Vert field max: pVertex=38534 (min=0) iSide=37869 (min=-1)
+  Node.iVertPool max: 281517
+  OVERFLOW: Node.iCollisionBound max=67219 min=-1 (SWORD limit +-32767)
+  OVERFLOW: Node.iVertPool max=281517 min=0 (SWORD limit +-32767)
+  NOTE: Node.iVertPool max=281517, stays INT (no extra saving)
+  OVERFLOW: Vert.pVertex max=38534 min=0 (SWORD=NO, WORD=fits)
+  OVERFLOW: Vert.iSide max=37869 min=-1 (SWORD=NO, WORD=NO)
+
+-----------------------------------------------------------------------
+ IsvKran4.unr
+-----------------------------------------------------------------------
+  Nodes:       5013  (    313 KB)    Surfs:      2839  (    110 KB)
+  Verts:      82689  (    646 KB)    Vectors:     294  (      3 KB)
+  Points:      7826  (     91 KB)    LightMap:   2564  (    100 KB)
+  LightBits: 626588  (    611 KB)    Bounds:     2703  (     73 KB)
+  LeafHulls:  19834  (     77 KB)    Leaves:     2155  (     42 KB)
+  Actors:      1768                 Textures:      0
+  Current BSP RAM:   2120612 bytes (2070 KB)
+  Proposed BSP RAM:  1755788 bytes (1714 KB)
+  Savings:            364824 bytes (356 KB, 17.2%)
+  Surf field max: pBase=2286 vNormal=286 vTexU=293 vTexV=290 iLightMap=2563 iBrushPoly=28
+  Vert field max: pVertex=11807 (min=0) iSide=10933 (min=-1)
+  Node.iVertPool max: 82684
+  OVERFLOW: Node.iVertPool max=82684 min=0 (SWORD limit +-32767)
+  NOTE: Node.iVertPool max=82684, stays INT (no extra saving)
+
+-----------------------------------------------------------------------
+ NaliBoat.unr
+-----------------------------------------------------------------------
+  Nodes:       6481  (    405 KB)    Surfs:      2095  (     81 KB)
+  Verts:      88298  (    689 KB)    Vectors:    2725  (     31 KB)
+  Points:      9670  (    113 KB)    LightMap:   1953  (     76 KB)
+  LightBits: 162241  (    158 KB)    Bounds:     2904  (     79 KB)
+  LeafHulls:  24594  (     96 KB)    Leaves:     2293  (     44 KB)
+  Actors:       578                 Textures:      0
+  Current BSP RAM:   1819617 bytes (1776 KB)
+  Proposed BSP RAM:  1441285 bytes (1407 KB)
+  Savings:            378332 bytes (369 KB, 20.8%)
+  Surf field max: pBase=1917 vNormal=2723 vTexU=2721 vTexV=2724 iLightMap=1952 iBrushPoly=427
+  Vert field max: pVertex=13252 (min=0) iSide=13864 (min=-1)
+  Node.iVertPool max: 88291
+  OVERFLOW: Node.iVertPool max=88291 min=0 (SWORD limit +-32767)
+  NOTE: Node.iVertPool max=88291, stays INT (no extra saving)
+
+-----------------------------------------------------------------------
+ NaliC.unr
+-----------------------------------------------------------------------
+  Nodes:      18703  (   1168 KB)    Surfs:      6407  (    250 KB)
+  Verts:     271735  (   2122 KB)    Vectors:    2961  (     34 KB)
+  Points:     28405  (    332 KB)    LightMap:   5981  (    233 KB)
+  LightBits: 604163  (    590 KB)    Bounds:     8156  (    223 KB)
+  LeafHulls:  69169  (    270 KB)    Leaves:     6561  (    128 KB)
+  Actors:      2142                 Textures:      0
+  Current BSP RAM:   5483211 bytes (5354 KB)
+  Proposed BSP RAM:  5406327 bytes (5279 KB)
+  Savings:             76884 bytes (75 KB, 1.4%)
+  Surf field max: pBase=5733 vNormal=2959 vTexU=2955 vTexV=2960 iLightMap=5980 iBrushPoly=335
+  Vert field max: pVertex=39010 (min=0) iSide=41319 (min=-1)
+  Node.iVertPool max: 271728
+  OVERFLOW: Node.iCollisionBound max=69156 min=-1 (SWORD limit +-32767)
+  OVERFLOW: Node.iVertPool max=271728 min=0 (SWORD limit +-32767)
+  NOTE: Node.iVertPool max=271728, stays INT (no extra saving)
+  OVERFLOW: Vert.pVertex max=39010 min=0 (SWORD=NO, WORD=fits)
+  OVERFLOW: Vert.iSide max=41319 min=-1 (SWORD=NO, WORD=NO)
+
+-----------------------------------------------------------------------
+ NaliLord.unr
+-----------------------------------------------------------------------
+  Nodes:       3832  (    239 KB)    Surfs:       606  (     23 KB)
+  Verts:      43069  (    336 KB)    Vectors:     937  (     10 KB)
+  Points:      4587  (     53 KB)    LightMap:    565  (     22 KB)
+  LightBits:  82247  (     80 KB)    Bounds:     1135  (     31 KB)
+  LeafHulls:   9393  (     36 KB)    Leaves:      893  (     17 KB)
+  Actors:       249                 Textures:      0
+  Current BSP RAM:    872387 bytes (851 KB)
+  Proposed BSP RAM:   692839 bytes (676 KB)
+  Savings:            179548 bytes (175 KB, 20.6%)
+  Surf field max: pBase=494 vNormal=935 vTexU=936 vTexV=934 iLightMap=564 iBrushPoly=76
+  Vert field max: pVertex=5828 (min=0) iSide=7653 (min=-1)
+  Node.iVertPool max: 43064
+  OVERFLOW: Node.iVertPool max=43064 min=0 (SWORD limit +-32767)
+  NOTE: Node.iVertPool max=43064, stays INT (no extra saving)
+
+-----------------------------------------------------------------------
+ Noork.unr
+-----------------------------------------------------------------------
+  Nodes:       2578  (    161 KB)    Surfs:      1152  (     45 KB)
+  Verts:      39503  (    308 KB)    Vectors:     811  (      9 KB)
+  Points:      3997  (     46 KB)    LightMap:   1128  (     44 KB)
+  LightBits: 578269  (    564 KB)    Bounds:     1361  (     37 KB)
+  LeafHulls:  11225  (     43 KB)    Leaves:      900  (     17 KB)
+  Actors:       863                 Textures:      0
+  Current BSP RAM:   1309189 bytes (1278 KB)
+  Proposed BSP RAM:  1137353 bytes (1110 KB)
+  Savings:            171836 bytes (167 KB, 13.1%)
+  Surf field max: pBase=3995 vNormal=809 vTexU=807 vTexV=810 iLightMap=1127 iBrushPoly=233
+  Vert field max: pVertex=5603 (min=0) iSide=5280 (min=-1)
+  Node.iVertPool max: 39500
+  OVERFLOW: Node.iVertPool max=39500 min=0 (SWORD limit +-32767)
+  NOTE: Node.iVertPool max=39500, stays INT (no extra saving)
+
+-----------------------------------------------------------------------
+ NyLeve.unr
+-----------------------------------------------------------------------
+  Nodes:       5990  (    374 KB)    Surfs:      3308  (    129 KB)
+  Verts:      98453  (    769 KB)    Vectors:    1930  (     22 KB)
+  Points:      8953  (    104 KB)    LightMap:   3158  (    123 KB)
+  LightBits: 3360701  (   3281 KB)    Bounds:     2994  (     81 KB)
+  LeafHulls:  22889  (     89 KB)    Leaves:     2370  (     46 KB)
+  Actors:      1572                 Textures:      0
+  Current BSP RAM:   5143709 bytes (5023 KB)
+  Proposed BSP RAM:  4710201 bytes (4599 KB)
+  Savings:            433508 bytes (423 KB, 8.4%)
+  Surf field max: pBase=8952 vNormal=1902 vTexU=1928 vTexV=1929 iLightMap=3157 iBrushPoly=217
+  Vert field max: pVertex=13709 (min=0) iSide=11977 (min=-1)
+  Node.iVertPool max: 98449
+  OVERFLOW: Node.iVertPool max=98449 min=0 (SWORD limit +-32767)
+  NOTE: Node.iVertPool max=98449, stays INT (no extra saving)
+
+-----------------------------------------------------------------------
+ Passage.unr
+-----------------------------------------------------------------------
+  Nodes:       2776  (    173 KB)    Surfs:      1331  (     51 KB)
+  Verts:      44233  (    345 KB)    Vectors:     595  (      6 KB)
+  Points:      4305  (     50 KB)    LightMap:   1274  (     49 KB)
+  LightBits: 397778  (    388 KB)    Bounds:     1431  (     39 KB)
+  LeafHulls:  12335  (     48 KB)    Leaves:     1013  (     19 KB)
+  Actors:       822                 Textures:      0
+  Current BSP RAM:   1201974 bytes (1173 KB)
+  Proposed BSP RAM:  1009070 bytes (985 KB)
+  Savings:            192904 bytes (188 KB, 16.0%)
+  Surf field max: pBase=1151 vNormal=594 vTexU=594 vTexV=592 iLightMap=1273 iBrushPoly=83
+  Vert field max: pVertex=6296 (min=0) iSide=5883 (min=-1)
+  Node.iVertPool max: 44227
+  OVERFLOW: Node.iVertPool max=44227 min=0 (SWORD limit +-32767)
+  NOTE: Node.iVertPool max=44227, stays INT (no extra saving)
+
+-----------------------------------------------------------------------
+ QueenEnd.unr
+-----------------------------------------------------------------------
+  Nodes:       3500  (    218 KB)    Surfs:      1603  (     62 KB)
+  Verts:      59912  (    468 KB)    Vectors:     587  (      6 KB)
+  Points:      5423  (     63 KB)    LightMap:   1454  (     56 KB)
+  LightBits: 3581849  (   3497 KB)    Bounds:     1713  (     46 KB)
+  LeafHulls:  14065  (     54 KB)    Leaves:     1269  (     24 KB)
+  Actors:      1667                 Textures:      0
+  Current BSP RAM:   4609149 bytes (4501 KB)
+  Proposed BSP RAM:  4350265 bytes (4248 KB)
+  Savings:            258884 bytes (252 KB, 5.6%)
+  Surf field max: pBase=5422 vNormal=584 vTexU=581 vTexV=583 iLightMap=1453 iBrushPoly=68
+  Vert field max: pVertex=7732 (min=0) iSide=7571 (min=-1)
+  Node.iVertPool max: 59908
+  OVERFLOW: Node.iVertPool max=59908 min=0 (SWORD limit +-32767)
+  NOTE: Node.iVertPool max=59908, stays INT (no extra saving)
+
+-----------------------------------------------------------------------
+ Ruins.unr
+-----------------------------------------------------------------------
+  Nodes:      20545  (   1284 KB)    Surfs:      7223  (    282 KB)
+  Verts:     297584  (   2324 KB)    Vectors:    5644  (     66 KB)
+  Points:     31032  (    363 KB)    LightMap:   6838  (    267 KB)
+  LightBits: 172749  (    168 KB)    Bounds:     9558  (    261 KB)
+  LeafHulls:  82953  (    324 KB)    Leaves:     6751  (    131 KB)
+  Actors:      1699                 Textures:      0
+  Current BSP RAM:   5605309 bytes (5473 KB)
+  Proposed BSP RAM:  5518633 bytes (5389 KB)
+  Savings:             86676 bytes (84 KB, 1.5%)
+  Surf field max: pBase=6435 vNormal=5641 vTexU=5642 vTexV=5643 iLightMap=6837 iBrushPoly=769
+  Vert field max: pVertex=43931 (min=0) iSide=44983 (min=-1)
+  Node.iVertPool max: 297578
+  OVERFLOW: Node.iCollisionBound max=82941 min=-1 (SWORD limit +-32767)
+  OVERFLOW: Node.iVertPool max=297578 min=0 (SWORD limit +-32767)
+  NOTE: Node.iVertPool max=297578, stays INT (no extra saving)
+  OVERFLOW: Vert.pVertex max=43931 min=0 (SWORD=NO, WORD=fits)
+  OVERFLOW: Vert.iSide max=44983 min=-1 (SWORD=NO, WORD=NO)
+
+-----------------------------------------------------------------------
+ SkyBase.unr
+-----------------------------------------------------------------------
+  Nodes:      13761  (    860 KB)    Surfs:      5703  (    222 KB)
+  Verts:     200381  (   1565 KB)    Vectors:    1524  (     17 KB)
+  Points:     21216  (    248 KB)    LightMap:   5562  (    217 KB)
+  LightBits: 526200  (    513 KB)    Bounds:     6957  (    190 KB)
+  LeafHulls:  61350  (    239 KB)    Leaves:     4854  (     94 KB)
+  Actors:      2187                 Textures:      0
+  Current BSP RAM:   4270708 bytes (4170 KB)
+  Proposed BSP RAM:  3400748 bytes (3321 KB)
+  Savings:            869960 bytes (849 KB, 20.4%)
+  Surf field max: pBase=4526 vNormal=1523 vTexU=1521 vTexV=1522 iLightMap=5561 iBrushPoly=124
+  Vert field max: pVertex=27859 (min=0) iSide=29709 (min=-1)
+  Node.iVertPool max: 200374
+  OVERFLOW: Node.iCollisionBound max=61338 min=-1 (SWORD limit +-32767)
+  OVERFLOW: Node.iVertPool max=200374 min=0 (SWORD limit +-32767)
+  NOTE: Node.iVertPool max=200374, stays INT (no extra saving)
+
+-----------------------------------------------------------------------
+ SkyCaves.unr
+-----------------------------------------------------------------------
+  Nodes:       6818  (    426 KB)    Surfs:      2797  (    109 KB)
+  Verts:      95037  (    742 KB)    Vectors:    2099  (     24 KB)
+  Points:     10269  (    120 KB)    LightMap:   2463  (     96 KB)
+  LightBits: 233525  (    228 KB)    Bounds:     3331  (     91 KB)
+  LeafHulls:  29549  (    115 KB)    Leaves:     2191  (     42 KB)
+  Actors:      1365                 Textures:      0
+  Current BSP RAM:   2044273 bytes (1996 KB)
+  Proposed BSP RAM:  1630561 bytes (1592 KB)
+  Savings:            413712 bytes (404 KB, 20.2%)
+  Surf field max: pBase=2377 vNormal=2097 vTexU=2098 vTexV=2088 iLightMap=2462 iBrushPoly=124
+  Vert field max: pVertex=13494 (min=0) iSide=14315 (min=-1)
+  Node.iVertPool max: 95029
+  OVERFLOW: Node.iVertPool max=95029 min=0 (SWORD limit +-32767)
+  NOTE: Node.iVertPool max=95029, stays INT (no extra saving)
+
+-----------------------------------------------------------------------
+ SkyTown.unr
+-----------------------------------------------------------------------
+  Nodes:      15337  (    958 KB)    Surfs:      6111  (    238 KB)
+  Verts:     248289  (   1939 KB)    Vectors:    1393  (     16 KB)
+  Points:     24447  (    286 KB)    LightMap:   5939  (    231 KB)
+  LightBits: 1999418  (   1952 KB)    Bounds:     7332  (    200 KB)
+  LeafHulls:  59693  (    233 KB)    Leaves:     5892  (    115 KB)
+  Actors:      3035                 Textures:      0
+  Current BSP RAM:   6321286 bytes (6173 KB)
+  Proposed BSP RAM:  6247954 bytes (6101 KB)
+  Savings:             73332 bytes (71 KB, 1.2%)
+  Surf field max: pBase=5010 vNormal=1384 vTexU=1391 vTexV=1392 iLightMap=5938 iBrushPoly=124
+  Vert field max: pVertex=34282 (min=0) iSide=32672 (min=-1)
+  Node.iVertPool max: 248277
+  OVERFLOW: Node.iCollisionBound max=59681 min=-1 (SWORD limit +-32767)
+  OVERFLOW: Node.iVertPool max=248277 min=0 (SWORD limit +-32767)
+  NOTE: Node.iVertPool max=248277, stays INT (no extra saving)
+  OVERFLOW: Vert.pVertex max=34282 min=0 (SWORD=NO, WORD=fits)
+
+-----------------------------------------------------------------------
+ SpireVillage.unr
+-----------------------------------------------------------------------
+  Nodes:       2689  (    168 KB)    Surfs:      1146  (     44 KB)
+  Verts:      38213  (    298 KB)    Vectors:    1070  (     12 KB)
+  Points:      3848  (     45 KB)    LightMap:   1095  (     42 KB)
+  LightBits: 341351  (    333 KB)    Bounds:     1400  (     38 KB)
+  LeafHulls:  10064  (     39 KB)    Leaves:     1159  (     22 KB)
+  Actors:       643                 Textures:      0
+  Current BSP RAM:   1070443 bytes (1045 KB)
+  Proposed BSP RAM:   903839 bytes (882 KB)
+  Savings:            166604 bytes (162 KB, 15.6%)
+  Surf field max: pBase=1011 vNormal=1067 vTexU=1069 vTexV=1064 iLightMap=1094 iBrushPoly=323
+  Vert field max: pVertex=6003 (min=0) iSide=5488 (min=-1)
+  Node.iVertPool max: 38204
+  OVERFLOW: Node.iVertPool max=38204 min=0 (SWORD limit +-32767)
+  NOTE: Node.iVertPool max=38204, stays INT (no extra saving)
+
+-----------------------------------------------------------------------
+ TerraLift.unr
+-----------------------------------------------------------------------
+  Nodes:       4167  (    260 KB)    Surfs:      2260  (     88 KB)
+  Verts:      70921  (    554 KB)    Vectors:     534  (      6 KB)
+  Points:      5985  (     70 KB)    LightMap:   2199  (     85 KB)
+  LightBits: 174505  (    170 KB)    Bounds:     2187  (     59 KB)
+  LeafHulls:  16123  (     62 KB)    Leaves:     1700  (     33 KB)
+  Actors:      1275                 Textures:      0
+  Current BSP RAM:   1424877 bytes (1391 KB)
+  Proposed BSP RAM:  1114073 bytes (1087 KB)
+  Savings:            310804 bytes (303 KB, 21.8%)
+  Surf field max: pBase=1852 vNormal=531 vTexU=532 vTexV=533 iLightMap=2198 iBrushPoly=37
+  Vert field max: pVertex=9068 (min=0) iSide=8433 (min=-1)
+  Node.iVertPool max: 70916
+  OVERFLOW: Node.iVertPool max=70916 min=0 (SWORD limit +-32767)
+  NOTE: Node.iVertPool max=70916, stays INT (no extra saving)
+
+-----------------------------------------------------------------------
+ Terraniux.unr
+-----------------------------------------------------------------------
+  Nodes:      15016  (    938 KB)    Surfs:      6882  (    268 KB)
+  Verts:     248329  (   1940 KB)    Vectors:    1878  (     22 KB)
+  Points:     21089  (    247 KB)    LightMap:   6750  (    263 KB)
+  LightBits: 4450847  (   4346 KB)    Bounds:     7525  (    205 KB)
+  LeafHulls:  60624  (    236 KB)    Leaves:     5357  (    104 KB)
+  Actors:      3551                 Textures:      0
+  Current BSP RAM:   8779723 bytes (8573 KB)
+  Proposed BSP RAM:  7703823 bytes (7523 KB)
+  Savings:           1075900 bytes (1050 KB, 12.3%)
+  Surf field max: pBase=21088 vNormal=1876 vTexU=1877 vTexV=1843 iLightMap=6749 iBrushPoly=61
+  Vert field max: pVertex=31382 (min=0) iSide=31211 (min=-1)
+  Node.iVertPool max: 248325
+  OVERFLOW: Node.iCollisionBound max=60612 min=-1 (SWORD limit +-32767)
+  OVERFLOW: Node.iVertPool max=248325 min=0 (SWORD limit +-32767)
+  NOTE: Node.iVertPool max=248325, stays INT (no extra saving)
+
+-----------------------------------------------------------------------
+ TheSunspire.unr
+-----------------------------------------------------------------------
+  Nodes:      13427  (    839 KB)    Surfs:      6199  (    242 KB)
+  Verts:     172102  (   1344 KB)    Vectors:    1288  (     15 KB)
+  Points:     18650  (    218 KB)    LightMap:   6118  (    238 KB)
+  LightBits: 3971920  (   3878 KB)    Bounds:     6978  (    190 KB)
+  LeafHulls:  65622  (    256 KB)    Leaves:     3954  (     77 KB)
+  Actors:      2739                 Textures:      0
+  Current BSP RAM:   7476952 bytes (7301 KB)
+  Proposed BSP RAM:  6714156 bytes (6556 KB)
+  Savings:            762796 bytes (744 KB, 10.2%)
+  Surf field max: pBase=5343 vNormal=1286 vTexU=1282 vTexV=1287 iLightMap=6117 iBrushPoly=217
+  Vert field max: pVertex=26786 (min=0) iSide=27547 (min=-1)
+  Node.iVertPool max: 172094
+  OVERFLOW: Node.iCollisionBound max=65608 min=-1 (SWORD limit +-32767)
+  OVERFLOW: Node.iVertPool max=172094 min=0 (SWORD limit +-32767)
+  NOTE: Node.iVertPool max=172094, stays INT (no extra saving)
+
+-----------------------------------------------------------------------
+ Trench.unr
+-----------------------------------------------------------------------
+  Nodes:       1710  (    106 KB)    Surfs:       712  (     27 KB)
+  Verts:      27047  (    211 KB)    Vectors:     561  (      6 KB)
+  Points:      2566  (     30 KB)    LightMap:    683  (     26 KB)
+  LightBits: 228081  (    222 KB)    Bounds:      855  (     23 KB)
+  LeafHulls:   6939  (     27 KB)    Leaves:      667  (     13 KB)
+  Actors:       757                 Textures:      0
+  Current BSP RAM:    712257 bytes (695 KB)
+  Proposed BSP RAM:   592105 bytes (578 KB)
+  Savings:            120152 bytes (117 KB, 16.9%)
+  Surf field max: pBase=637 vNormal=559 vTexU=552 vTexV=560 iLightMap=682 iBrushPoly=95
+  Vert field max: pVertex=3598 (min=0) iSide=3807 (min=-1)
+  Node.iVertPool max: 27035
+
+-----------------------------------------------------------------------
+ Unreal.unr
+-----------------------------------------------------------------------
+  Nodes:       2762  (    172 KB)    Surfs:       933  (     36 KB)
+  Verts:      42181  (    329 KB)    Vectors:     797  (      9 KB)
+  Points:      4245  (     49 KB)    LightMap:    909  (     35 KB)
+  LightBits: 151063  (    147 KB)    Bounds:     1274  (     34 KB)
+  LeafHulls:  11423  (     44 KB)    Leaves:      956  (     18 KB)
+  Actors:       412                 Textures:      0
+  Current BSP RAM:    899947 bytes (878 KB)
+  Proposed BSP RAM:   720027 bytes (703 KB)
+  Savings:            179920 bytes (175 KB, 20.0%)
+  Surf field max: pBase=828 vNormal=795 vTexU=796 vTexV=788 iLightMap=908 iBrushPoly=184
+  Vert field max: pVertex=5497 (min=0) iSide=5991 (min=-1)
+  Node.iVertPool max: 42175
+  OVERFLOW: Node.iVertPool max=42175 min=0 (SWORD limit +-32767)
+  NOTE: Node.iVertPool max=42175, stays INT (no extra saving)
+
+-----------------------------------------------------------------------
+ VeloraEnd.unr
+-----------------------------------------------------------------------
+  Nodes:       1797  (    112 KB)    Surfs:       816  (     31 KB)
+  Verts:      23536  (    183 KB)    Vectors:     475  (      5 KB)
+  Points:      2810  (     32 KB)    LightMap:    783  (     30 KB)
+  LightBits: 458012  (    447 KB)    Bounds:      973  (     26 KB)
+  LeafHulls:   7716  (     30 KB)    Leaves:      749  (     14 KB)
+  Actors:       589                 Textures:      0
+  Current BSP RAM:    937776 bytes (915 KB)
+  Proposed BSP RAM:   830246 bytes (810 KB)
+  Savings:            107530 bytes (105 KB, 11.5%)
+  Surf field max: pBase=666 vNormal=473 vTexU=469 vTexV=474 iLightMap=782 iBrushPoly=216
+  Vert field max: pVertex=3776 (min=0) iSide=3727 (min=-1)
+  Node.iVertPool max: 23531
+
+-----------------------------------------------------------------------
+ Vortex2.unr
+-----------------------------------------------------------------------
+  Nodes:       8559  (    534 KB)    Surfs:      4539  (    177 KB)
+  Verts:     120597  (    942 KB)    Vectors:    1475  (     17 KB)
+  Points:     11995  (    140 KB)    LightMap:   4217  (    164 KB)
+  LightBits: 679738  (    663 KB)    Bounds:     4098  (    112 KB)
+  LeafHulls:  32867  (    128 KB)    Leaves:     3053  (     59 KB)
+  Actors:      1811                 Textures:      0
+  Current BSP RAM:   3011442 bytes (2940 KB)
+  Proposed BSP RAM:  2474586 bytes (2416 KB)
+  Savings:            536856 bytes (524 KB, 17.8%)
+  Surf field max: pBase=11994 vNormal=1447 vTexU=1472 vTexV=1474 iLightMap=4216 iBrushPoly=123
+  Vert field max: pVertex=17793 (min=0) iSide=18537 (min=-1)
+  Node.iVertPool max: 120587
+  OVERFLOW: Node.iCollisionBound max=32854 min=-1 (SWORD limit +-32767)
+  OVERFLOW: Node.iVertPool max=120587 min=0 (SWORD limit +-32767)
+  NOTE: Node.iVertPool max=120587, stays INT (no extra saving)
+
+
+Global worst-case: Node.iVertPool=342681 Surf.pBase=26449 vNormal=5641 vTexU=5642 vTexV=5643 iLM=8719 iBP=769
+Global worst-case: Vert.pVertex=0..47890 Vert.iSide=-1..49544
+
+Total current:  147104 KB (143.7 MB)
+Total proposed: 131588 KB (128.5 MB)
+Total savings:  15515 KB (15.2 MB, 10.5%)

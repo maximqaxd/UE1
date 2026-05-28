@@ -366,7 +366,6 @@ FMovingBrushTracker::FMovingBrushTracker( ULevel* ThisLevel )
 	guard(FMovingBrushTracker::FMovingBrushTracker);
 
 	Level				= ThisLevel;
-#if defined (PLATFORM_DREAMCAST)
 	// Note that all actors are unassimilated and count all movers.
 	INT i;
 	INT NumMovers = 0;
@@ -392,10 +391,10 @@ FMovingBrushTracker::FMovingBrushTracker( ULevel* ThisLevel )
 			}
 		}
 	}
-#endif
 	debugf( NAME_Init, "%s has %d moving brushes with %d polys", Level->GetFullName(), NumMovers, NumMoverPolys );
 
 #if defined (PLATFORM_DREAMCAST)
+	{
 	INT EstNodes = NumMoverPolys * 6;      // Estimate 6 nodes per poly (conservative)
 	INT EstSurfs = NumMoverPolys;          // 1 surface per polygon
 	INT EstPoints = TotalMoverVertices * 2; // Estimate 2x vertices (accounting for splits)
@@ -409,6 +408,7 @@ FMovingBrushTracker::FMovingBrushTracker( ULevel* ThisLevel )
 	iTopPoint			= ExpandDb(Level->Model->Points, 16384, Level->Model->Points->GetNum() + EstPoints);
 	iTopVector			= ExpandDb(Level->Model->Vectors, 16384, Level->Model->Vectors->GetNum() + EstVectors);
 	iTopVertPool		= ExpandDb(Level->Model->Verts, 256, Level->Model->Verts->GetNum() + EstVerts);
+	}
 #else
 	iTopNode			= ExpandDb(Level->Model->Nodes);
 	iTopSurf			= ExpandDb(Level->Model->Surfs);

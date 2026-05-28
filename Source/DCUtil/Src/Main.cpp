@@ -585,9 +585,14 @@ void FDCUtil::Main( )
 		}
 		CommitChanges();
 	}
+	else if( Parse( Cmd, "ANALYZE=", Temp, sizeof( Temp ) - 1 ) )
+	{
+		AnalyzeMapLimits( Temp );
+	}
 	else
 	{
-		printf( "Usage: dctool CVTUTX=<TEXPKG> | CVTUAX=<SOUNDPKG> | CVTUMX=<MUSPKG> | CVTUMH=<UMESHPKG> | CVTUNR=<MAPPKG>\n" );
+		printf( "Usage: dctool CVTUTX=<TEXPKG> | CVTUAX=<SOUNDPKG> | CVTUMX=<MUSPKG> | CVTUMH=<UMESHPKG> | CVTUNR=<MAPPKG> | ANALYZE=<MAPGLOB>\n" );
+		printf( "  ANALYZE=../Maps/*.unr  — Analyze all maps for SWORD compression feasibility\n" );
 	}
 
 	GIsRunning = 0;
