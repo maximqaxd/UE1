@@ -154,6 +154,11 @@ case "${1:-}" in
     run_dcutil "ANALYZE=../Maps/*.unr"
     exit 0
     ;;
+  texreport)
+    build_dcutil
+    run_dcutil "TEXREPORT=../Textures/*.utx"
+    exit 0
+    ;;
   dcutil)
     build_dcutil
     exit 0
@@ -180,6 +185,7 @@ case "${1:-}" in
     echo "              music, meshes, maps), then stage into gamedata/"
     echo "  stage       Copy processed Unreal/ data dirs into gamedata/ (no processing)"
     echo "  analyze     Build DCUtil, then analyze all maps for SWORD limits"
+    echo "  texreport   Build DCUtil, then report textures below the PVR 8x8 minimum"
     echo "  dcutil      Build DCUtil only"
     echo "  dcutil-run  Build & run DCUtil with custom args, e.g.:"
     echo "              ./build.sh dcutil-run 'CVTUNR=../Maps/Dark.unr'"

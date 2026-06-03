@@ -1083,3 +1083,139 @@ void FDCUtil::AnalyzeMapLimits( const char* MapGlob )
 	unguard;
 }
 
+/*-----------------------------------------------------------------------------
+	ReportTextures: report-only scan of texture dimensions (no modification).
+
+	Finds textures below the PVR 8x8 minimum (which currently hit the runtime
+	I8 expand+upscale path) and splits them into static vs parametric/realtime,
+	since static ones can be padded offline but parametric/realtime ones must be
+	bumped to 8x8 at load (they are regenerated each frame).
+-----------------------------------------------------------------------------*/
+
+void FDCUtil::ReportTextures( const char* Glob )
+{
+	guard(ReportTextures);
+
+	printf( "=======================================================================\n" );
+	printf( " Texture min-size report (read-only)\n" );
+	printf( " PVR minimum texture size is 8x8; anything smaller hits runtime padding.\n" );
+	printf( "=======================================================================\n\n" );
+
+	TArray<FString> Files = appFindFiles( Glob );
+	if( Files.Num() == 0 )
+	{
+		printf( "No files found matching '%s'\n", Glob );
+		return;
+	}
+
+	// Directory portion of the glob.
+	char Dir[2048];
+	appStrcpy( Dir, Glob );
+	char* Slash = strrchr( Dir, '/' );
+	if( !Slash ) Slash = strrchr( Dir, '\\' );
+	if( Slash ) *(Slash + 1) = 0;
+	else Dir[0] = 0;
+
+	// Histogram buckets for min(USize,VSize): 1,2,4,8,16,32,64,128,>=256
+	INT Hist[9] = {0};
+	auto BucketOf = []( INT D ) -> INT
+	{
+		if( D <= 1 ) return 0;
+		if( D <= 2 ) return 1;
+		if( D <= 4 ) return 2;
+		if( D <= 8 ) return 3;
+		if( D <= 16 ) return 4;
+		if( D <= 32 ) return 5;
+		if( D <= 64 ) return 6;
+		if( D <= 128 ) return 7;
+		return 8;
+	};
+
+	INT TotalTex = 0;
+	INT Sub8Static = 0;
+	INT Sub8Dynamic = 0;   // parametric/realtime/realtimepalette
+	// Category totals (any size) to confirm flag detection works.
+	INT TotParam = 0, TotRealtime = 0, TotRTPal = 0;
+	// Distinct palettes (HW PVR palette feasibility: only 1024 entries = 4x256).
+	TArray<UPalette*> AllPals;        // every distinct palette
+	TArray<UPalette*> DynPals;        // palettes used by realtime/parametric textures
+
+	// Record packages already resident (Core/Engine/Editor/etc.) so we never
+	// ResetLoaders on them — doing so unloads the engine's own packages and crashes.
+	TArray<UPackage*> PreLoaded;
+	for( TObjectIterator<UPackage> It; It; ++It )
+		PreLoaded.AddItem( *It );
+
+	for( INT i = 0; i < Files.Num(); i++ )
+	{
+		char FullPath[2048];
+		snprintf( FullPath, sizeof(FullPath), "%s%s", Dir, *Files(i) );
+
+		UPackage* Pkg = Cast<UPackage>( GObj.LoadPackage( nullptr, FullPath, LOAD_KeepImports ) );
+		if( !Pkg )
+		{
+			printf( "FAILED to load: %s\n", *Files(i) );
+			continue;
+		}
+
+		for( TObjectIterator<UTexture> It; It; ++It )
+		{
+			if( !It->IsIn( Pkg ) )
+				continue;
+
+			UTexture* T = *It;
+			const INT U = T->USize, V = T->VSize;
+			const INT MinDim = Min( U, V );
+			const UBOOL bDynamic = ( T->TextureFlags & (TF_Realtime|TF_RealtimePalette|TF_Parametric) ) != 0;
+
+			TotalTex++;
+			Hist[ BucketOf( MinDim ) ]++;
+			if( T->TextureFlags & TF_Parametric )      TotParam++;
+			if( T->TextureFlags & TF_Realtime )        TotRealtime++;
+			if( T->TextureFlags & TF_RealtimePalette ) TotRTPal++;
+
+			if( T->Palette )
+			{
+				AllPals.AddUniqueItem( T->Palette );
+				if( bDynamic )
+					DynPals.AddUniqueItem( T->Palette );
+			}
+
+			if( MinDim < 8 )
+			{
+				if( bDynamic ) Sub8Dynamic++; else Sub8Static++;
+				const char* Kind =
+					( T->TextureFlags & TF_Parametric )      ? "PARAM" :
+					( T->TextureFlags & TF_RealtimePalette ) ? "RTPAL" :
+					( T->TextureFlags & TF_Realtime )        ? "RT"    : "static";
+				printf( "  SUB-8: %-28s %3dx%-3d fmt=%d %s\n",
+					T->GetPathName(), U, V, T->Format, Kind );
+			}
+		}
+
+		// Only unload packages we loaded fresh; never the engine's resident ones.
+		UBOOL WasPreloaded = false;
+		for( INT k = 0; k < PreLoaded.Num(); k++ )
+			if( PreLoaded(k) == Pkg ) { WasPreloaded = true; break; }
+		if( !WasPreloaded )
+			GObj.ResetLoaders( Pkg );
+	}
+
+	printf( "\n" );
+	printf( "min(USize,VSize) histogram:\n" );
+	printf( "  ==1:%d  ==2:%d  <=4:%d  ==8:%d  <=16:%d  <=32:%d  <=64:%d  <=128:%d  >=256:%d\n",
+		Hist[0], Hist[1], Hist[2], Hist[3], Hist[4], Hist[5], Hist[6], Hist[7], Hist[8] );
+	printf( "\n" );
+	printf( "Total textures:            %d\n", TotalTex );
+	printf( "  of which Parametric=%d, Realtime=%d, RealtimePalette=%d (any size)\n",
+		TotParam, TotRealtime, TotRTPal );
+	printf( "Sub-8x8 static (pad offline in DCUtil):        %d\n", Sub8Static );
+	printf( "Sub-8x8 parametric/realtime (bump at load):    %d\n", Sub8Dynamic );
+	printf( "Distinct palettes: %d total, %d used by realtime/parametric\n",
+		AllPals.Num(), DynPals.Num() );
+	printf( "  (PVR HW palette holds 1024 entries = 4x256-color banks)\n" );
+	printf( "=======================================================================\n" );
+
+	unguard;
+}
+
