@@ -489,7 +489,14 @@ ULevel* UGameEngine::LoadMap( const FURL& URL, UPendingLevel* Pending, char* Err
 				Guid = &Connection->Driver->Map(0).Guid;
 			}
 		}
+#ifndef PLATFORM_DREAMCAST
+		// Pre-verify the new map loads before tearing down the old level. On
+		// Dreamcast we SKIP this: building the new map's linker (name/import/export
+		// tables) while the outgoing level is still fully resident doubles memory and
+		// overflows the 16MB ceiling during map transitions. The real load below
+		// (LOAD_NoFail, after the old level is freed) handles it instead.
 		LoadObject<ULevel>( MapParent, "MyLevel", *URL.Map, LOAD_Verify | LOAD_Throw | LOAD_KeepImports | LOAD_NoWarn, NULL );
+#endif
 	}
 	catch( char* Error )
 	{
