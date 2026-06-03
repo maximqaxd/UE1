@@ -133,6 +133,237 @@ static void CompressLightBitsRLE( TArray<BYTE>& LightBits )
 }
 
 /*-----------------------------------------------------------------------------
+	ReduceLightmapResolution: Halve lightmap resolution to save RAM.
+
+	Each surface's shadow data in LightBits is a bitmask grid of UClamp x VClamp
+	texels, packed 8 bits per byte (row-major, ceil(UClamp/8) bytes per row).
+	For each light affecting the surface, there's one such grid, stored
+	sequentially at DataOffset.
+
+	We downsample each 2x2 block of shadow texels into 1 texel using OR
+	(if any of the 4 source texels is lit, the destination is lit — preserves
+	light visibility, errs on the side of too much light rather than too dark).
+-----------------------------------------------------------------------------*/
+
+static UBOOL GetShadowBit( const BYTE* Bits, INT UClamp, INT U, INT V )
+{
+	// Shadow bits are packed: byte = row V, bit position = U within that byte
+	// Byte index = V * ceil(UClamp/8) + (U >> 3)
+	// Bit index  = U & 7
+	const INT BytesPerRow = (UClamp + 7) >> 3;
+	return ( Bits[ V * BytesPerRow + (U >> 3) ] >> (U & 7) ) & 1;
+}
+
+static void SetShadowBit( BYTE* Bits, INT UClamp, INT U, INT V )
+{
+	const INT BytesPerRow = (UClamp + 7) >> 3;
+	Bits[ V * BytesPerRow + (U >> 3) ] |= (1 << (U & 7));
+}
+
+// 4-byte sentinel prepended to LightBits after reduction so a map can never be
+// reduced twice (which would corrupt the data). The engine reads shadow bits via
+// FLightMapIndex.DataOffset, so these 4 unreferenced prefix bytes are harmless at
+// runtime. All new DataOffsets are >= LIGHTBITS_MAGIC_SIZE.
+static const BYTE  LIGHTBITS_MAGIC[4]   = { 'D', 'C', 'L', 'M' };
+static const INT   LIGHTBITS_MAGIC_SIZE = 4;
+
+static UBOOL IsLightmapAlreadyReduced( UModel* Model )
+{
+	if( !Model || Model->LightBits.Num() < LIGHTBITS_MAGIC_SIZE )
+		return false;
+	for( INT i = 0; i < LIGHTBITS_MAGIC_SIZE; ++i )
+		if( Model->LightBits(i) != LIGHTBITS_MAGIC[i] )
+			return false;
+	return true;
+}
+
+static DWORD ReduceLightmapResolution( UModel* Model, INT ScaleFactor )
+{
+	guard(ReduceLightmapResolution);
+
+	if( !Model || Model->LightMap.Num() == 0 || Model->LightBits.Num() == 0 )
+		return 0;
+
+	// Idempotency guard: never reduce twice.
+	if( IsLightmapAlreadyReduced( Model ) )
+		return 0;
+
+	const INT NumSurfs = Model->LightMap.Num();
+	const INT OldBitsSize = Model->LightBits.Num();
+
+	// Step 1: Determine how many bytes each surface owns in LightBits.
+	// Sort surfaces by DataOffset to find contiguous blocks, then
+	// NumLights = OwnedBytes / MaskSpace.
+
+	// Build sorted index array — only include surfaces that actually have lights
+	struct FSurfSort { INT iSurf; INT DataOffset; };
+	TArray<FSurfSort> Sorted;
+	for( INT i = 0; i < NumSurfs; i++ )
+	{
+		FLightMapIndex& Index = Model->LightMap(i);
+		if( Index.DataOffset != INDEX_NONE && Index.DataOffset >= 0
+			&& Index.UClamp > 0 && Index.VClamp > 0
+			&& Index.iLightActors != INDEX_NONE )
+		{
+			FSurfSort S;
+			S.iSurf = i;
+			S.DataOffset = Index.DataOffset;
+			Sorted.AddItem( S );
+		}
+	}
+
+	if( Sorted.Num() == 0 )
+		return 0;
+
+	// Simple insertion sort by DataOffset (stable, small N)
+	for( INT i = 1; i < Sorted.Num(); i++ )
+	{
+		FSurfSort Key = Sorted(i);
+		INT j = i - 1;
+		while( j >= 0 && Sorted(j).DataOffset > Key.DataOffset )
+		{
+			Sorted(j + 1) = Sorted(j);
+			j--;
+		}
+		Sorted(j + 1) = Key;
+	}
+
+	// Compute owned bytes per surface
+	TArray<INT> OwnedBytes;
+	OwnedBytes.AddZeroed( NumSurfs );
+	for( INT i = 0; i < Sorted.Num(); i++ )
+	{
+		INT NextOffset = (i + 1 < Sorted.Num()) ? Sorted(i + 1).DataOffset : OldBitsSize;
+		OwnedBytes(Sorted(i).iSurf) = NextOffset - Sorted(i).DataOffset;
+	}
+
+	// Step 2: Rebuild LightBits with downsampled data.
+	// Start with the 4-byte sentinel so the rebuilt array is tagged as reduced
+	// and all surface DataOffsets land at >= LIGHTBITS_MAGIC_SIZE.
+	const BYTE* OldBits = &Model->LightBits(0);
+	TArray<BYTE> NewBits;
+	NewBits.Empty();
+	for( INT m = 0; m < LIGHTBITS_MAGIC_SIZE; ++m )
+		NewBits.AddItem( LIGHTBITS_MAGIC[m] );
+
+	DWORD TotalOldBytes = 0;
+	DWORD TotalNewBytes = 0;
+	INT NumReduced = 0;
+
+	for( INT iSurf = 0; iSurf < NumSurfs; iSurf++ )
+	{
+		FLightMapIndex& Index = Model->LightMap(iSurf);
+
+		if( Index.DataOffset == INDEX_NONE || Index.DataOffset < 0 || Index.UClamp <= 0 || Index.VClamp <= 0
+			|| Index.iLightActors == INDEX_NONE )
+			continue;
+
+		const INT OldUClamp = Index.UClamp;
+		const INT OldVClamp = Index.VClamp;
+		const INT OldBytesPerRow = (OldUClamp + 7) >> 3;
+		const INT OldMaskSpace = OldBytesPerRow * OldVClamp;
+
+		// Derive light count from gap between consecutive DataOffsets.
+		// This is correct because the editor appends each surface's data sequentially.
+		const INT SurfOwnedBytes = OwnedBytes(iSurf);
+		INT NumLights = (OldMaskSpace > 0) ? (SurfOwnedBytes / OldMaskSpace) : 0;
+
+		// Cap to a sane maximum (no surface has >64 lights in practice)
+		if( NumLights > 64 ) NumLights = 64;
+		if( NumLights <= 0 ) NumLights = 1;
+
+		// Also clamp to what's actually in the array
+		INT MaxLights = (OldBitsSize - Index.DataOffset) / Max(OldMaskSpace, 1);
+		if( MaxLights > 64 ) MaxLights = 64;
+		if( NumLights > MaxLights ) NumLights = MaxLights;
+		if( NumLights <= 0 )
+		{
+			Index.DataOffset = INDEX_NONE;
+			continue;
+		}
+
+		// Don't reduce surfaces that are already tiny
+		if( OldUClamp <= 2 && OldVClamp <= 2 )
+		{
+			const INT CopySize = OldMaskSpace * NumLights;
+			const INT NewOffset = NewBits.Num();
+			for( INT b = 0; b < CopySize; b++ )
+				NewBits.AddItem( OldBits[Index.DataOffset + b] );
+			TotalOldBytes += CopySize;
+			TotalNewBytes += CopySize;
+			Index.DataOffset = NewOffset;
+			continue;
+		}
+
+		// Calculate new resolution
+		INT NewUClamp = Max( 2, (OldUClamp + ScaleFactor - 1) / ScaleFactor );
+		INT NewVClamp = Max( 2, (OldVClamp + ScaleFactor - 1) / ScaleFactor );
+		const INT NewBytesPerRow = (NewUClamp + 7) >> 3;
+		const INT NewMaskSpace = NewBytesPerRow * NewVClamp;
+
+		const INT NewOffset = NewBits.Num();
+
+		// Downsample each light's shadow mask
+		for( INT iLight = 0; iLight < NumLights; iLight++ )
+		{
+			const BYTE* SrcLight = OldBits + Index.DataOffset + (OldMaskSpace * iLight);
+
+			// Allocate zeroed destination
+			const INT DstStart = NewBits.Num();
+			NewBits.AddZeroed( NewMaskSpace );
+			BYTE* DstLight = &NewBits(DstStart);
+
+			// Downsample: for each new texel, OR the ScaleFactor x ScaleFactor source texels
+			for( INT NewV = 0; NewV < NewVClamp; NewV++ )
+			{
+				for( INT NewU = 0; NewU < NewUClamp; NewU++ )
+				{
+					UBOOL Lit = 0;
+					for( INT dv = 0; dv < ScaleFactor && !Lit; dv++ )
+					{
+						const INT SrcV = NewV * ScaleFactor + dv;
+						if( SrcV >= OldVClamp ) break;
+						for( INT du = 0; du < ScaleFactor && !Lit; du++ )
+						{
+							const INT SrcU = NewU * ScaleFactor + du;
+							if( SrcU >= OldUClamp ) break;
+							Lit = GetShadowBit( SrcLight, OldUClamp, SrcU, SrcV );
+						}
+					}
+					if( Lit )
+						SetShadowBit( DstLight, NewUClamp, NewU, NewV );
+				}
+			}
+		}
+
+		TotalOldBytes += OldMaskSpace * NumLights;
+		TotalNewBytes += NewMaskSpace * NumLights;
+
+		// Update the index
+		Index.DataOffset = NewOffset;
+		Index.UScale *= ScaleFactor;
+		Index.VScale *= ScaleFactor;
+		Index.UClamp = NewUClamp;
+		Index.VClamp = NewVClamp;
+		Index.UBits = 0; { INT v = NewUClamp; while( v > 1 ) { v >>= 1; Index.UBits++; } }
+		Index.VBits = 0; { INT v = NewVClamp; while( v > 1 ) { v >>= 1; Index.VBits++; } }
+
+		NumReduced++;
+	}
+
+	// Replace LightBits (always tagged with the magic prefix now).
+	const INT OldTotal = Model->LightBits.Num();
+	const INT NewTotal = NewBits.Num();
+	Model->LightBits = NewBits;
+
+	// Report net savings for accounting; clamp at 0 (tiny models may not shrink
+	// once the 4-byte sentinel is added, but they're still correctly tagged).
+	return (NewTotal < OldTotal) ? (DWORD)(OldTotal - NewTotal) : 0;
+
+	unguard;
+}
+
+/*-----------------------------------------------------------------------------
 	ConvertMapPkg: Process .unr map packages to compress LightBits
 -----------------------------------------------------------------------------*/
 
@@ -167,6 +398,15 @@ void FDCUtil::ConvertMapPkg( const FString& PkgPath, UPackage* Pkg )
 		// Ensure Model is marked as public so it gets saved
 		if( !(Level->Model->GetFlags() & RF_Public) )
 			Level->Model->SetFlags( RF_Public );
+
+		// Idempotency guard: if the level model's LightBits already carries the
+		// reduction sentinel, this map was already processed — skip it entirely
+		// so we never double-reduce (which would corrupt the data).
+		if( IsLightmapAlreadyReduced( Level->Model ) )
+		{
+			printf( "  Already processed (LightBits tagged) — skipping '%s'\n", Pkg->GetName() );
+			return;
+		}
 	}
 	
 	// Force load all objects in the package to ensure we process everything
@@ -175,99 +415,36 @@ void FDCUtil::ConvertMapPkg( const FString& PkgPath, UPackage* Pkg )
 	// iterate through all models to make sure we catch everything
 	
 	UBOOL Changed = false;
-	DWORD TotalOriginalSize = 0;
-	DWORD TotalCompressedSize = 0;
-	
-	// Process the main level model first
-	if( Level->Model && Level->Model->IsIn( Pkg ) )
-	{
-		UModel* Model = Level->Model;
-		
-		if( Model->LightBits.Num() > 0 )
-		{
-			const DWORD OriginalSize = Model->LightBits.Num();
-			TotalOriginalSize += OriginalSize;
-			
-		TArray<BYTE> OriginalLightBits = Model->LightBits;
-		CompressLightBitsRLE( Model->LightBits );
-		const DWORD CompressedSize = Model->LightBits.Num();
-		TotalCompressedSize += CompressedSize;
-		
-		if( CompressedSize < OriginalSize )
-		{
-			Changed = true;
-			// Mark model as modified so it gets saved
-			Model->Modify();
-			printf( "  - Compressed LightBits in '%s': %u -> %u bytes (%.1f%% reduction)\n", 
-				Model->GetName(), OriginalSize, CompressedSize, 
-				100.0f * (1.0f - (FLOAT)CompressedSize / (FLOAT)OriginalSize) );
-		}
-		else
-		{
-			Model->LightBits = OriginalLightBits;
-			printf( "  - LightBits in '%s': %u bytes (compression not beneficial)\n", 
-				Model->GetName(), OriginalSize );
-		}
-		}
-	}
-	
-	// Iterate through all other UModel objects in the package (brush models, etc.)
+	DWORD TotalSaved = 0;
+
+	// Reduce lightmap resolution (quarter each dimension = up to 16x fewer texels).
+	// NOTE: No RLE compression — the engine has no LightBits RLE decoder
+	// (UModel::Serialize does a plain Ar << LightBits), and RLE would not reduce
+	// runtime RAM anyway (it decompresses to full size on load). Only the
+	// resolution downsample reduces RAM, and the data stays raw/loadable.
 	for( TObjectIterator<UModel> It; It; ++It )
 	{
 		UModel* Model = *It;
-		
-		if( !Model->IsIn( Pkg ) )
+		if( !Model->IsIn( Pkg ) || Model->LightBits.Num() == 0 || Model->LightMap.Num() == 0 )
 			continue;
-		
-		// Skip the level model, we already processed it
-		if( Model == Level->Model )
-			continue;
-		
-		// Check if this model has LightBits to compress
-		if( Model->LightBits.Num() == 0 )
-			continue;
-		
-		const DWORD OriginalSize = Model->LightBits.Num();
-		TotalOriginalSize += OriginalSize;
-		
-		// Make a copy of original for compression
-		TArray<BYTE> OriginalLightBits = Model->LightBits;
-		
-		// Compress the LightBits
-		CompressLightBitsRLE( Model->LightBits );
-		
-		const DWORD CompressedSize = Model->LightBits.Num();
-		TotalCompressedSize += CompressedSize;
-		
-		if( CompressedSize < OriginalSize )
+
+		const DWORD Before = Model->LightBits.Num();
+		DWORD Saved = ReduceLightmapResolution( Model, 4 ); // 4x = quarter each dimension
+		if( Saved > 0 )
 		{
 			Changed = true;
+			TotalSaved += Saved;
 			Model->Modify();
-			printf( "  - Compressed LightBits in '%s': %u -> %u bytes (%.1f%% reduction)\n", 
-				Model->GetName(), OriginalSize, CompressedSize, 
-				100.0f * (1.0f - (FLOAT)CompressedSize / (FLOAT)OriginalSize) );
-		}
-		else
-		{
-			// Compression didn't help, restore original
-			Model->LightBits = OriginalLightBits;
-			printf( "  - LightBits in '%s': %u bytes (compression not beneficial)\n", 
-				Model->GetName(), OriginalSize );
+			printf( "  %s: LightBits %u -> %u bytes\n", Model->GetName(), Before, Model->LightBits.Num() );
 		}
 	}
-	
+
 	if( Changed )
 	{
-		printf( "Total LightBits compression: %u -> %u bytes (%.1f%% reduction)\n",
-			TotalOriginalSize, TotalCompressedSize,
-			100.0f * (1.0f - (FLOAT)TotalCompressedSize / (FLOAT)TotalOriginalSize) );
+		printf( "  Total LightBits saved: %u bytes (%.1f KB)\n", TotalSaved, TotalSaved / 1024.0f );
 		ChangedPackages.Add( PkgPath, Pkg );
 	}
-		else if( TotalOriginalSize > 0 )
-	{
-		printf( "No beneficial compression found for LightBits in '%s'\n", Pkg->GetName() );
-	}
-	
+
 	unguard;
 }
 
