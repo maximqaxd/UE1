@@ -116,7 +116,7 @@ bool AudioEngine_Initialise(void);
 int AudioEngine_Load(const char * fname, uint32_t seek_bytes_aligned);
 int AudioEngine_LoadFromMemory(const uint8_t * wav_data, uint32_t wav_size, const char * name);
 int AudioEngine_LoadFromWaveInfo(const uint8_t * sample_data, uint32_t sample_size, int sample_rate, int channels, int bits_per_sample, const char * name, const uint8_t * full_wav_data = nullptr, uint32_t full_wav_size = 0);
-void AudioEngine_Play(int nStream, uint8 volume, uint8 panl, uint8 panr, bool loop, uint32 loop_offset);
+void AudioEngine_Play(int nStream, uint8_t volume, uint8_t panl, uint8_t panr, bool loop, uint32_t loop_offset);
 int AudioEngine_Stop(int nStream);
 int AudioEngine_Unload(int nStream);
 struct sfx_info * AudioEngine_getSfxInfo(int nStream);
