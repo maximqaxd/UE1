@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${KOS_BASE:?Please source your KOS environ.sh to set KOS_BASE}"
+# KOS_BASE is only required for the Dreamcast target build, not for the host-only
+# DCUtil subcommands (dcutil/repack/stage/analyze/dcutil-run). Checked lazily below.
+require_kos() {
+  : "${KOS_BASE:?Please source your KOS environ.sh to set KOS_BASE}"
+}
 
 SRC_DIR="./Source"
 BUILD_DIR="./build_dc"
@@ -57,13 +61,9 @@ build_dcutil() {
 
 run_dcutil() {
   local ARGS="$1"
-  local DCUTIL="$DEST_SYSTEM_DIR/DCUtil.bin"
-  if [[ ! -f "$DCUTIL" ]]; then
-    echo "DCUtil not found at $DCUTIL — building first..."
-    build_dcutil
-  fi
+  build_dcutil
   # Copy DCUtil + .so libs into Unreal/System so ini Paths[] and .u packages resolve naturally
-  cp "$DCUTIL" "$UNREAL_DIR/System/"
+  cp "$DEST_SYSTEM_DIR/DCUtil.bin" "$UNREAL_DIR/System/"
   for so_file in "$DEST_SYSTEM_DIR"/*.so; do
     cp "$so_file" "$UNREAL_DIR/System/"
   done
@@ -71,6 +71,79 @@ run_dcutil() {
   pushd "$UNREAL_DIR/System" > /dev/null
   LD_LIBRARY_PATH=. ./DCUtil.bin "$ARGS"
   popd > /dev/null
+}
+
+# Run a DCUtil command without rebuilding (assumes binary already deployed).
+run_dcutil_nobuild() {
+  local ARGS="$1"
+  echo "=== Running DCUtil: $ARGS ==="
+  pushd "$UNREAL_DIR/System" > /dev/null
+  LD_LIBRARY_PATH=. ./DCUtil.bin "$ARGS"
+  popd > /dev/null
+}
+
+# ── Repack: process all game data and stage it into gamedata/ ─────────────────
+#
+# Conversions overwrite packages IN PLACE and are NOT idempotent, so we keep a
+# pristine copy in Unreal_orig/ and restore from it before every repack.
+
+UNREAL_BACKUP_DIR="./Unreal_orig"
+REPACK_DATA_DIRS=( Maps Textures Sounds Music System )
+
+repack_data() {
+  # 1. First run: snapshot pristine data. Later runs: restore the data dirs.
+  if [[ ! -d "$UNREAL_BACKUP_DIR" ]]; then
+    echo "=== First repack: snapshotting $UNREAL_DIR -> $UNREAL_BACKUP_DIR ==="
+    cp -r "$UNREAL_DIR" "$UNREAL_BACKUP_DIR"
+  else
+    echo "=== Restoring pristine data from $UNREAL_BACKUP_DIR ==="
+    for d in "${REPACK_DATA_DIRS[@]}"; do
+      if [[ -d "$UNREAL_BACKUP_DIR/$d" ]]; then
+        rm -rf "${UNREAL_DIR:?}/$d"
+        cp -r "$UNREAL_BACKUP_DIR/$d" "$UNREAL_DIR/"
+      fi
+    done
+  fi
+
+  # 2. Build + deploy DCUtil next to the data.
+  build_dcutil
+  cp "$DEST_SYSTEM_DIR/DCUtil.bin" "$UNREAL_DIR/System/"
+  for so_file in "$DEST_SYSTEM_DIR"/*.so; do
+    cp "$so_file" "$UNREAL_DIR/System/"
+  done
+
+  # 3. Process each asset type (textures/sounds/music/meshes first, maps last).
+  run_dcutil_nobuild "CVTUTX=../Textures/*.utx"
+  run_dcutil_nobuild "CVTUAX=../Sounds/*.uax"
+  run_dcutil_nobuild "CVTUMX=../Music/*.umx"
+  run_dcutil_nobuild "CVTUMH=../System/*.u"
+  run_dcutil_nobuild "CVTUNR=../Maps/*.unr"
+
+  # 4. Stage processed data into gamedata/ (the disc image source).
+  stage_gamedata
+}
+
+# Copy processed Unreal data dirs into gamedata/, preserving gamedata/System
+# binaries (.so/.bin/.ini) that the build produces.
+stage_gamedata() {
+  echo "=== Staging processed data into $GAMEDATA_DIR ==="
+  mkdir -p "$GAMEDATA_DIR"
+  for d in "${REPACK_DATA_DIRS[@]}"; do
+    if [[ "$d" == "System" ]]; then
+      # System holds the game's .u packages + config; copy *.u and configs but
+      # do NOT clobber the Dreamcast binaries placed here by the main build.
+      mkdir -p "$GAMEDATA_DIR/System"
+      shopt -s nullglob
+      for f in "$UNREAL_DIR/System"/*.u "$UNREAL_DIR/System"/*.int "$UNREAL_DIR/System"/*.ini; do
+        cp "$f" "$GAMEDATA_DIR/System/"
+      done
+      shopt -u nullglob
+    else
+      rm -rf "${GAMEDATA_DIR:?}/$d"
+      cp -r "$UNREAL_DIR/$d" "$GAMEDATA_DIR/"
+    fi
+  done
+  echo "=== gamedata/ staged. ==="
 }
 
 # ── Command dispatch ──────────────────────────────────────────────────────────
@@ -90,20 +163,32 @@ case "${1:-}" in
     run_dcutil "$*"
     exit 0
     ;;
+  repack)
+    repack_data
+    exit 0
+    ;;
+  stage)
+    stage_gamedata
+    exit 0
+    ;;
   help)
     echo "Usage: ./build.sh [command]"
     echo ""
     echo "Commands:"
     echo "  (no args)   Build DCUtil + Dreamcast target + CDI/ISO"
+    echo "  repack      Restore pristine data, process ALL assets (textures, sounds,"
+    echo "              music, meshes, maps), then stage into gamedata/"
+    echo "  stage       Copy processed Unreal/ data dirs into gamedata/ (no processing)"
     echo "  analyze     Build DCUtil, then analyze all maps for SWORD limits"
     echo "  dcutil      Build DCUtil only"
     echo "  dcutil-run  Build & run DCUtil with custom args, e.g.:"
-    echo "              ./build.sh dcutil-run 'CVTUTX=../../Unreal/Textures/*.utx'"
+    echo "              ./build.sh dcutil-run 'CVTUNR=../Maps/Dark.unr'"
     echo "  help        Show this help"
     exit 0
     ;;
 esac
 
+require_kos
 build_dcutil
 
 # ── Build Dreamcast target ────────────────────────────────────────────────────
@@ -115,6 +200,12 @@ cmake -S "$SRC_DIR" -B "$BUILD_DIR" \
 
 cmake --build "$BUILD_DIR" -j"$(nproc)"
 cmake --install "$BUILD_DIR"
+
+# Mirror the current Unreal/ game data into gamedata/ so the disc always
+# contains the up-to-date Maps/Textures/Sounds/Music/.u packages.
+# (stage_gamedata preserves the Dreamcast binaries already in gamedata/System.)
+stage_gamedata
+
 cmake --build "$BUILD_DIR" --target cdi
 
 # Create ISO target
