@@ -10,12 +10,18 @@ extern DLL_IMPORT const char* GStartupDbgDev;
 // Global PVR DR state 
 static pvr_dr_state_t GPVRDRState;
 
-static int GPVRSrcBlend = PVR_BLEND_ONE;
-static int GPVRDstBlend = PVR_BLEND_ZERO;
-static int GPVRZFunction = PVR_DEPTHCMP_GEQUAL;
-static int GPVRZWrite = PVR_DEPTHWRITE_ENABLE;
-static int GPVRBlendEnabled = 0;
-static int GPVRCullMode = PVR_CULLING_NONE;
+// Newer KOS made several poly-context fields strongly-typed enums/bools.
+// CRITICAL: depth.write is the RAW hardware "Z-write disable" bit despite its
+// "Enable depth writes" doc comment. pvr_prim.c does
+//   FIELD_PREP(PVR_TA_PM1_DEPTHWRITE, depth.write)
+// and defaults it to PVR_DEPTHWRITE_ENABLE(0). So 0 = writes ENABLED, 1 = writes
+// DISABLED. Always assign PVR_DEPTHWRITE_ENABLE/DISABLE — NOT true/false.
+static pvr_blend_mode_t    GPVRSrcBlend  = PVR_BLEND_ONE;
+static pvr_blend_mode_t    GPVRDstBlend  = PVR_BLEND_ZERO;
+static pvr_depthcmp_mode_t GPVRZFunction = PVR_DEPTHCMP_GEQUAL;
+static int                 GPVRZWrite    = PVR_DEPTHWRITE_ENABLE;  // 0 = writes enabled
+static int                 GPVRBlendEnabled = 0;
+static pvr_cull_mode_t     GPVRCullMode  = PVR_CULLING_NONE;
 
 struct FPVRRenderCallback
 {
@@ -475,6 +481,20 @@ void UPVRRenderDevice::Unlock( UBOOL Blit )
 		pvr_list_finish();
 	}
 
+	// Measure TA vertex-buffer usage BEFORE scene_finish (which resets POS).
+	// If the buffer fills, the TA silently drops subsequent polys -> geometry
+	// vanishes depending on view angle. Track peak usage / detect overflow.
+	static DWORD MaxVertUsed = 0;
+	{
+		const size_t End  = PVR_GET(PVR_TA_VERTBUF_END);
+		const size_t Pos  = PVR_GET(PVR_TA_VERTBUF_POS);
+		const DWORD  Free = (End > Pos) ? (DWORD)(End - Pos) : 0;
+		const DWORD  Used = (DWORD)params.vertex_buf_size - Free;
+		if( Used > MaxVertUsed ) MaxVertUsed = Used;
+		if( Free == 0 )
+			debugf( "PVR: TA VERTEX BUFFER FULL (Pos=%u End=%u) - geometry being dropped!", (unsigned)Pos, (unsigned)End );
+	}
+
 	pvr_scene_finish();
 
 	++Frame;
@@ -484,7 +504,9 @@ void UPVRRenderDevice::Unlock( UBOOL Blit )
 	}
 	if( ( Frame & 0xff ) == 0 )
 	{
-		debugf( "Frame %d", Frame );
+		debugf( "Frame %d: OP=%d PT=%d TR=%d, peak TA vert used=%u / %u",
+			Frame, GPVROPCallbacks.Num(), GPVRPTCallbacks.Num(), GPVRTRCallbacks.Num(),
+			(unsigned)MaxVertUsed, (unsigned)params.vertex_buf_size );
 		PrintMemStats();
 		DumpMemStatsDC( "after several scenes" );
 	}
@@ -1088,10 +1110,13 @@ void UPVRRenderDevice::SetBlend( DWORD PolyFlags, UBOOL InverseOrder )
 		GPVRDstBlend = PVR_BLEND_ZERO;
 	}
 
+	// depth.write is the raw "Z-write disable" bit: ENABLE(0) writes Z, DISABLE(1) doesn't.
+	// Opaque world (PF_Occlude) must write Z so the z-buffer works; sky and translucent
+	// surfaces must NOT write Z.
 	if( PolyFlags & PF_Occlude )
-		GPVRZWrite = PVR_DEPTHWRITE_ENABLE;
+		GPVRZWrite = PVR_DEPTHWRITE_ENABLE;   // 0 -> writes enabled
 	else
-		GPVRZWrite = PVR_DEPTHWRITE_DISABLE;
+		GPVRZWrite = PVR_DEPTHWRITE_DISABLE;  // 1 -> writes disabled
 
 	// Record current flags
 	CurrentPolyFlags = PolyFlags;

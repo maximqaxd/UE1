@@ -1,6 +1,5 @@
 #include "AICADrvPrivate.h"
 #include "UnRender.h"
-#include <kos.h>
 #include <string.h>
 // Redefine debugf after AudioEngine.h undef'd it
 #ifndef debugf
