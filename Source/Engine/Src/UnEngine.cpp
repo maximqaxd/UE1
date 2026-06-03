@@ -197,6 +197,7 @@ void DumpMemStatsDC( const char* Tag )
 			break;
 		}
 	}
+	DWORD SizeLightBits=0, SizeLightMap=0, SizeBounds=0, SizeLeafHulls=0, SizeLeaves=0;
 	if( Level && Level->Model )
 	{
 		if( Level->Model->Vectors ) SizeVectors = (DWORD)( Level->Model->Vectors->Num() * Level->Model->Vectors->GetClass()->ClassRecordSize );
@@ -204,13 +205,21 @@ void DumpMemStatsDC( const char* Tag )
 		if( Level->Model->Nodes   ) SizeNodes   = (DWORD)( Level->Model->Nodes  ->Num() * Level->Model->Nodes  ->GetClass()->ClassRecordSize );
 		if( Level->Model->Surfs   ) SizeSurfs   = (DWORD)( Level->Model->Surfs  ->Num() * Level->Model->Surfs  ->GetClass()->ClassRecordSize );
 		if( Level->Model->Verts   ) SizeVerts   = (DWORD)( Level->Model->Verts  ->Num() * Level->Model->Verts  ->GetClass()->ClassRecordSize );
+		SizeLightBits = (DWORD)Level->Model->LightBits.Num();
+		SizeLightMap  = (DWORD)( Level->Model->LightMap.Num() * sizeof(FLightMapIndex) );
+		SizeBounds    = (DWORD)( Level->Model->Bounds.Num() * sizeof(FBox) );
+		SizeLeafHulls = (DWORD)( Level->Model->LeafHulls.Num() * sizeof(INT) );
+		SizeLeaves    = (DWORD)( Level->Model->Leaves.Num() * sizeof(FLeaf) );
 	}
 
-	// Texture counts and CPU-resident bytes
+	// Texture counts and CPU-resident bytes; total object count.
 	INT TexCount = 0;
 	DWORD TexCPUBytes = 0;
+	INT ObjCount = 0;
+	INT ActorCount = 0;
 	for( FObjectIterator It; It; ++It )
 	{
+		++ObjCount;
 		if( It->IsA( UTexture::StaticClass ) )
 		{
 			UTexture* T = (UTexture*)(UObject*)*It;
@@ -218,10 +227,30 @@ void DumpMemStatsDC( const char* Tag )
 				TexCPUBytes += (DWORD)T->Mips(i).DataArray.Num();
 			++TexCount;
 		}
+		else if( It->IsA( AActor::StaticClass ) )
+		{
+			++ActorCount;
+		}
 	}
 
-	// VRAM used 
+	// VRAM used
 	DWORD TexVRAMBytes = PVR_GetVRAMUsed();
+
+	// Script bytecode + class default-property bytes (the UnrealScript footprint).
+	DWORD ScriptBytes = 0, DefaultsBytes = 0;
+	INT   StructCount = 0, ClassCount = 0;
+	for( TObjectIterator<UStruct> It; It; ++It )
+	{
+		ScriptBytes += (DWORD)It->Script.Num();
+		++StructCount;
+	}
+	for( TObjectIterator<UClass> It; It; ++It )
+	{
+		DefaultsBytes += (DWORD)It->Defaults.Num();
+		++ClassCount;
+	}
+	// Name table: count + rough byte estimate (entry struct + string).
+	const INT NameCount = FName::GetMaxNames();
 
 	// Audio on/off: check if any audio subsystem exists
 	UBOOL bAudio = 0;
@@ -243,10 +272,14 @@ void DumpMemStatsDC( const char* Tag )
 
 	debugf( NAME_Log, "MemStats [%s]: Model Vectors=%u, Points=%u, Nodes=%u, Surfs=%u, Verts=%u",
 		Tag ? Tag : "", (unsigned)SizeVectors, (unsigned)SizePoints, (unsigned)SizeNodes, (unsigned)SizeSurfs, (unsigned)SizeVerts );
+	debugf( NAME_Log, "MemStats [%s]: LightBits=%u, LightMap=%u, Bounds=%u, LeafHulls=%u, Leaves=%u",
+		Tag ? Tag : "", (unsigned)SizeLightBits, (unsigned)SizeLightMap, (unsigned)SizeBounds, (unsigned)SizeLeafHulls, (unsigned)SizeLeaves );
 	debugf( NAME_Log, "MemStats [%s]: Textures count=%d, CPU bytes=%u, VRAM est=%u",
 		Tag ? Tag : "", TexCount, (unsigned)TexCPUBytes, (unsigned)TexVRAMBytes );
-	debugf( NAME_Log, "MemStats [%s]: Audio=%s, CollisionHash=%s",
-		Tag ? Tag : "", bAudio ? "On" : "Off", bCollision ? "Present" : "None" );
+	debugf( NAME_Log, "MemStats [%s]: Objects=%d, Actors=%d, Audio=%s, CollisionHash=%s",
+		Tag ? Tag : "", ObjCount, ActorCount, bAudio ? "On" : "Off", bCollision ? "Present" : "None" );
+	debugf( NAME_Log, "MemStats [%s]: Script=%u bytes (%d structs), Defaults=%u bytes (%d classes), Names=%d",
+		Tag ? Tag : "", (unsigned)ScriptBytes, StructCount, (unsigned)DefaultsBytes, ClassCount, NameCount );
 	debugf( NAME_Log, "MemStats [%s]: Cache: %s", Tag ? Tag : "", CacheLine );
 
 	unguard;
