@@ -18,7 +18,6 @@ void USound::Serialize( FArchive& Ar )
 	guard(USound::Serialize);
 	Super::Serialize( Ar );
 	Ar << FileType;
-#ifndef PLATFORM_LOW_MEMORY
 	if( Ar.IsLoading() || Ar.IsSaving() )
 	{
 		Ar << Data;
@@ -34,7 +33,7 @@ void USound::Serialize( FArchive& Ar )
 			}
 
 			// Frequencies below this sample rate will NOT be downsampled.
-			DWORD FreqThreshold = 22050;
+			DWORD FreqThreshold = 11050;
 
 			// Reduce sound frequency and/or bit depth if required.
 			if( Force8Bit || ForceHalve )
@@ -75,17 +74,21 @@ void USound::Serialize( FArchive& Ar )
 			// Register it.
 			OriginalSize = Data.Num();
 			if( Audio && !GIsEditor )
+			{
 				Audio->RegisterSound( this );
+#if defined(PLATFORM_DREAMCAST)
+				// On Dreamcast, once the audio backend has uploaded the sample
+				// into AICA RAM we do not need to keep another copy in system RAM.
+				Data.Empty();
+#endif
+			}
 		}
 	}
 	else
-#endif
 	{
 		Ar.CountBytes( OriginalSize );
 	}
-#ifdef PLATFORM_LOW_MEMORY
-	OriginalSize = 0;
-#endif
+
 	unguard;
 }
 void USound::Destroy()
@@ -112,7 +115,6 @@ void USound::PostLoad()
 UAudioSubsystem* USound::Audio;
 IMPLEMENT_CLASS(USound);
 
-#ifndef PLATFORM_LOW_MEMORY
 
 /*-----------------------------------------------------------------------------
 	WaveModInfo implementation - downsampling of wave files.
@@ -124,71 +126,100 @@ UBOOL FWaveModInfo::ReadWaveInfo( TArray<BYTE>& WavData )
 {
 	guard(FWaveModInfo::ReadWaveInfo);
 
-	FFormatChunk* FmtChunk;
-	FRiffWaveHeader* RiffHdr = (FRiffWaveHeader*)&WavData(0);
-	WaveDataEnd = &WavData(0) + WavData.Num();	
-	
+	if( WavData.Num() < (INT)sizeof(FRiffWaveHeader) )
+		return 0;
+
+	BYTE* WaveStart = &WavData(0);
+	WaveDataEnd = WaveStart + WavData.Num();
+
+	FRiffWaveHeader RiffHeader;
+	appMemcpy( &RiffHeader, WaveStart, sizeof(FRiffWaveHeader) );
+
 	// Verify we've got a real 'WAVE' header.
-	if( RiffHdr->wID != ( mmioFOURCC('W','A','V','E') )  )
+	if( RiffHeader.wID != mmioFOURCC('W','A','V','E') )
 		return 0;
 
-	pMasterSize = &RiffHdr->ChunkLen;
+	pMasterSize = (DWORD*)( WaveStart + STRUCT_OFFSET( FRiffWaveHeader, ChunkLen ) );
 
-	FRiffChunk* RiffChunk = (FRiffChunk*)&WavData(3*4);
+	// Helper lambda replacement to safely walk chunks.
+	BYTE* ChunkCursor = WaveStart + sizeof(FRiffWaveHeader);
+	FRiffChunk ChunkHeader;
+
 	// Look for the 'fmt ' chunk.
-	while( ( ((BYTE*)RiffChunk + 8) < WaveDataEnd)  && ( RiffChunk->ChunkID != mmioFOURCC('f','m','t',' ') ) )
+	while( ChunkCursor + sizeof(FRiffChunk) <= WaveDataEnd )
 	{
-		// Go to next chunk.
-		RiffChunk = (FRiffChunk*) ( (BYTE*)RiffChunk + Pad16Bit(RiffChunk->ChunkLen) + 8); 
+		appMemcpy( &ChunkHeader, ChunkCursor, sizeof(FRiffChunk) );
+		if( ChunkHeader.ChunkID == mmioFOURCC('f','m','t',' ') )
+			break;
+
+		ChunkCursor += Pad16Bit( ChunkHeader.ChunkLen ) + sizeof(FRiffChunk);
 	}
-	// Chunk found ?
-	if( RiffChunk->ChunkID != mmioFOURCC('f','m','t',' ') )
+
+	if( ChunkCursor + sizeof(FRiffChunk) > WaveDataEnd || ChunkHeader.ChunkID != mmioFOURCC('f','m','t',' ') )
 		return 0;
 
-	FmtChunk = (FFormatChunk*)((BYTE*)RiffChunk + 8);
-	pBitsPerSample  = &FmtChunk->wBitsPerSample;
-	pSamplesPerSec  = &FmtChunk->nSamplesPerSec;
-	pAvgBytesPerSec = &FmtChunk->nAvgBytesPerSec;
-	pBlockAlign		= &FmtChunk->nBlockAlign;
-	pChannels       = &FmtChunk->nChannels;
+	BYTE* FmtData = ChunkCursor + sizeof(FRiffChunk);
+	if( FmtData + sizeof(FFormatChunk) > WaveDataEnd )
+		return 0;
 
-	// re-initalize the RiffChunk pointer
-	RiffChunk = (FRiffChunk*)&WavData(3*4);
+	FFormatChunk FmtCopy;
+	appMemcpy( &FmtCopy, FmtData, sizeof(FFormatChunk) );
+
+	pBitsPerSample  = (_WORD*)( FmtData + STRUCT_OFFSET( FFormatChunk, wBitsPerSample ) );
+	pSamplesPerSec  = (DWORD*)( FmtData + STRUCT_OFFSET( FFormatChunk, nSamplesPerSec ) );
+	pAvgBytesPerSec = (DWORD*)( FmtData + STRUCT_OFFSET( FFormatChunk, nAvgBytesPerSec ) );
+	pBlockAlign		= (_WORD*)( FmtData + STRUCT_OFFSET( FFormatChunk, nBlockAlign ) );
+	pChannels       = (_WORD*)( FmtData + STRUCT_OFFSET( FFormatChunk, nChannels ) );
+
 	// Look for the 'data' chunk.
-	while( ( ((BYTE*)RiffChunk + 8) < WaveDataEnd) && ( RiffChunk->ChunkID != mmioFOURCC('d','a','t','a') ) )
+	ChunkCursor = WaveStart + sizeof(FRiffWaveHeader);
+	while( ChunkCursor + sizeof(FRiffChunk) <= WaveDataEnd )
 	{
-		// Go to next chunk.
-		RiffChunk = (FRiffChunk*) ( (BYTE*)RiffChunk + Pad16Bit(RiffChunk->ChunkLen) + 8); 
-	} 
-	// Chunk found ?
-	if( RiffChunk->ChunkID != mmioFOURCC('d','a','t','a') )
+		appMemcpy( &ChunkHeader, ChunkCursor, sizeof(FRiffChunk) );
+		if( ChunkHeader.ChunkID == mmioFOURCC('d','a','t','a') )
+			break;
+
+		ChunkCursor += Pad16Bit( ChunkHeader.ChunkLen ) + sizeof(FRiffChunk);
+	}
+
+	if( ChunkCursor + sizeof(FRiffChunk) > WaveDataEnd || ChunkHeader.ChunkID != mmioFOURCC('d','a','t','a') )
 		return 0;
 
-	SampleDataStart = (BYTE*)RiffChunk + 8;
-	pWaveDataSize   = &RiffChunk->ChunkLen;
-	SampleDataSize  =  RiffChunk->ChunkLen;
-	OldBitsPerSample = FmtChunk->wBitsPerSample;
-	SampleDataEnd   =  SampleDataStart+SampleDataSize;
+	SampleDataStart = ChunkCursor + sizeof(FRiffChunk);
+	pWaveDataSize   = (DWORD*)( ChunkCursor + STRUCT_OFFSET( FRiffChunk, ChunkLen ) );
+	SampleDataSize  = ChunkHeader.ChunkLen;
+	OldBitsPerSample = FmtCopy.wBitsPerSample;
+	SampleDataEnd   = SampleDataStart + SampleDataSize;
+
+	if( SampleDataEnd > WaveDataEnd )
+		return 0;
 
 	NewDataSize	= SampleDataSize;
 
-	// Re-initalize the RiffChunk pointer
-	RiffChunk = (FRiffChunk*)&WavData(3*4);
-	// Look for a 'smpl' chunk.
-	while( ( (((BYTE*)RiffChunk) + 8) < WaveDataEnd) && ( RiffChunk->ChunkID != mmioFOURCC('s','m','p','l') ) )
+	// Look for a 'smpl' chunk (optional).
+	ChunkCursor = WaveStart + sizeof(FRiffWaveHeader);
+	while( ChunkCursor + sizeof(FRiffChunk) <= WaveDataEnd )
 	{
-		// Go to next chunk.
-		RiffChunk = (FRiffChunk*) ( (BYTE*)RiffChunk + Pad16Bit(RiffChunk->ChunkLen) + 8); 
-	} 
+		appMemcpy( &ChunkHeader, ChunkCursor, sizeof(FRiffChunk) );
+		if( ChunkHeader.ChunkID == mmioFOURCC('s','m','p','l') )
+			break;
+
+		ChunkCursor += Pad16Bit( ChunkHeader.ChunkLen ) + sizeof(FRiffChunk);
+	}
 
 	// Chunk found ? smpl chunk is optional.
 	// Find the first sample-loop structure, and the total number of them.
-	if( (BYTE*)RiffChunk+4<WaveDataEnd && RiffChunk->ChunkID == mmioFOURCC('s','m','p','l') )
+	if( ChunkCursor + sizeof(FRiffChunk) <= WaveDataEnd && ChunkHeader.ChunkID == mmioFOURCC('s','m','p','l') )
 	{
-		FSampleChunk* pSampleChunk =  (FSampleChunk*)( (BYTE*)RiffChunk + 8);
-		SampleLoopsNum  = pSampleChunk->cSampleLoops; // Number of tSampleLoop structures.
-		// First tSampleLoop structure starts right after the tSampleChunk.
-		pSampleLoop = (FSampleLoop*) ((BYTE*)pSampleChunk + sizeof(FSampleChunk)); 
+		BYTE* SampleChunkData = ChunkCursor + sizeof(FRiffChunk);
+		if( SampleChunkData + sizeof(FSampleChunk) <= WaveDataEnd )
+		{
+			FSampleChunk SampleChunkCopy;
+			appMemcpy( &SampleChunkCopy, SampleChunkData, sizeof(FSampleChunk) );
+			SampleLoopsNum  = SampleChunkCopy.cSampleLoops; // Number of tSampleLoop structures.
+			// First tSampleLoop structure starts right after the tSampleChunk.
+			pSampleLoop = (FSampleLoop*) ( SampleChunkData + sizeof(FSampleChunk) ); 
+		}
 	}
 		
 	return 1;
@@ -216,15 +247,18 @@ UBOOL FWaveModInfo::UpdateWaveData( TArray<BYTE>& WavData )
 		*pAvgBytesPerSec = *pBlockAlign * *pSamplesPerSec; //sample rate * Block align
 
 		// Update 'smpl' chunk data also, if present.
-		if (SampleLoopsNum)
+		if (SampleLoopsNum && pSampleLoop)
 		{
-			FSampleLoop* pTempSampleLoop = pSampleLoop;
+			BYTE* SampleLoopPtr = (BYTE*)pSampleLoop;
 			INT SampleDivisor = ( (SampleDataSize *  *pBitsPerSample) / (NewDataSize ) );
 			for (INT SL = 0; SL<SampleLoopsNum; SL++)
 			{
-				pTempSampleLoop->dwStart = pTempSampleLoop->dwStart  * OldBitsPerSample / SampleDivisor;
-				pTempSampleLoop->dwEnd   = pTempSampleLoop->dwEnd  * OldBitsPerSample / SampleDivisor;
-				pTempSampleLoop++; // Next TempSampleLoop structure.
+				FSampleLoop LoopCopy;
+				appMemcpy( &LoopCopy, SampleLoopPtr, sizeof(FSampleLoop) );
+				LoopCopy.dwStart = LoopCopy.dwStart  * OldBitsPerSample / SampleDivisor;
+				LoopCopy.dwEnd   = LoopCopy.dwEnd  * OldBitsPerSample / SampleDivisor;
+				appMemcpy( SampleLoopPtr, &LoopCopy, sizeof(FSampleLoop) );
+				SampleLoopPtr += sizeof(FSampleLoop); // Next TempSampleLoop structure.
 			}	
 		}		
 			
@@ -469,8 +503,6 @@ void FWaveModInfo::NoiseGateFilter()
 	}
 	unguard;
 }
-
-#endif
 
 /*-----------------------------------------------------------------------------
 	UMusic implementation.
