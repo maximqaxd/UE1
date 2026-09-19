@@ -817,7 +817,7 @@ int getOpenSfxChannel() {
 	 return index;
 }
 
-void AudioEngine_Play(int nStream, uint8 volume, uint8 panl, uint8 panr, bool loop, uint32 loop_offset)
+void AudioEngine_Play(int nStream, uint8_t volume, uint8_t panl, uint8_t panr, bool loop, uint32_t loop_offset)
 {
     if(nStream < AUDIO_ENGINE_MAX_STREAMS) {
         std::lock_guard<std::mutex> lk(channel_mtx);
