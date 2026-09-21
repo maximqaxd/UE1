@@ -32,6 +32,7 @@ FMemStack							URender::VectorMem;
 #if defined(PLATFORM_DREAMCAST)
 FTransform**						URender::PointCache;
 BYTE*							URender::PointCacheStamps;
+BYTE							URender::PointCacheGeneration;
 #else
 URender::FStampedPoint*				URender::PointCache;
 #endif
@@ -66,7 +67,7 @@ void URender::EnsureDCModelCaches()
 		PointCache = new FTransform*[PointCacheCapacity];
 		PointCacheStamps = new BYTE[PointCacheCapacity];
 		appMemset( PointCache, 0, PointCacheCapacity * sizeof(FTransform*) );
-		appMemset( PointCacheStamps, 0xff, PointCacheCapacity * sizeof(BYTE) );
+		appMemset( PointCacheStamps, 0, PointCacheCapacity * sizeof(BYTE) );
 #else
 		PointCache = new FStampedPoint[PointCacheCapacity];
 		for( INT i = 0; i < PointCacheCapacity; ++i )
@@ -172,6 +173,7 @@ void URender::Init( UEngine* InEngine )
 	PointCacheCapacity = DynamicsCacheCapacity = 0;
 #if defined(PLATFORM_DREAMCAST)
 	PointCacheStamps = NULL;
+	PointCacheGeneration = 0;
 #endif
 #else
 	PointCache		= new FStampedPoint [MAX_POINTS];
@@ -649,9 +651,9 @@ INT URender::ClipBspSurf( INT iNode, FTransform**& Result )
 	{
 		INT pPoint = VertPool[i].pVertex;
 #if defined(PLATFORM_DREAMCAST)
-		if( PointCacheStamps[pPoint] != (BYTE)Stamp )
+		if( PointCacheStamps[pPoint] != PointCacheGeneration )
 		{
-			PointCacheStamps[pPoint] = (BYTE)Stamp;
+			PointCacheStamps[pPoint] = PointCacheGeneration;
 			PointCache[pPoint] = new(VectorMem)FTransform;
 			Pipe( *PointCache[pPoint], GFrame, GPoints[pPoint] );
 			STAT(GStat.NumPoints++);
@@ -1350,9 +1352,9 @@ void Traverse( FSceneNode* Frame, INT iNode )
 		{
 			INT pPoint = _Verts[Plane->iVertPool+i].pVertex;
 #if defined(PLATFORM_DREAMCAST)
-			if( URender::PointCacheStamps[pPoint] != (BYTE)URender::Stamp )
+			if( URender::PointCacheStamps[pPoint] != URender::PointCacheGeneration )
 			{
-				URender::PointCacheStamps[pPoint] = (BYTE)URender::Stamp;
+				URender::PointCacheStamps[pPoint] = URender::PointCacheGeneration;
 				URender::PointCache[pPoint] = New<FTransform>( URender::VectorMem );
 				Pipe( *URender::PointCache[pPoint], Frame, Model->Points->Element(pPoint) );
 				STAT(GStat.NumPoints++);
@@ -1460,8 +1462,11 @@ void URender::OccludeBsp( FSceneNode* Frame )
 	// Init temporary caches.
 	Stamp++;
 #if defined(PLATFORM_DREAMCAST)
-	if( (BYTE)Stamp == 0 && PointCacheStamps )
-		appMemset( PointCacheStamps, 0xff, PointCacheCapacity * sizeof(BYTE) );
+	if( ++PointCacheGeneration == 0 )
+	{
+		appMemset( PointCacheStamps, 0, PointCacheCapacity * sizeof(BYTE) );
+		PointCacheGeneration = 1;
+	}
 #endif
 
 	// Init.

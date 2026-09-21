@@ -516,6 +516,7 @@ class RENDER_API URender : public URenderBase
 #if defined(PLATFORM_DREAMCAST)
 	static FTransform** PointCache;
 	static BYTE* PointCacheStamps;
+	static BYTE PointCacheGeneration;
 #else
 	static FStampedPoint* PointCache;
 #endif

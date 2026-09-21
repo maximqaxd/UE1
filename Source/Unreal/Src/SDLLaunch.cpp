@@ -96,8 +96,9 @@ void HandleIrqException( irq_t Code, irq_context_t* Context, void* Data )
 	printf( "PC: %p PR: %p\n", (void*)Context->pc, (void*)Context->pr );
 	printf( "SR: %p R0: %p\n", (void*)Context->sr, (void*)Context->r[0] );
 
-	arch_stk_trace_at( Context->r[14], 0 );
-
+	// The exception may have followed memory corruption, so the interrupted
+	// frame pointer cannot be trusted. Walking it can replace the original
+	// report with a double fault before the serial log is flushed.
 	volatile INT Dummy = 1;
 	while (Dummy);
 }
