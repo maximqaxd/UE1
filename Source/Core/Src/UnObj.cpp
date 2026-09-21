@@ -8,6 +8,10 @@
 
 #include "CorePrivate.h" 
 
+#if defined(PLATFORM_DREAMCAST)
+#include <malloc.h>
+#endif
+
 /*-----------------------------------------------------------------------------
 	Globals.
 -----------------------------------------------------------------------------*/
@@ -24,6 +28,32 @@ CORE_API FDCLinkerIndexCallback GDCLinkerIndexCallback = NULL;
 // Export creation order, not UObject slot order. Native class registration and
 // recycled object slots differ between the host cooker and the static DC build.
 static TArray<UObject*> GDCLoadedObjects;
+
+#if defined(PLATFORM_DREAMCAST)
+static DWORD GDCEndLoadReportedHeap = 0;
+
+static void DCProfileEndLoad( const char* Phase, INT Index, UObject* Object )
+{
+	struct mallinfo Heap = mallinfo();
+	DWORD Used = Heap.uordblks;
+	if( appStrcmp(Phase, "preload") == 0 && Used < GDCEndLoadReportedHeap + 262144 )
+	{
+		return;
+	}
+	GDCEndLoadReportedHeap = Used;
+	debugf(
+		"DCENDLOAD phase=%s index=%d queue=%d queue_capacity=%d heap=%u arena_free=%u blocks=%d class=%s object=%s",
+		Phase,
+		Index,
+		GDCLoadedObjects.Num(),
+		GDCLoadedObjects.ArrayMax,
+		Used,
+		(DWORD)Heap.fordblks,
+		Heap.ordblks,
+		Object ? Object->GetClass()->GetName() : "None",
+		Object ? Object->GetName() : "None" );
+}
+#endif
 
 CORE_API void appDCQueueLoadedObject( UObject* Object )
 {
@@ -2155,6 +2185,10 @@ void FObjectManager::EndLoad()
 			// UTDC EndLoad (8c16c640): drain the growing export queue. Preload
 			// can append dependencies, so neither cache Num() nor keep references
 			// to array elements across a call that may reallocate it.
+#if defined(PLATFORM_DREAMCAST)
+			GDCEndLoadReportedHeap = 0;
+			DCProfileEndLoad( "begin", 0, NULL );
+#endif
 			for( INT i = 0; i < GDCLoadedObjects.Num(); ++i )
 			{
 				UObject* Object = GDCLoadedObjects(i);
@@ -2162,8 +2196,14 @@ void FObjectManager::EndLoad()
 				{
 					check(Object->GetLinker());
 					Object->GetLinker()->Preload( Object );
+#if defined(PLATFORM_DREAMCAST)
+					DCProfileEndLoad( "preload", i, Object );
+#endif
 				}
 			}
+#if defined(PLATFORM_DREAMCAST)
+			DCProfileEndLoad( "preload_done", GDCLoadedObjects.Num(), NULL );
+#endif
 #else
 			UBOOL Preloaded;
 			do
@@ -2190,6 +2230,9 @@ void FObjectManager::EndLoad()
 			{
 				GDCLoadedObjects(i)->ConditionalPostLoad();
 			}
+#if defined(PLATFORM_DREAMCAST)
+			DCProfileEndLoad( "postload_done", GDCLoadedObjects.Num(), NULL );
+#endif
 			GDCLoadedObjects.Empty();
 #if defined(DC_RESOURCE_COOKER)
 			// Detect exports omitted from the queue, not just matching read CRCs.
