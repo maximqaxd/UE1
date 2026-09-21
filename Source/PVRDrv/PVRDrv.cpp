@@ -242,25 +242,18 @@ static inline void BuildPolyHeader( UPVRRenderDevice* RD, DWORD PolyFlags, const
     OutList = IsMasked ? PVR_LIST_PT_POLY : (IsTrans ? PVR_LIST_TR_POLY : PVR_LIST_OP_POLY);
 
     pvr_poly_cxt_t Cxt;
-    if( Info && RD->TexInfo.CurrentBind && RD->TexInfo.CurrentBind->Tex )
-    {
-        const INT USize = Max( UPVRRenderDevice::MinTexSize, Info->USize );
-        const INT VSize = Max( UPVRRenderDevice::MinTexSize, Info->VSize );
-        int PvrFmt = (Info->Palette ? PVR_TXRFMT_ARGB1555 : PVR_TXRFMT_RGB565);
-        if( Info->Format == TEXF_EXT_ARGB1555_VQ )
-            PvrFmt |= PVR_TXRFMT_VQ_ENABLE;
-        else
-            PvrFmt |= PVR_TXRFMT_NONTWIDDLED;
-        pvr_poly_cxt_txr( &Cxt, OutList, PvrFmt, USize, VSize, RD->TexInfo.CurrentBind->Tex, RD->NoFiltering ? PVR_FILTER_NONE : PVR_FILTER_BILINEAR );
-#if defined(PLATFORM_DREAMCAST)
-		if( Info->Format == TEXF_EXT_DCTEX )
-		{
-			const UPVRRenderDevice::FTexBind& Bind = *RD->TexInfo.CurrentBind;
-			pvr_poly_cxt_txr( &Cxt, OutList, Bind.DCFormat, Bind.DCWidth, Bind.DCHeight,
-				Bind.Tex, RD->NoFiltering ? PVR_FILTER_NONE : PVR_FILTER_BILINEAR );
-			Cxt.txr.mipmap = Bind.DCMipMapped;
-		}
-#endif
+	if( Info && RD->TexInfo.CurrentBind && RD->TexInfo.CurrentBind->Tex )
+	{
+		const UPVRRenderDevice::FTexBind& Bind = *RD->TexInfo.CurrentBind;
+		pvr_poly_cxt_txr(
+			&Cxt,
+			OutList,
+			Bind.DCFormat,
+			Bind.DCWidth,
+			Bind.DCHeight,
+			Bind.Tex,
+			RD->NoFiltering ? PVR_FILTER_NONE : PVR_FILTER_BILINEAR );
+		Cxt.txr.mipmap = Bind.DCMipMapped;
     }
     else
     {
@@ -355,8 +348,11 @@ extern ENGINE_API UBOOL appDCHasSessionTravel();
 UPVRRenderDevice::UPVRRenderDevice()
 {
 	NoFiltering = false;
+	Compose = NULL;
+	ComposeSize = 0;
 	VRAMUsed = 0;
 	TextureFrame = 0;
+	appMemset( PaletteBanks, 0, sizeof(PaletteBanks) );
 }
 
 UBOOL UPVRRenderDevice::Init( UViewport* InViewport )
@@ -385,8 +381,9 @@ UBOOL UPVRRenderDevice::Init( UViewport* InViewport )
 	SupportsDistanceFog = false; // true;
 	NoVolumetricBlend = true;
 
+	Compose = NULL;
 	ComposeSize = 0;
-	EnsureComposeSize( 256 * 256 * 2 );
+	pvr_set_pal_format( PVR_PAL_ARGB1555 );
 
     // PVR: no fixed function matrices; we keep a software viewport matrix.
     // Initialized in InitScreenViewMatrix() and updated from SetSceneNode/viewport.
@@ -469,6 +466,7 @@ void UPVRRenderDevice::Flush()
 		}
 		BindMap.Empty();
 	}
+	appMemset( PaletteBanks, 0, sizeof(PaletteBanks) );
 
 	unguard;
 }
@@ -525,12 +523,24 @@ void UPVRRenderDevice::Unlock( UBOOL Blit )
 	CallbackPeak = Max(CallbackPeak, CallbackBytes + QueueBytes);
 	if( TextureFrame <= 3 )
 	{
+		INT Pal8Count = 0;
+		DWORD Pal8VRAM = 0;
+		for( INT Index = 0; Index < BindMap.Size(); ++Index )
+		{
+			const FTexBind& Bind = BindMap[Index];
+			if( Bind.Tex && (Bind.DCFormat & (7 << 27)) == PVR_TXRFMT_PAL8BPP )
+			{
+				++Pal8Count;
+				Pal8VRAM += Bind.SizeBytes;
+			}
+		}
 		struct mallinfo Heap = mallinfo();
 		debugf(
 			"DCPVRMEM phase=before_submit heap=%u callbacks=%u opaque_direct=%u "
-			"queue_capacity=%u queue_peak=%u compose=%u op=%u pt=%d tr=%d",
+			"queue_capacity=%u queue_peak=%u compose=%u pal8_count=%d pal8_vram=%u "
+			"op=%u pt=%d tr=%d",
 			(DWORD)Heap.uordblks, CallbackBytes, GPVROpaqueDirectBytes, QueueBytes,
-			CallbackPeak, ComposeSize, GPVROpaqueDirectCount,
+			CallbackPeak, ComposeSize, Pal8Count, Pal8VRAM, GPVROpaqueDirectCount,
 			GPVRPTCallbacks.Num(), GPVRTRCallbacks.Num());
 	}
 
@@ -897,14 +907,16 @@ void UPVRRenderDevice::DrawTile( FSceneNode* Frame, FTextureInfo& Texture, FLOAT
 		pvr_poly_cxt_t Cxt;
 		if( TexInfo.CurrentBind && TexInfo.CurrentBind->Tex )
 		{
-			const INT USize = Max( UPVRRenderDevice::MinTexSize, Texture.USize );
-			const INT VSize = Max( UPVRRenderDevice::MinTexSize, Texture.VSize );
-			int PvrFmt = (Texture.Palette ? PVR_TXRFMT_ARGB1555 : PVR_TXRFMT_RGB565);
-			if( Texture.Format == TEXF_EXT_ARGB1555_VQ )
-				PvrFmt |= PVR_TXRFMT_TWIDDLED | PVR_TXRFMT_VQ_ENABLE;
-			else
-				PvrFmt |= PVR_TXRFMT_NONTWIDDLED;
-			pvr_poly_cxt_txr( &Cxt, PVR_LIST_TR_POLY, PvrFmt, USize, VSize, TexInfo.CurrentBind->Tex, NoFiltering ? PVR_FILTER_NONE : PVR_FILTER_BILINEAR );
+			const FTexBind& Bind = *TexInfo.CurrentBind;
+			pvr_poly_cxt_txr(
+				&Cxt,
+				PVR_LIST_TR_POLY,
+				Bind.DCFormat,
+				Bind.DCWidth,
+				Bind.DCHeight,
+				Bind.Tex,
+				NoFiltering ? PVR_FILTER_NONE : PVR_FILTER_BILINEAR );
+			Cxt.txr.mipmap = Bind.DCMipMapped;
 		}
 		else
 		{
@@ -1203,7 +1215,20 @@ void UPVRRenderDevice::SetTexture( FTextureInfo& Info, DWORD PolyFlags, FLOAT Pa
 	// Find in cache.
 	const QWORD NewCacheID = Info.CacheID;
 	const UBOOL RealtimeChanged = ( Info.TextureFlags & TF_RealtimeChanged ) != 0;
-	if( !RealtimeChanged && NewCacheID == Tex.CurrentCacheID )
+	const UBOOL PaletteChanged = ( Info.TextureFlags & TF_RealtimePalette ) != 0;
+	const UBOOL Masked = (PolyFlags & PF_Masked) != 0;
+	UBOOL CurrentPaletteValid = 1;
+	if( Tex.CurrentBind && Tex.CurrentBind->PaletteBank != INDEX_NONE )
+	{
+		const INT Bank = Tex.CurrentBind->PaletteBank;
+		CurrentPaletteValid = PaletteBanks[Bank].CacheID == Info.PaletteCacheID
+			&& PaletteBanks[Bank].Masked == Masked;
+		if( CurrentPaletteValid )
+		{
+			PaletteBanks[Bank].LastUsedFrame = TextureFrame;
+		}
+	}
+	if( !RealtimeChanged && !PaletteChanged && CurrentPaletteValid && NewCacheID == Tex.CurrentCacheID )
 	{
 		if( Tex.CurrentBind && Tex.CurrentBind->Tex )
 		{
@@ -1219,7 +1244,18 @@ void UPVRRenderDevice::SetTexture( FTextureInfo& Info, DWORD PolyFlags, FLOAT Pa
 	if( NewTexture )
 	{
 		// Create new binding entry; VRAM is allocated in UploadTexture.
-		Bind = BindMap.Add( LookupID, { 0, NewType, 0 } );
+		Bind = BindMap.Add( LookupID, { 0, NewType, 0, 0, 0, 0, 0, 0, -1, 0 } );
+	}
+	UBOOL BindPaletteValid = 1;
+	if( Bind->PaletteBank != INDEX_NONE )
+	{
+		const INT Bank = Bind->PaletteBank;
+		BindPaletteValid = PaletteBanks[Bank].CacheID == Info.PaletteCacheID
+			&& PaletteBanks[Bank].Masked == Masked;
+		if( BindPaletteValid )
+		{
+			PaletteBanks[Bank].LastUsedFrame = TextureFrame;
+		}
 	}
 
 	// Make current.
@@ -1227,15 +1263,66 @@ void UPVRRenderDevice::SetTexture( FTextureInfo& Info, DWORD PolyFlags, FLOAT Pa
 	Tex.CurrentBind = Bind;
 	Bind->LastUsedFrame = TextureFrame;
 
-	if( NewTexture || !Bind->Tex || RealtimeChanged || Bind->LastType != NewType )
+	if( NewTexture || !Bind->Tex || RealtimeChanged || PaletteChanged || !BindPaletteValid || Bind->LastType != NewType )
 	{
 		// New texture or it has changed, upload it to VRAM.
 		Bind->LastType = NewType;
 		Info.TextureFlags &= ~TF_RealtimeChanged;
-		UploadTexture( Info, NewTexture );
+		UploadTexture( Info, NewTexture, Masked );
 	}
 
 	unguard;
+}
+
+INT UPVRRenderDevice::AcquirePaletteBank( const FTextureInfo& Info, UBOOL Masked )
+{
+	for( INT Bank = 0; Bank < ARRAY_COUNT(PaletteBanks); ++Bank )
+	{
+		if( PaletteBanks[Bank].CacheID == Info.PaletteCacheID
+			&& PaletteBanks[Bank].Masked == Masked )
+		{
+			PaletteBanks[Bank].LastUsedFrame = TextureFrame;
+			return Bank;
+		}
+	}
+
+	for( INT Bank = 0; Bank < ARRAY_COUNT(PaletteBanks); ++Bank )
+	{
+		if( PaletteBanks[Bank].LastUsedFrame != TextureFrame )
+		{
+			PaletteBanks[Bank].CacheID = Info.PaletteCacheID;
+			PaletteBanks[Bank].Masked = Masked;
+			PaletteBanks[Bank].LastUsedFrame = TextureFrame;
+			PaletteBanks[Bank].LastUploadFrame = 0;
+			return Bank;
+		}
+	}
+
+	return INDEX_NONE;
+}
+
+void UPVRRenderDevice::UploadPalette( INT Bank, const FTextureInfo& Info, UBOOL Masked )
+{
+	check(Bank >= 0 && Bank < ARRAY_COUNT(PaletteBanks));
+	check(Info.Palette);
+
+	FPaletteBank& State = PaletteBanks[Bank];
+	if( State.LastUploadFrame == TextureFrame )
+	{
+		return;
+	}
+
+	const DWORD Base = Bank * NUM_PAL_COLORS;
+	for( INT Index = 0; Index < NUM_PAL_COLORS; ++Index )
+	{
+		_WORD Color = Info.Palette[Index].RGB888ToARGB1555();
+		if( Masked && Index == 0 )
+		{
+			Color &= ~0x8000U;
+		}
+		pvr_set_pal_entry( Base + Index, Color );
+	}
+	State.LastUploadFrame = TextureFrame;
 }
 
 void UPVRRenderDevice::EnsureComposeSize( const DWORD NewSize )
@@ -1417,7 +1504,7 @@ pvr_ptr_t UPVRRenderDevice::AllocateTexture( INT Size )
 	return Result;
 }
 
-void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, const UBOOL NewTexture )
+void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, UBOOL NewTexture, UBOOL Masked )
 {
 	guard(UPVRRenderDevice::UploadTexture);
 
@@ -1517,6 +1604,8 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, const UBOOL NewTexture
 		Bind->DCWidth = Width;
 		Bind->DCHeight = Height;
 		Bind->DCMipMapped = (Mode & 0x80000000) != 0;
+		Bind->PaletteBank = INDEX_NONE;
+		Bind->PaletteMasked = 0;
 	}
 	else if( Info.Format == TEXF_EXT_ARGB1555_VQ )
 	{
@@ -1542,6 +1631,88 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, const UBOOL NewTexture
 			Bind->SizeBytes = SizeBytes;
 			VRAMUsed += SizeBytes;
 		}
+		Bind->DCFormat = PVR_TXRFMT_ARGB1555 | PVR_TXRFMT_VQ_ENABLE;
+		Bind->DCWidth = Max( MinTexSize, Mip0->USize );
+		Bind->DCHeight = Max( MinTexSize, Mip0->VSize );
+		Bind->DCMipMapped = 0;
+		Bind->PaletteBank = INDEX_NONE;
+		Bind->PaletteMasked = 0;
+	}
+	else if( Info.Format == TEXF_P8
+		&& Info.Palette
+		&& (Info.TextureFlags & (TF_Realtime | TF_RealtimePalette | TF_Parametric))
+		&& Mip0->USize >= MinTexSize
+		&& Mip0->VSize >= MinTexSize
+		&& Mip0->USize <= 256
+		&& Mip0->VSize <= 256 )
+	{
+		const INT Bank = AcquirePaletteBank( Info, Masked );
+		if( Bank != INDEX_NONE )
+		{
+			const INT SizeBytes = Mip0->USize * Mip0->VSize;
+			const DWORD Format = PVR_TXRFMT_PAL8BPP | PVR_TXRFMT_8BPP_PAL(Bank);
+			const UBOOL UploadPixels = !Bind->Tex
+				|| Bind->SizeBytes != SizeBytes
+				|| (Bind->DCFormat & (7 << 27)) != PVR_TXRFMT_PAL8BPP
+				|| (Info.TextureFlags & TF_RealtimeChanged);
+
+			if( Bind->Tex && (Bind->SizeBytes != SizeBytes
+				|| (Bind->DCFormat & (7 << 27)) != PVR_TXRFMT_PAL8BPP) )
+			{
+				pvr_mem_free( Bind->Tex );
+				VRAMUsed -= Bind->SizeBytes;
+				Bind->Tex = NULL;
+				Bind->SizeBytes = 0;
+			}
+			if( !Bind->Tex )
+			{
+				Bind->Tex = AllocateTexture( SizeBytes );
+				Bind->SizeBytes = SizeBytes;
+				VRAMUsed += SizeBytes;
+			}
+			if( UploadPixels )
+			{
+				check(Mip0->DataPtr);
+				pvr_txr_load_ex(
+					Mip0->DataPtr,
+					Bind->Tex,
+					Mip0->USize,
+					Mip0->VSize,
+					PVR_TXRLOAD_8BPP );
+			}
+
+			UploadPalette( Bank, Info, Masked );
+			Bind->DCFormat = Format;
+			Bind->DCWidth = Mip0->USize;
+			Bind->DCHeight = Mip0->VSize;
+			Bind->DCMipMapped = 0;
+			Bind->PaletteBank = Bank;
+			Bind->PaletteMasked = Masked;
+		}
+		else
+		{
+			// All four hardware PAL8 banks are referenced by this scene. Preserve
+			// correctness by expanding this texture through the 16-bit fallback.
+			void* Lin = ConvertTextureMipI8( Mip0, Info.Palette );
+			const INT USize = Max( MinTexSize, Mip0->USize );
+			const INT VSize = Max( MinTexSize, Mip0->VSize );
+			const INT SizeBytes = USize * VSize * 2;
+			if( Bind->Tex )
+			{
+				pvr_mem_free( Bind->Tex );
+				VRAMUsed -= Bind->SizeBytes;
+			}
+			Bind->Tex = AllocateTexture( SizeBytes );
+			pvr_txr_load( Lin, Bind->Tex, SizeBytes );
+			Bind->SizeBytes = SizeBytes;
+			VRAMUsed += SizeBytes;
+			Bind->DCFormat = PVR_TXRFMT_ARGB1555 | PVR_TXRFMT_NONTWIDDLED;
+			Bind->DCWidth = USize;
+			Bind->DCHeight = VSize;
+			Bind->DCMipMapped = 0;
+			Bind->PaletteBank = INDEX_NONE;
+			Bind->PaletteMasked = 0;
+		}
 	}
 	else if( Info.Palette )
 	{
@@ -1565,6 +1736,12 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, const UBOOL NewTexture
 			Bind->SizeBytes = SizeBytes;
 			VRAMUsed += SizeBytes;
 		}
+		Bind->DCFormat = PVR_TXRFMT_ARGB1555 | PVR_TXRFMT_NONTWIDDLED;
+		Bind->DCWidth = USize;
+		Bind->DCHeight = VSize;
+		Bind->DCMipMapped = 0;
+		Bind->PaletteBank = INDEX_NONE;
+		Bind->PaletteMasked = 0;
 	}
 	else
 	{
@@ -1588,6 +1765,12 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, const UBOOL NewTexture
 			Bind->SizeBytes = SizeBytes;
 			VRAMUsed += SizeBytes;
 		}
+		Bind->DCFormat = PVR_TXRFMT_RGB565 | PVR_TXRFMT_NONTWIDDLED;
+		Bind->DCWidth = USize;
+		Bind->DCHeight = VSize;
+		Bind->DCMipMapped = 0;
+		Bind->PaletteBank = INDEX_NONE;
+		Bind->PaletteMasked = 0;
 	}
 
 	// Free temporary streamed buffer immediately

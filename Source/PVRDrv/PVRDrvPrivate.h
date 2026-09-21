@@ -33,8 +33,19 @@ class DLL_EXPORT UPVRRenderDevice : public URenderDevice
 		INT DCHeight;
 		UBOOL DCMipMapped;
 		DWORD LastUsedFrame;
+		INT PaletteBank;
+		UBOOL PaletteMasked;
 	};
 	TMap<QWORD, FTexBind> BindMap;
+
+	struct FPaletteBank
+	{
+		QWORD CacheID;
+		UBOOL Masked;
+		DWORD LastUsedFrame;
+		DWORD LastUploadFrame;
+	};
+	FPaletteBank PaletteBanks[4];
 
 	struct FTexInfo
 	{
@@ -96,7 +107,9 @@ class DLL_EXPORT UPVRRenderDevice : public URenderDevice
 	void SetBlend( DWORD PolyFlags, UBOOL InverseOrder = false );
 	void SetTexture( FTextureInfo& Info, DWORD PolyFlags, FLOAT PanBias );
 	void ResetTexture( );
-	void UploadTexture( FTextureInfo& Info, const UBOOL NewTexture );
+	void UploadTexture( FTextureInfo& Info, UBOOL NewTexture, UBOOL Masked );
+	INT AcquirePaletteBank( const FTextureInfo& Info, UBOOL Masked );
+	void UploadPalette( INT Bank, const FTextureInfo& Info, UBOOL Masked );
 	pvr_ptr_t AllocateTexture( INT Size );
 	void EnsureComposeSize( const DWORD NewSize );
 	void* ConvertTextureMipI8( const FMipmap* Mip, const FColor* Palette );
