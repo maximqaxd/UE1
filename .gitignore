@@ -4,3 +4,22 @@ Bin
 *.log
 Source/.vs
 Source/UnrealED/obj
+
+# Local build trees and test scratch.
+/build_*/
+/build_test_tmp/
+
+# Cooked/runtime inputs and generated disc images.
+/build_cooked/
+/gamedata/
+/Unreal/
+/Unreal_orig/
+/unreal.cdi
+/Unreal.iso
+/Unreal.ini
+/Unreal - Copy.ini
+
+# Generated Python and reverse-engineering output.
+__pycache__/
+*.py[cod]
+/research/utdc/utdc-current-report.json
