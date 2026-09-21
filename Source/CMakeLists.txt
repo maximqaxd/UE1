@@ -34,6 +34,10 @@ option(BUILD_NOPENALDRV "Build NOpenALDrv" ON)
 option(BUILD_WINDRV "Build WinDrv" OFF)
 option(BUILD_FOR_PSVITA "Build binaries that can be loaded by so_loader on the Vita" OFF)
 option(BUILD_DCUTIL "Build DCUtil" OFF)
+option(DC_RESOURCE_COOKER "Enable Dreamcast resource codecs in host cooker builds" OFF)
+if(DC_RESOURCE_COOKER)
+  add_compile_definitions(DC_RESOURCE_COOKER)
+endif()
 option(BUILD_STATIC "Link everything into a single binary" OFF)
 
 option(DREAMCAST_USE_FATFS "Try to load data from SD or IDE" OFF)
@@ -164,7 +168,7 @@ elseif(TARGET_IS_ARM)
   endif()
 elseif(TARGET_IS_DREAMCAST)
   set(DREAMCAST_CFLAGS
-    -m4-single -fsigned-char -fno-short-enums -fexceptions -fno-rtti -fsingle-precision-constant -flto=8
+    -m4-single-only -fsigned-char -fno-short-enums -fexceptions -fno-rtti -fsingle-precision-constant -flto=8
     -fomit-frame-pointer -fstack-usage
   )
   set(DREAMCAST_WFLAGS

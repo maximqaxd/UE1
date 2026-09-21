@@ -2704,6 +2704,11 @@ void UWetTexture::ApplyWetTexture()
 // Calculate panning movement for ice.
 //
 
+#if defined(PLATFORM_DREAMCAST)
+// GCC 15 SH-4 single-only hits a reload ICE in this calculation under LTO.
+// Prevent it from being inlined into RenderIce; keep other rendering optimized.
+__attribute__((optimize("O1"), noipa))
+#endif
 void  UIceTexture::MoveIcePosition(FLOAT DeltaTime)
 {
 	guard(UIceTexture::MoveIcePosition);
