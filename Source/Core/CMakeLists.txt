@@ -2,6 +2,8 @@ project(Core CXX)
 
 set(SRC_FILES
   "Src/UnCache.cpp"
+  "Src/UnDCDat.cpp"
+  "Src/UnDCStream.cpp"
   "Src/UnClass.cpp"
   "Src/UnCorSc.cpp"
   "Src/UnFile.cpp"
@@ -44,6 +46,14 @@ target_include_directories(${PROJECT_NAME}
 )
 
 target_compile_definitions(${PROJECT_NAME} PRIVATE CORE_EXPORTS UPACKAGE_NAME=${PROJECT_NAME})
+
+option(DC_TRACE_RESTART_ALLOCS "Track host cooker allocations during restart tests" OFF)
+if(DC_TRACE_RESTART_ALLOCS)
+  if(NOT DC_RESOURCE_COOKER OR TARGET_IS_DREAMCAST)
+    message(FATAL_ERROR "DC_TRACE_RESTART_ALLOCS requires a host DC_RESOURCE_COOKER build")
+  endif()
+  target_compile_definitions(${PROJECT_NAME} PRIVATE CHECK_ALLOCS=1)
+endif()
 
 if(USE_SDL)
   target_link_libraries(${PROJECT_NAME} PRIVATE ${SDL2_LIBRARY})

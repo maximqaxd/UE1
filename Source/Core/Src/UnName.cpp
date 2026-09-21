@@ -148,7 +148,14 @@ void FName::ExitSubsystem()
 	// Kill all names.
 	for( int i=0; i<Names.Num(); i++ )
 		if( Names(i) && !(Names(i)->Flags & RF_Intrinsic) )
+		{
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+			// Keep the hash and reusable index list consistent for reinitialization.
+			DeleteEntry(i);
+#else
 			delete Names(i);
+#endif
+		}
 
 	debugf( NAME_Exit, "Name subsystem shut down" );
 	unguard;
@@ -197,7 +204,13 @@ void FName::DeleteEntry( int i )
 	Available.AddItem(i);
 
 	// Delete it.
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	// AllocateNameEntry uses appMalloc, not C++ new. Pair the allocator even
+	// when the host compiler selects a sized C++ delete implementation.
+	appFree( Name );
+#else
 	delete Name;
+#endif
 
 	unguard;
 }

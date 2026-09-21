@@ -8,6 +8,94 @@
 
 #include "CorePrivate.h"
 
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+static const FDCNativeClassRegistration* GDCNativeClassRegistry = NULL;
+
+FDCNativeClassRegistration::FDCNativeClassRegistration(
+	UClass* InClass, UClass* const* InSuperSlot, const char* InName,
+	const char* InPackage, DWORD InSize, DWORD InRecordSize, DWORD InFlags,
+	DWORD A, DWORD B, DWORD C, DWORD D, void (*InConstructor)(void*),
+	void (*InInitializer)(UClass*) )
+	: Class(InClass), SuperSlot(InSuperSlot), Name(InName), Package(InPackage),
+	  Size(InSize), RecordSize(InRecordSize), Flags(InFlags), Guid{A, B, C, D},
+	  Constructor(InConstructor), Initializer(InInitializer), Next(GDCNativeClassRegistry)
+{
+	// Runs at static initialization, including late-loaded native packages.
+	// Do not allocate, log, or inspect UObject/FName state here.
+	GDCNativeClassRegistry = this;
+}
+
+const FDCNativeClassRegistration* appDCNativeClassRegistry()
+{
+	return GDCNativeClassRegistry;
+}
+
+INT appDCValidateNativeClassRegistry()
+{
+	check(GObj.GetInitialized());
+	INT Count = 0;
+	for( const FDCNativeClassRegistration* Recipe = GDCNativeClassRegistry;
+		Recipe; Recipe = Recipe->Next )
+	{
+		UClass* Class = Recipe->Class;
+		UClass* Super = *Recipe->SuperSlot;
+		if( Super == Class )
+		{
+			Super = NULL;
+		}
+		if( !Class || Class->GetClass() != UClass::StaticClass
+			|| !(Class->GetFlags() & RF_Intrinsic)
+			|| appStrcmp( Class->GetName(), Recipe->Name + 1 )
+			|| !Class->GetParent()
+			|| appStrcmp( Class->GetParent()->GetName(), Recipe->Package )
+			|| Class->GetSuperClass() != Super
+			|| Class->ClassInitializer != Recipe->Initializer )
+		{
+			appErrorf( "Native restart recipe mismatch: %s.%s class=%p meta=%p "
+				"flags=%08x name=%s package=%s super=%p expected_super=%p initializer_matches=%d",
+				Recipe->Package, Recipe->Name, Class, Class ? Class->GetClass() : NULL,
+				Class ? Class->GetFlags() : 0, Class ? Class->GetName() : "<null>",
+				Class && Class->GetParent() ? Class->GetParent()->GetName() : "<null>",
+				Class ? Class->GetSuperClass() : NULL, Super,
+				Class && Class->ClassInitializer == Recipe->Initializer );
+		}
+		for( const FDCNativeClassRegistration* Other = Recipe->Next; Other; Other = Other->Next )
+		{
+			if( Other->Class == Class || (!appStricmp( Other->Package, Recipe->Package )
+				&& !appStricmp( Other->Name, Recipe->Name )) )
+			{
+				appErrorf( "Duplicate native restart recipe: %s.%s", Recipe->Package, Recipe->Name );
+			}
+		}
+		++Count;
+	}
+	INT NativeCount = 0;
+	for( TObjectIterator<UClass> It; It; ++It )
+	{
+		if( It->GetFlags() & RF_Intrinsic )
+		{
+			const FDCNativeClassRegistration* Recipe = GDCNativeClassRegistry;
+			while( Recipe && Recipe->Class != *It )
+			{
+				Recipe = Recipe->Next;
+			}
+			if( !Recipe )
+			{
+				appErrorf( "Missing native restart recipe: %s", It->GetFullName() );
+			}
+			++NativeCount;
+		}
+	}
+	if( !Count || Count != NativeCount )
+	{
+		appErrorf( "Native restart registry count mismatch: recipes=%d objects=%d", Count, NativeCount );
+	}
+	debugf( "DCNATIVE registry_verified classes=%d static_bytes=%u", Count,
+		(DWORD)(Count * sizeof(FDCNativeClassRegistration)) );
+	return Count;
+}
+#endif
+
 /*-----------------------------------------------------------------------------
 	FPropertyTag.
 -----------------------------------------------------------------------------*/

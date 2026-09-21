@@ -91,8 +91,13 @@ class CORE_API UField : public UObject
 	DECLARE_ABSTRACT_CLASS(UField,UObject,0)
 	NO_DEFAULT_CONSTRUCTOR(UField)
 
-	// Constants.
+	// Constants. A 256-pointer table per class/state is disproportionately
+	// expensive on Dreamcast and contributes directly to the map-load peak.
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	enum {HASH_COUNT = 64};
+#else
 	enum {HASH_COUNT = 256};
+#endif
 
 	// Variables.
 	UField*			SuperField;

@@ -142,6 +142,12 @@ public:
 	{
 		return Names.Num();
 	}
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	static INT GetDCTableBytes()
+	{
+		return Names.ArrayMax * sizeof(FNameEntry*) + Available.ArrayMax * sizeof(INT);
+	}
+#endif
 	static FNameEntry* GetEntry( int i )
 	{
 		return Names(i);

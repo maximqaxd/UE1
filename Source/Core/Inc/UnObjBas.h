@@ -377,6 +377,45 @@ public: \
 		{ ConditionalDestroy(); } \
 	enum {InternalConstructor=0}; \
 
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+// Static construction recipe. No FNames, arrays, defaults or session allocations.
+// SuperSlot is resolved after static initialization, never in this constructor.
+struct CORE_API FDCNativeClassRegistration
+{
+	UClass* const Class;
+	UClass* const* const SuperSlot;
+	const char* const Name;
+	const char* const Package;
+	const DWORD Size;
+	const DWORD RecordSize;
+	const DWORD Flags;
+	const DWORD Guid[4];
+	void (*const Constructor)(void*);
+	void (*const Initializer)(UClass*);
+	const FDCNativeClassRegistration* const Next;
+
+	FDCNativeClassRegistration( UClass* InClass, UClass* const* InSuperSlot,
+		const char* InName, const char* InPackage, DWORD InSize, DWORD InRecordSize,
+		DWORD InFlags, DWORD A, DWORD B, DWORD C, DWORD D,
+		void (*InConstructor)(void*), void (*InInitializer)(UClass*) );
+};
+
+CORE_API const FDCNativeClassRegistration* appDCNativeClassRegistry();
+CORE_API INT appDCValidateNativeClassRegistry();
+
+#define IMPLEMENT_DC_NATIVE_RECIPE(ClassName) \
+	static FDCNativeClassRegistration dcRecipe##ClassName \
+	( \
+		&autoclass##ClassName, &ClassName::Super::StaticClass, #ClassName, THIS_PACKAGE, \
+		sizeof(ClassName), ClassName::StaticRecordSize, ClassName::StaticClassFlags, \
+		ClassName::GUID1, ClassName::GUID2, ClassName::GUID3, ClassName::GUID4, \
+		(void(*)(void*))ClassName::InternalConstructor, \
+		(void(*)(UClass*))ClassName::InternalClassInitializer \
+	);
+#else
+#define IMPLEMENT_DC_NATIVE_RECIPE(ClassName)
+#endif
+
 // Register a class at startup time.
 #define IMPLEMENT_CLASS(ClassName) \
 	/* Register this class globally */ \
@@ -394,6 +433,7 @@ public: \
 	); } \
 	/* Static variable. */ \
 	UClass* ClassName::StaticClass = &autoclass##ClassName; \
+	IMPLEMENT_DC_NATIVE_RECIPE(ClassName) \
 	/* Static export, if needed. */ \
 	STATIC_EXPORT( ClassName, autoclass##ClassName )
 
@@ -458,6 +498,12 @@ public:
 
 	// Accessors.
 	virtual UBOOL GetInitialized() {return Initialized;}
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	// Rebuild immutable native registrations after destroying a session. The
+	// host cooker uses strict mode; Dreamcast opts into loaded-asset teardown
+	// only after the game loop and hardware-facing subsystems have stopped.
+	void RestartNativeCore( UBOOL LoadedAssets=0 );
+#endif
 	virtual UPackage* GetTransientPackage() {return TransientPackage;}
 	FName GetTempState() {return TempState;}//oldver
 	FName GetTempGroup() {return TempGroup;}//oldver

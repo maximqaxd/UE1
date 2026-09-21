@@ -32,9 +32,8 @@
 	Options.
 -----------------------------------------------------------------------------*/
 
-// To force memory leak checking.
-#undef CHECK_ALLOCS
-#define CHECK_ALLOCS 0
+// CHECK_ALLOCS defaults to zero in UnBuild.h. Host restart diagnostics may
+// override it for Core without changing the target runtime or native modules.
 
 /*-----------------------------------------------------------------------------
 	FArchive implementation.
@@ -208,6 +207,11 @@ CORE_API void appDumpAllocs( FOutputDevice* Out )
 {
 	guard(DumpTrackedAllocations);
 #if CHECK_ALLOCS
+#if defined(DC_RESOURCE_COOKER)
+	// The legacy global new/delete replacements are inline. Host C++ runtime
+	// deletes can bypass them; these records are not a complete leak census.
+	Out->Log( "DCALLOC scope=appMalloc/appRealloc; C++ new records may be stale" );
+#endif
 	INT Count=0;
 	for( FTrackedAllocation* A = GTrackedAllocations; A; A=A->Next )
 	{
@@ -229,6 +233,14 @@ CORE_API void* appMalloc( INT Size, const char* Tag )
 	check(Size>0);
 
 	void* Ptr = malloc( Size );
+#if defined(PLATFORM_DREAMCAST)
+	if( !Ptr && Size )
+	{
+		struct mallinfo Heap = mallinfo();
+		printf( "DCOOM kind=malloc tag=%s requested=%i heap=%i free_heap=%i\n",
+			Tag, Size, Heap.uordblks, Heap.fordblks );
+	}
+#endif
 	check(Ptr);
 
 #if CHECK_ALLOCS

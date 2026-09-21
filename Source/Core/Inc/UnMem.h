@@ -56,6 +56,9 @@ public:
 	void Exit();
 	void Tick();
 	int  GetByteCount();
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	static void GetDCMemoryStats( INT& Allocated, INT& Pooled, INT& Chunks );
+#endif
 
 	// Friends.
 	friend class FMemMark;

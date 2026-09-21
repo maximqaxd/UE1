@@ -13,6 +13,19 @@ Revision history:
 -----------------------------------------------------------------------------*/
 
 FMemStack::FTaggedMemory* FMemStack::UnusedChunks = NULL;
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+static INT DCMemStackBytes = 0;
+static INT DCMemStackChunks = 0;
+
+void FMemStack::GetDCMemoryStats( INT& Allocated, INT& Pooled, INT& Chunks )
+{
+	Allocated = DCMemStackBytes;
+	Chunks = DCMemStackChunks;
+	Pooled = 0;
+	for( FTaggedMemory* Chunk = UnusedChunks; Chunk; Chunk = Chunk->Next )
+		Pooled += 256 + Chunk->DataSize + sizeof(FTaggedMemory);
+}
+#endif
 
 /*-----------------------------------------------------------------------------
 	FMemStack implementation.
@@ -53,6 +66,10 @@ void FMemStack::Exit()
 	while( UnusedChunks )
 	{
 		void* Old = UnusedChunks;
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+		DCMemStackBytes -= 256 + UnusedChunks->DataSize + sizeof(FTaggedMemory);
+		--DCMemStackChunks;
+#endif
 		UnusedChunks = UnusedChunks->Next;
 		appFree( Old );
 	}
@@ -108,6 +125,10 @@ BYTE* FMemStack::AllocateNewChunk( INT MinSize )
 		INT DataSize    = Max(MinSize,DefaultChunkSize);
 		Chunk           = (FTaggedMemory*)appMalloc( 256/*!!*/ + DataSize + sizeof(FTaggedMemory), "MemChunk" );
 		Chunk->DataSize = DataSize;
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+		DCMemStackBytes += 256 + DataSize + sizeof(FTaggedMemory);
+		++DCMemStackChunks;
+#endif
 	}
 	Chunk->Next = TopChunk;
 	TopChunk    = Chunk;

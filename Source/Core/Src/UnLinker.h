@@ -10,6 +10,10 @@
 	FObjectExport.
 -----------------------------------------------------------------------------*/
 
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+CORE_API void appDCQueueLoadedObject( UObject* Object );
+#endif
+
 //
 // Information about an exported object.
 //
@@ -224,6 +228,30 @@ struct FFileStatus
 	INT SavedPos;
 };
 
+#include "UnDCStream.h"
+
+// Optional observer for tools which record the logical package read stream.
+typedef void (*FArchiveFileReadCallback)( const char* Filename, INT Offset, const void* Data, INT Length );
+extern CORE_API FArchiveFileReadCallback GArchiveFileReadCallback;
+
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+enum EDCLinkerIndexKind
+{
+	DC_LINKER_Name   = 0,
+	DC_LINKER_Import = 1,
+	DC_LINKER_Export = 2
+};
+typedef void (*FDCLinkerIndexCallback)( const char* Filename, INT Kind, INT Index );
+extern CORE_API FDCLinkerIndexCallback GDCLinkerIndexCallback;
+#endif
+
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+CORE_API void appDCOpenDat( const char* Path );
+CORE_API void appDCCloseDat();
+CORE_API UBOOL appDCReadDat( const char* Filename, INT FileSize, INT Offset, void* Data, INT Length );
+CORE_API void appDCDatStats();
+#endif
+
 //
 // Ansi file loader.
 //
@@ -238,7 +266,19 @@ public:
 	{
 		guard(FArchiveFileLoad::FArchiveFileLoad);
 		appStrcpy( Filename, InFilename );
-		File = appFopen( Filename, "rb" );	
+
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+		if( appDCStreamActive() )
+		{
+			Eof = appDCStreamFileSize( Filename );
+			if( Eof < 0 )
+			{
+				appErrorf( "Package absent from dependency stream: %s", Filename );
+			}
+			return;
+		}
+#endif
+		File = appFopen( Filename, "rb" );
 		if( File == NULL )
 			appThrowf( LocalizeError("OpenFailed") );
 		appFseek( File, 0, USEEK_END );
@@ -265,34 +305,69 @@ public:
 		guard(FArchiveFileLoad::Seek);
 		check(InPos>=0);
 		check(InPos<=Eof);
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+		Pos = InPos;
+#else
 		INT Result = appFseek(File,InPos,USEEK_SET);
 		if( Result!=0 )
 			appErrorf( "Seek Failed %i/%i (%i): %i %i", InPos, Eof, Pos, Result, appFerror(File) );
+#endif
 		unguard;
 		Pos = InPos;
 	}
 	INT Tell()
 	{
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+		return Pos;
+#else
 		return appFtell( File );
+#endif
 	}
 	void Push( FFileStatus& St, BYTE* NewBuffer )
 	{
-		St.SavedPos = appFtell( File );
+		St.SavedPos = Tell();
 	}
 	void Pop( FFileStatus& St )
 	{
 		guardSlow(FArchiveFileLoad::Pop);
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+		Pos = St.SavedPos;
+#else
 		INT Result = appFseek( File, St.SavedPos, USEEK_SET );
 		if( Result!=0 )
 			appErrorf( "Seek Failed %i/%i (%i): %i %i", St.SavedPos, Eof, Pos, Result, appFerror(File) );
+#endif
 		Pos = St.SavedPos;
 		unguardSlow;
 	}
 	FArchive& Serialize( void* V, INT Length )
 	{
-		INT Count = appFread( V, Length, 1, File );
+		INT ReadOffset = Tell();
+		INT Count = 1;
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+		if( appDCStreamActive() )
+		{
+			appDCStreamRead( Filename, ReadOffset, V, Length );
+		}
+		else if( !appDCReadDat( Filename, Eof, ReadOffset, V, Length ) )
+		{
+			if( !File )
+			{
+				appErrorf( "Dependency stream closed with live package reader: %s", Filename );
+			}
+			if( appFtell( File ) != ReadOffset && appFseek( File, ReadOffset, USEEK_SET ) )
+			{
+				appErrorf( "Package seek failed: %s", Filename );
+			}
+			Count = appFread( V, Length, 1, File );
+		}
+#else
+		Count = appFread( V, Length, 1, File );
+#endif
 		if( Count!=1 && Length!=0 )
 			appErrorf( "appFread failed: Count=%i Length=%i Error=%i", Count, Length, appFerror(File) );
+		if( GArchiveFileReadCallback && Length )
+			GArchiveFileReadCallback( Filename, ReadOffset, V, Length );
 		Pos += Length;
 		check(Pos<=Eof);
 		return *this;
@@ -432,12 +507,18 @@ class ULinkerLoad : public ULinker, public FArchiveFileLoad
 	// Variables.
 	DWORD LoadFlags;
 	INT FileSize;
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	UBOOL DCCompactExports;
+#endif
 
 	// Constructor; all errors here throw exceptions which are fully recoverable.
 	ULinkerLoad( UObject* InParent, const char* InFilename, DWORD InLoadFlags )
 	:	ULinker( InParent, InFilename )
 	,	FArchiveFileLoad( InFilename )
 	,	LoadFlags( InLoadFlags )
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	,	DCCompactExports( 0 )
+#endif
 	{
 		guard(ULinkerLoad::ULinkerLoad);
 		debugf( "Loading: %s", InParent->GetFullName() );
@@ -449,7 +530,7 @@ class ULinkerLoad : public ULinker, public FArchiveFileLoad
 
 		// Begin.
 		GSystem->StatusUpdatef( 0, 0, LocalizeProgress("Loading"), Filename );
-		FileSize = appFSize(Filename);
+		FileSize = Eof;
 
 		// Set status info.
 		guard(InitAr);
@@ -489,7 +570,15 @@ class ULinkerLoad : public ULinker, public FArchiveFileLoad
 
 		// Allocate everything according to summary.
 		ImportMap   .AddZeroed( Summary.ImportCount   );
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+		INT CompactExportCount = appDCStreamActive()
+			? appDCStreamCompactExportCount( Filename, Summary.ExportCount )
+			: INDEX_NONE;
+		DCCompactExports = CompactExportCount != INDEX_NONE;
+		ExportMap.AddZeroed( DCCompactExports ? CompactExportCount : Summary.ExportCount );
+#else
 		ExportMap   .AddZeroed( Summary.ExportCount   );
+#endif
 		NameMap		.AddZeroed( Summary.NameCount     );
 		Heritage    .AddZeroed( Summary.HeritageCount );
 
@@ -540,13 +629,28 @@ class ULinkerLoad : public ULinker, public FArchiveFileLoad
 			//debugf( NAME_Log, "Reading export table: %i objects", Summary.ExportCount );
 			Seek( Summary.ExportOffset );
 			for( INT i=0; i<Summary.ExportCount; i++ )
-				*this << ExportMap( i );
+			{
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+				if( DCCompactExports )
+				{
+					FObjectExport Export;
+					*this << Export;
+					INT CompactIndex = appDCStreamMapExport( Filename, i );
+					if( CompactIndex != INDEX_NONE )
+						ExportMap(CompactIndex) = Export;
+				}
+				else
+#endif
+				{
+					*this << ExportMap( i );
+				}
+			}
 		}
 		unguard;
 
 		// Generate export in-memory info.
 		guard(GenerateExportInfo);
-		for( INT i=0; i<Summary.ExportCount; i++ )
+		for( INT i=0; i<ExportMap.Num(); i++ )
 		{
 			FObjectExport& Export = ExportMap(i);
 			if( Export.ClassIndex < 0 )
@@ -566,7 +670,14 @@ class ULinkerLoad : public ULinker, public FArchiveFileLoad
 			else if( Export.ClassIndex > 0 )
 			{
 				Export.ClassPackage = LinkerRoot->GetFName();
-				Export.ClassName    = ExportMap( Export.ClassIndex-1 ).ObjectName;
+				INT ClassIndex = Export.ClassIndex - 1;
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+				if( DCCompactExports )
+					ClassIndex = appDCStreamMapExport( Filename, ClassIndex );
+#endif
+				if( !ExportMap.IsValidIndex(ClassIndex) )
+					appErrorf( "DAT omitted export class: %s original=%d", Filename, Export.ClassIndex-1 );
+				Export.ClassName = ExportMap( ClassIndex ).ObjectName;
 			}
 			else
 			{
@@ -583,7 +694,14 @@ class ULinkerLoad : public ULinker, public FArchiveFileLoad
 			// Validate all imports and map them to their remote linkers.
 			guard(ValidateImports);
 			for( INT i=0; i<Summary.ImportCount; i++ )
-				VerifyImport( i );
+			{
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+				if( appDCStreamActive() && !appDCStreamUsesImport(Filename,Summary.ImportCount,i) )
+					VerifyImportPackageOnly( i );
+				else
+#endif
+					VerifyImport( i );
+			}
 			unguard;
 		}
 		catch( char* Error )
@@ -599,6 +717,42 @@ class ULinkerLoad : public ULinker, public FArchiveFileLoad
 	}
 
 	// Safely verify an import.
+	void VerifyImportPackageOnly( INT i )
+	{
+		guard(ULinkerLoad::VerifyImportPackageOnly);
+		FObjectImport& Import = ImportMap(i);
+		if( Import.SourceIndex != -1 )
+			return;
+		if( Import.ClassPackage != NAME_None && Import.ClassName != NAME_None
+			&& Import.ObjectName != NAME_None && (Ver()>=50 || Import._ObjectPackage!=NAME_None) )
+		{
+			if( Ver() >= 50 )
+			{
+				if( Import.PackageIndex == 0 )
+				{
+					UPackage* Package = GObj.CreatePackage( NULL, *Import.ObjectName );
+					Import.SourceLinker = GObj.GetPackageLinker( Package, NULL,
+						LOAD_Throw | (LoadFlags & LOAD_Propagate), NULL, NULL );
+				}
+				else
+				{
+					check(Import.PackageIndex < 0);
+					INT Parent = -Import.PackageIndex - 1;
+					VerifyImportPackageOnly( Parent );
+					Import.SourceLinker = ImportMap(Parent).SourceLinker;
+				}
+			}
+			else
+			{
+				UPackage* Package = GObj.CreatePackage( NULL, *Import._ObjectPackage );
+				Import.SourceLinker = GObj.GetPackageLinker( Package, NULL,
+					LOAD_Throw | (LoadFlags & LOAD_Propagate), NULL, NULL );
+			}
+		}
+		Import.SourceIndex = -2;
+		unguard;
+	}
+
 	void VerifyImport( INT i )
 	{
 		guard(ULinkerLoad::VerifyImport);
@@ -678,7 +832,9 @@ class ULinkerLoad : public ULinker, public FArchiveFileLoad
 					}
 					if( !(Source.ObjectFlags & RF_Public) )
 						appThrowf( LocalizeError("FailedImportPrivate"), *Source.ClassName, Import.SourceLinker->LinkerRoot->GetClassName(), *Source.ObjectName );
-					Import.SourceIndex = j;
+					Import.SourceIndex = Import.SourceLinker->DCCompactExports
+						? appDCStreamOriginalExport( Import.SourceLinker->Filename, j )
+						: j;
 					break;
 				}
 			}
@@ -702,7 +858,9 @@ class ULinkerLoad : public ULinker, public FArchiveFileLoad
 					&&	Source.ClassName	== Import.ClassName
 					&&	Source.ClassPackage	== Import.ClassPackage )
 					{
-						Import.SourceIndex = j;
+						Import.SourceIndex = Import.SourceLinker->DCCompactExports
+							? appDCStreamOriginalExport( Import.SourceLinker->Filename, j )
+							: j;
 						break;
 					}
 				}
@@ -753,10 +911,10 @@ class ULinkerLoad : public ULinker, public FArchiveFileLoad
 
 		// Load all exports.
 		guard(LoadExports);
-		if( Summary.ExportCount > 0 )
+		if( ExportMap.Num() > 0 )
 		{
 			//debugf( NAME_Log, "Loading all objects: %i objects", Summary.ExportCount );
-			for( INT i=0; i<Summary.ExportCount; i++ )
+			for( INT i=0; i<ExportMap.Num(); i++ )
 				CreateExport( i );
 		}
 		unguard;
@@ -821,6 +979,11 @@ private:
 	{
 		guard(ULinkerLoad::CreateExport);
 
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+		if( GDCLinkerIndexCallback )
+			GDCLinkerIndexCallback( Filename, DC_LINKER_Export, Index );
+#endif
+
 		// Map the object into our table.
 		FObjectExport& Export = ExportMap( Index );
 		if( Export._Object )
@@ -861,6 +1024,12 @@ private:
 			debugfSlow( NAME_DevLoad, "Created %s", Export._Object->GetFullName() );
 			Export._Object->SetLinker( this, Index );
 
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+			// UTDC CreateExport (8c17a9e0) queues immediately after SetLinker,
+			// before creating the superclass or binding the native class.
+			appDCQueueLoadedObject( Export._Object );
+#endif
+
 			// If it's a struct or class, set its parent.
 			if( Export._Object->IsA(UStruct::StaticClass) && Export.ParentIndex!=0 )
 				((UStruct*)Export._Object)->SuperField = (UStruct*)IndexToObject( Export.ParentIndex );
@@ -880,7 +1049,26 @@ private:
 	{
 		guard(ULinkerLoad::CreateImport);
 
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+		if( GDCLinkerIndexCallback )
+		{
+			INT Chain = Index;
+			while( ImportMap.IsValidIndex(Chain) )
+			{
+				GDCLinkerIndexCallback( Filename, DC_LINKER_Import, Chain );
+				INT Parent = ImportMap(Chain).PackageIndex;
+				if( Parent >= 0 )
+					break;
+				Chain = -Parent - 1;
+			}
+		}
+#endif
+
 		FObjectImport& Import = ImportMap( Index );
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+		if( GDCLinkerIndexCallback && Import.SourceLinker && Import.SourceIndex >= 0 )
+			GDCLinkerIndexCallback( Import.SourceLinker->Filename, DC_LINKER_Export, Import.SourceIndex );
+#endif
 		if( !Import.Object && (LoadFlags & LOAD_KeepImports) )
 		{
 			// If keeping existing imports, try to map to existing object.
@@ -921,7 +1109,14 @@ private:
 		{
 			check(Import.SourceLinker);
 			//debugf( "Imported new %s %s.%s", *Import.ClassName, *Import.ObjectPackage, *Import.ObjectName );
-			Import.Object = Import.SourceLinker->CreateExport( Import.SourceIndex );
+			INT SourceIndex = Import.SourceIndex;
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+			if( Import.SourceLinker->DCCompactExports )
+				SourceIndex = appDCStreamMapExport( Import.SourceLinker->Filename, SourceIndex );
+#endif
+			if( SourceIndex == INDEX_NONE )
+				appErrorf( "DAT omitted imported export: %s original=%d", Import.SourceLinker->Filename, Import.SourceIndex );
+			Import.Object = Import.SourceLinker->CreateExport( SourceIndex );
 		}
 		return Import.Object;
 		unguard;
@@ -969,14 +1164,23 @@ private:
 		guard(IndexToObject);
 		if( Index > 0 )
 		{
-			if( !ExportMap.IsValidIndex( Index-1 ) )
-				appErrorf( LocalizeError("ExportIndex"), Index-1, ExportMap.Num() );			
-			return CreateExport( Index-1 );
+			INT ExportIndex = Index - 1;
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+			if( DCCompactExports )
+				ExportIndex = appDCStreamMapExport( Filename, ExportIndex );
+#endif
+			if( !ExportMap.IsValidIndex(ExportIndex) )
+				appErrorf( "DAT omitted required export: %s original=%d", Filename, Index-1 );
+			return CreateExport( ExportIndex );
 		}
 		else if( Index < 0 )
 		{
 			if( !ImportMap.IsValidIndex( -Index-1 ) )
 				appErrorf( LocalizeError("ImportIndex"), -Index-1, ImportMap.Num() );
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+			if( appDCStreamActive() && !appDCStreamUsesImport(Filename,Summary.ImportCount,-Index-1) )
+				appErrorf( "DAT omitted required import: %s original=%d", Filename, -Index-1 );
+#endif
 			return CreateImport( -Index-1 );
 		}
 		else return NULL;
@@ -1030,6 +1234,11 @@ private:
 
 		NAME_INDEX NameIndex;
 		*this << AR_INDEX(NameIndex);
+
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+		if( Success == 1 && GDCLinkerIndexCallback )
+			GDCLinkerIndexCallback( Filename, DC_LINKER_Name, NameIndex );
+#endif
 
 		if( !NameMap.IsValidIndex(NameIndex) )
 			appErrorf( "Bad name index %i/%i", NameIndex, NameMap.Num() );	

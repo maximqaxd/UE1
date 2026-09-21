@@ -55,6 +55,7 @@
 #include <memory>
 
 #include "Core.h"
+#include "UnDCStream.h"
 
 #ifndef MAX_COMPUTERNAME_LENGTH
 #define MAX_COMPUTERNAME_LENGTH 256
@@ -859,6 +860,13 @@ UBOOL appFindPackageFile( const char* In, const FGuid* Guid, char* Out )
 		return 0;
 
 	// Try file as specified.
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	if( appDCStreamActive() )
+	{
+		// No filesystem probe or loose fallback while replaying a dependency stream.
+		return appDCStreamResolve( In, Out );
+	}
+#endif
 	strcpy( Out, In );
 	if( appFSize( Out ) >= 0 )
 		return 1;

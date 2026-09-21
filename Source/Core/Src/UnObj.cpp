@@ -15,6 +15,110 @@
 // Print debugging info.
 #include "UnLinker.h"
 
+CORE_API FArchiveFileReadCallback GArchiveFileReadCallback = NULL;
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+CORE_API FDCLinkerIndexCallback GDCLinkerIndexCallback = NULL;
+#endif
+
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+// Export creation order, not UObject slot order. Native class registration and
+// recycled object slots differ between the host cooker and the static DC build.
+static TArray<UObject*> GDCLoadedObjects;
+
+CORE_API void appDCQueueLoadedObject( UObject* Object )
+{
+	GDCLoadedObjects.AddItem( Object );
+}
+#endif
+
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+static UBOOL GDCLinkerTablesReleased = 0;
+
+CORE_API void appDCSetLinkerTablesReleased( UBOOL Released )
+{
+	GDCLinkerTablesReleased = Released;
+}
+
+CORE_API void appDCProfileObjects( const char* Phase, UBOOL Detailed )
+{
+	DWORD Objects = 0;
+	DWORD Bodies = 0;
+	DWORD ScriptUsed = 0;
+	DWORD ScriptCapacity = 0;
+	DWORD Defaults = 0;
+	DWORD LinkerTables = 0;
+
+	for( FObjectIterator It; It; ++It )
+	{
+		++Objects;
+		Bodies += It->GetClass()->GetPropertiesSize();
+	}
+	for( TObjectIterator<UStruct> It; It; ++It )
+	{
+		ScriptUsed += It->Script.Num();
+		ScriptCapacity += It->Script.ArrayMax;
+	}
+	for( TObjectIterator<UClass> It; It; ++It )
+	{
+		Defaults += It->Defaults.ArrayMax;
+	}
+	for( TObjectIterator<ULinker> It; It; ++It )
+	{
+		DWORD Tables = It->NameMap.ArrayMax * sizeof(FName)
+			+ It->ImportMap.ArrayMax * sizeof(FObjectImport)
+			+ It->ExportMap.ArrayMax * sizeof(FObjectExport);
+		LinkerTables += Tables;
+		if( Detailed )
+		{
+			debugf( "DCLINKER phase=%s package=%s tables_capacity=%u names=%d imports=%d exports=%d",
+				Phase, It->LinkerRoot ? It->LinkerRoot->GetName() : "None", Tables,
+				It->NameMap.Num(), It->ImportMap.Num(), It->ExportMap.Num() );
+		}
+	}
+	debugf( "DCOBJECTS phase=%s count=%u body_bytes_est=%u script_used=%u script_capacity=%u"
+		" defaults_capacity=%u linker_tables_capacity=%u",
+		Phase, Objects, Bodies, ScriptUsed, ScriptCapacity, Defaults, LinkerTables );
+
+	// Detailed attribution is only emitted at load boundaries, not every tick.
+	// No scratch arrays or retained UObject pointers are needed by the profiler.
+	if( Detailed )
+	{
+		for( TObjectIterator<UPackage> Package; Package; ++Package )
+		{
+			if( Package->GetParent() )
+			{
+				continue;
+			}
+			DWORD Count = 0;
+			DWORD PackageBodies = 0;
+			DWORD PackageScript = 0;
+			DWORD PackageDefaults = 0;
+			for( FObjectIterator It; It; ++It )
+			{
+				UObject* Root = *It;
+				while( Root->GetParent() )
+				{
+					Root = Root->GetParent();
+				}
+				if( Root != *Package )
+				{
+					continue;
+				}
+				++Count;
+				PackageBodies += It->GetClass()->GetPropertiesSize();
+				UStruct* Struct = Cast<UStruct>( *It );
+				UClass* Class = Cast<UClass>( *It );
+				PackageScript += Struct ? Struct->Script.ArrayMax : 0;
+				PackageDefaults += Class ? Class->Defaults.ArrayMax : 0;
+			}
+			debugf( "DCPACKAGE phase=%s package=%s objects=%u body_bytes_est=%u"
+				" script_capacity=%u defaults_capacity=%u",
+				Phase, Package->GetName(), Count, PackageBodies, PackageScript, PackageDefaults );
+		}
+	}
+}
+#endif
+
 /*-----------------------------------------------------------------------------
 	Statics.
 -----------------------------------------------------------------------------*/
@@ -1105,7 +1209,12 @@ void FObjectManager::Init()
 	check(sizeof(SQWORD)==8);
 	check(sizeof(UBOOL)==4);
 	check(sizeof(FLOAT)==4);
+#if defined(PLATFORM_DREAMCAST)
+	// Match the 32-bit double ABI of the KOS single-only C/C++ libraries.
+	static_assert( sizeof(DOUBLE) == 4, "Dreamcast requires -m4-single-only" );
+#else
 	check(sizeof(DOUBLE)==8);
+#endif
 
 	// Development.
 	if( ParseParam(appCmdLine(),"CONFLICTS") )
@@ -1221,6 +1330,112 @@ void FObjectManager::Exit()
 /*-----------------------------------------------------------------------------
 	FObjectManager Tick.
 -----------------------------------------------------------------------------*/
+
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+void FObjectManager::RestartNativeCore( UBOOL LoadedAssets )
+{
+	guard(FObjectManager::RestartNativeCore);
+	if( !Initialized || BeginLoadCount || GIsRunning || GDCLoadedObjects.Num()
+		|| (!LoadedAssets && (Loaders.Num() || !appDCStreamCanResetSession())) )
+	{
+		appErrorf( "Native core restart requires an idle object system" );
+	}
+	const INT NativeCount = appDCValidateNativeClassRegistry();
+	const INT ObjectCount = Objects.Num();
+	for( INT i = 0; i < Objects.Num(); ++i )
+	{
+		if( !LoadedAssets && Objects(i) && (Objects(i)->MainFrame
+			|| (Objects(i)->IsA(UClass::StaticClass) && !(Objects(i)->GetFlags() & RF_Intrinsic))) )
+		{
+			appErrorf( "Native core restart rejects script state: %s", Objects(i)->GetFullName() );
+		}
+	}
+	TArray<const FDCNativeClassRegistration*> Recipes;
+	for( const FDCNativeClassRegistration* Recipe = appDCNativeClassRegistry();
+		Recipe; Recipe = Recipe->Next )
+	{
+		Recipes.AddItem( Recipe );
+	}
+	if( LoadedAssets )
+	{
+		// Detach exports while their classes and names are intact.
+		ResetLoaders( NULL );
+	}
+	// Dispatch while every object's class, names and linker state remain valid.
+	for( INT i = 0; i < Objects.Num(); ++i )
+	{
+		if( Objects(i) )
+		{
+			Objects(i)->ConditionalDestroy();
+			delete Objects(i)->MainFrame;
+			Objects(i)->MainFrame = NULL;
+		}
+	}
+	// Prevent destructors from mutating the table being dismantled.
+	Initialized = 0;
+	GSys = NULL;
+	for( INT i = 0; i < Objects.Num(); ++i )
+	{
+		if( Objects(i) && !(Objects(i)->GetFlags() & RF_Intrinsic) )
+		{
+			delete Objects(i);
+		}
+	}
+	for( INT i = 0; i < Recipes.Num(); ++i )
+	{
+		Recipes(i)->Class->~UClass();
+	}
+	appDCCloseDat();
+	appDCStreamShutdown();
+	Objects.Empty();
+	Available.Empty();
+	Root.Empty();
+	Loaders.Empty();
+	TransientPackage = NULL;
+	AutoRegister = NULL;
+	TempState = NAME_None;
+	TempGroup = NAME_None;
+	TempNum = TempMax = 0;
+	appMemset( ObjHash, 0, sizeof(ObjHash) );
+	FName::ExitSubsystem();
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	GDCLinkerTablesReleased = 0;
+#endif
+	// Static names and config remain owned by the process in this test. This
+	// deliberately does NOT reset a heap arena or promise full name reclamation.
+	for( INT i = 0; i < Recipes.Num(); ++i )
+	{
+		appMemset( Recipes(i)->Class, 0, sizeof(UClass) );
+	}
+	// Reproduce original static construction order before running initializers.
+	for( INT i = Recipes.Num() - 1; i >= 0; --i )
+	{
+		const FDCNativeClassRegistration& Recipe = *Recipes(i);
+		new( (EInternal*)Recipe.Class )UClass(
+			Recipe.Size, Recipe.RecordSize, Recipe.Flags, *Recipe.SuperSlot,
+			FGuid( Recipe.Guid[0], Recipe.Guid[1], Recipe.Guid[2], Recipe.Guid[3] ),
+			Recipe.Name, FName(Recipe.Package), Recipe.Constructor, Recipe.Initializer );
+	}
+	Init();
+	GSys = new USystem;
+	AddToRoot( GSys );
+	if( appDCValidateNativeClassRegistry() != NativeCount )
+	{
+		appErrorf( "Native class count changed across core restart" );
+	}
+	if( !LoadedAssets && Objects.Num() != ObjectCount )
+	{
+		appErrorf( "Native core object count changed: before=%d after=%d", ObjectCount, Objects.Num() );
+	}
+	debugf( "DCNATIVE core_restart_verified classes=%d objects=%d names=%d",
+		NativeCount, Objects.Num(), FName::GetMaxNames() );
+	if( LoadedAssets )
+	{
+		debugf( "DCNATIVE loaded_teardown_verified before=%d after=%d", ObjectCount, Objects.Num() );
+	}
+	unguard;
+}
+#endif
 
 //
 // Mark one unit of passing time. This is used to update the object
@@ -1785,9 +2000,16 @@ UObject* FObjectManager::LoadObject( UClass* ObjectClass, UObject* InParent, con
 		// Create a new linker object which goes off and tries load the file.
 		ULinkerLoad* Linker = NULL;
 		ResolveName( InParent, InName, 1, 1 );
-		if( !(LoadFlags & LOAD_DisallowFiles) )
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+		// A completed DAT session detaches its package linkers to release the
+		// full import/export/name tables. Resolve already-resident objects before
+		// attempting to recreate a linker for a genuinely late dependency.
+		if( GDCLinkerTablesReleased )
+			Result = FindObject( ObjectClass, InParent, InName );
+#endif
+		if( !Result && !(LoadFlags & LOAD_DisallowFiles) )
 			Linker = GetPackageLinker( InParent, Filename, LoadFlags | LOAD_Throw | LOAD_AllowDll, Sandbox, NULL );
-		if( Linker )
+		if( !Result && Linker )
 			Result = Linker->Create( ObjectClass, InName, LoadFlags, 0 );
 		if( !Result )
 			Result = FindObject( ObjectClass, InParent, InName );
@@ -1872,6 +2094,40 @@ UObject* FObjectManager::LoadPackage( UObject* InParent, const char* Filename, D
 void FObjectManager::BeginLoad()
 {
 	guard(FObjectManager::BeginLoad);
+#if defined(DC_RESOURCE_COOKER)
+	// Regression injection: move live UObject slots without changing object
+	// identity, export identity, hash chains or free slots. A recorded stream
+	// must replay even with a different native registration/table order.
+	static UBOOL TestedObjectOrder = 0;
+	if( !TestedObjectOrder && !BeginLoadCount
+		&& ParseParam(appCmdLine(), "DCTESTOBJECTORDER") )
+	{
+		TestedObjectOrder = 1;
+		INT Left = 0;
+		INT Right = Objects.Num() - 1;
+		INT Swaps = 0;
+		while( Left < Right )
+		{
+			if( !Objects(Left) )
+			{
+				++Left;
+				continue;
+			}
+			if( !Objects(Right) )
+			{
+				--Right;
+				continue;
+			}
+			Exchange( Objects(Left), Objects(Right) );
+			Objects(Left)->Index = Left;
+			Objects(Right)->Index = Right;
+			++Left;
+			--Right;
+			++Swaps;
+		}
+		debugf( "DCQUEUE object_order_perturbed swaps=%d", Swaps );
+	}
+#endif
 	if( ++BeginLoadCount == 1 )
 	{
 		// Initiate load.
@@ -1895,6 +2151,20 @@ void FObjectManager::EndLoad()
 			// Finish loading everything.
 			guard(LoadObjects);
 			debugfSlow( NAME_DevLoad, "Loading objects..." );
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+			// UTDC EndLoad (8c16c640): drain the growing export queue. Preload
+			// can append dependencies, so neither cache Num() nor keep references
+			// to array elements across a call that may reallocate it.
+			for( INT i = 0; i < GDCLoadedObjects.Num(); ++i )
+			{
+				UObject* Object = GDCLoadedObjects(i);
+				if( Object->GetFlags() & RF_NeedLoad )
+				{
+					check(Object->GetLinker());
+					Object->GetLinker()->Preload( Object );
+				}
+			}
+#else
 			UBOOL Preloaded;
 			do
 			{
@@ -1909,13 +2179,32 @@ void FObjectManager::EndLoad()
 					}
 				}
 			} while( Preloaded );
+#endif
 			unguard;
 
 			// Postload the objects.
 			guard(PostloadObjects);
 			debugfSlow( NAME_DevLoad, "Linking all objects..." );
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+			for( INT i = 0; i < GDCLoadedObjects.Num(); ++i )
+			{
+				GDCLoadedObjects(i)->ConditionalPostLoad();
+			}
+			GDCLoadedObjects.Empty();
+#if defined(DC_RESOURCE_COOKER)
+			// Detect exports omitted from the queue, not just matching read CRCs.
+			for( FObjectIterator It; It; ++It )
+			{
+				if( It->GetFlags() & (RF_NeedLoad | RF_NeedPostLoad) )
+				{
+					appErrorf( "Export queue left unfinished object: %s", It->GetFullName() );
+				}
+			}
+#endif
+#else
 			for( FObjectIterator It; It; ++It )
 				It->ConditionalPostLoad();
+#endif
 			unguard;
 
 			// Dissociate all linker object imports, since they may be destroyed,
@@ -2277,6 +2566,15 @@ UBOOL FObjectManager::SavePackage( UObject* InParent, UObject* Base, DWORD TopLe
 			{
 				check(Export._Object->GetParent()->IsIn(InParent));
 				Export.PackageIndex = Linker->ObjectIndices(Export._Object->GetParent()->GetIndex());
+#if defined(DC_RESOURCE_COOKER)
+				if( Export.PackageIndex <= 0 )
+				{
+					printf( "COOKSAVE missing parent: object=%s parent=%s flags=%08x\n",
+						Export._Object->GetFullName(), Export._Object->GetParent()->GetFullName(),
+						Export._Object->GetParent()->GetFlags() );
+					fflush( stdout );
+				}
+#endif
 				check(Export.PackageIndex>0);
 			}
 
@@ -2530,6 +2828,9 @@ UObject* FObjectManager::AllocateObject
 	INT Index     = INDEX_NONE;
 	INT ClassSize = 0;
 	void (*Constructor)(void*) = NULL;
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	void (*NativeClassInitializer)(UClass*) = NULL;
+#endif
 	DWORD ClassFlags = 0;
 	if( !Obj )
 	{
@@ -2548,6 +2849,12 @@ UObject* FObjectManager::AllocateObject
 		if( Obj->IsA( UClass::StaticClass ) )
 		{
 			Constructor = ((UClass*)Obj)->Constructor;
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+			if( Obj->GetFlags() & RF_Intrinsic )
+			{
+				NativeClassInitializer = ((UClass*)Obj)->ClassInitializer;
+			}
+#endif
 			ClassFlags  = ((UClass*)Obj)->ClassFlags & CLASS_Abstract;
 		}
 		Index = Obj->Index;
@@ -2592,6 +2899,10 @@ UObject* FObjectManager::AllocateObject
 	if( Obj->IsA( UClass::StaticClass ) )
 	{
 		((UClass*)Obj)->Constructor  = Constructor;
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+		// Package replacement must not erase the native restart callback.
+		((UClass*)Obj)->ClassInitializer = NativeClassInitializer;
+#endif
 		((UClass*)Obj)->ClassFlags  |= ClassFlags;
 	}
 

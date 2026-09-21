@@ -81,6 +81,12 @@ public:
 	UBOOL Exec( const char* Cmd, FOutputDevice* Out=GSystem );
 	void Status( char* Msg );
 	INT GetTime() {return Time;}
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	INT GetDCAllocatedBytes() const
+	{
+		return Initialized ? MemTotal + ItemsTotal * sizeof(FCacheItem) + CACHE_LINE_SIZE - 1 : 0;
+	}
+#endif
 
 	// FMemCache inlines.
 	DWORD GHash( DWORD Val )
