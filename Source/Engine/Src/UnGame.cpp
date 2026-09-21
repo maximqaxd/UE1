@@ -21,6 +21,33 @@ extern CORE_API void appDCSetLinkerTablesReleased( UBOOL Released );
 
 static UBOOL GDCGameLinkersReleased = 0;
 
+static void DCDiscardNonMoverPolys( ULevel* Level )
+{
+	for( TObjectIterator<UModel> It; It; ++It )
+	{
+		if( !It->Polys || !It->Polys->Num() )
+		{
+			continue;
+		}
+
+		UBOOL UsedByMover = 0;
+		for( INT ActorIndex = 0; ActorIndex < Level->Num(); ++ActorIndex )
+		{
+			AActor* Owner = Level->Actors(ActorIndex);
+			if( Owner && Owner->IsMovingBrush() && Owner->Brush == *It )
+			{
+				UsedByMover = 1;
+				break;
+			}
+		}
+		if( !UsedByMover )
+		{
+			It->Polys->Empty();
+			It->Polys = NULL;
+		}
+	}
+}
+
 static void DCReleaseGameLinkers( const char* Phase )
 {
 	if( GDCGameLinkersReleased )
@@ -918,12 +945,18 @@ ULevel* UGameEngine::LoadMap( const FURL& URL, UPendingLevel* Pending, char* Err
 	guard(Cleanup);
 	Flush();
 	GObj.CollectGarbage( GSystem, RF_Intrinsic );
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	// Dynamic BSP needs source polygons only for moving brushes. The brush
+	// tracker discarded all other polygon databases later, after GameInfo had
+	// already caused a second export wave. Discard them before that peak.
+	DCDiscardNonMoverPolys( GLevel );
+	GObj.CollectGarbage( GSystem, RF_Intrinsic );
+#endif
 	unguard;
 
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
-	// The final session map has completed preload/postload here. Detach package
-	// tables before moving-brush reserves and BeginPlay allocations. A normal
-	// boot excludes Entry; a direct restarted session has no Entry level.
+	// The final session map and all mover source polygons are resident. Detach
+	// package tables before GameInfo dependencies and BeginPlay allocations.
 	if( GEntry
 		&& !Pending
 		&& !GLevel->NetDriver
@@ -996,7 +1029,6 @@ ULevel* UGameEngine::LoadMap( const FURL& URL, UPendingLevel* Pending, char* Err
 		check(Info->Game!=NULL);
 	}
 	unguard;
-
 	// Listen for clients.
 	guard(Listen);
 	if( !Client || URL.HasOption("Listen") )
