@@ -40,8 +40,7 @@ const char* FTextureConverter::Blacklist[] =
 	"GenWarp.gw_rusty",
 	"GenWarp.gw_calcium",
 	"GenWarp.gw_algae",
-	"HubEffects.Lavab",
-	"UnrealI.MenuGfx.*"
+	"HubEffects.Lavab"
 };
 
 UBOOL FTextureConverter::IsBlacklisted( UTexture* Texture )
