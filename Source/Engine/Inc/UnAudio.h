@@ -56,6 +56,10 @@ class ENGINE_API USound : public UObject
 	void*				Handle;
 	static UAudioSubsystem* Audio;
 	UBOOL				Looping;
+#if defined(PLATFORM_DREAMCAST)
+	DWORD                   DCLoopStart;
+	DWORD                   DCLoopEnd;
+#endif
 
 	// Constructor.
 

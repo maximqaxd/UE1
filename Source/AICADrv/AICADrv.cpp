@@ -91,8 +91,8 @@ void UAICAAudioSubsystem::Destroy()
 	// Stop all voices
 	SetViewport( NULL );
 
-	// Unload all sounds
-	// Note: AudioEngine doesn't have a global cleanup, individual streams are cleaned up
+	// Join the worker before any session-owned sample memory can be destroyed.
+	AudioEngine_Shutdown();
 
 	Initialized = false;
 
@@ -189,6 +189,30 @@ void UAICAAudioSubsystem::RegisterSound( USound* Sound )
 	}
 
 	// Calculate total samples to determine if we need streaming
+	_WORD FormatTag = 0;
+	appMemcpy( &FormatTag, (BYTE*)WaveInfo.pChannels - sizeof(_WORD), sizeof(FormatTag) );
+	if( *WaveInfo.pBitsPerSample == 4 && FormatTag != 0x14 && FormatTag != 0x20 )
+	{
+		debugf( NAME_Warning, "Unsupported ADPCM codec for %s", Sound->GetPathName() );
+		return;
+	}
+
+	DWORD ExactSamples = 0;
+	for( INT Offset = 12; Offset <= Sound->Data.Num() - 8; )
+	{
+		DWORD Size = 0;
+		appMemcpy( &Size, &Sound->Data(Offset + 4), sizeof(Size) );
+		if( Size > (DWORD)(Sound->Data.Num() - Offset - 8) )
+		{
+			return;
+		}
+		if( !appMemcmp( &Sound->Data(Offset), "fact", 4 ) && Size >= 4 )
+		{
+			appMemcpy( &ExactSamples, &Sound->Data(Offset + 8), sizeof(ExactSamples) );
+		}
+		Offset += 8 + Size + (Size & 1);
+	}
+
 	int total_samples;
 	if( *WaveInfo.pBitsPerSample == 4 )
 		total_samples = WaveInfo.SampleDataSize * 2;
@@ -198,6 +222,36 @@ void UAICAAudioSubsystem::RegisterSound( USound* Sound )
 		total_samples = WaveInfo.SampleDataSize / 2;
 	else
 		total_samples = (int)((float)WaveInfo.SampleDataSize / (((float)*WaveInfo.pBitsPerSample / 8) * (float)*WaveInfo.pChannels));
+	if( *WaveInfo.pChannels <= 0 )
+	{
+		return;
+	}
+	if( *WaveInfo.pBitsPerSample == 4 || *WaveInfo.pBitsPerSample == 8 || *WaveInfo.pBitsPerSample == 16 )
+	{
+		total_samples /= *WaveInfo.pChannels;
+	}
+	if( ExactSamples && ExactSamples <= (DWORD)total_samples )
+	{
+		total_samples = ExactSamples;
+	}
+
+	Sound->DCLoopStart = 0;
+	Sound->DCLoopEnd = total_samples;
+	if( WaveInfo.SampleLoopsNum )
+	{
+		FSampleLoop Loop;
+		if( !WaveInfo.pSampleLoop || (BYTE*)WaveInfo.pSampleLoop + sizeof(Loop) > &Sound->Data(0) + Sound->Data.Num() )
+		{
+			return;
+		}
+		appMemcpy( &Loop, WaveInfo.pSampleLoop, sizeof(Loop) );
+		if( Loop.dwStart > Loop.dwEnd || Loop.dwEnd >= (DWORD)total_samples )
+		{
+			return;
+		}
+		Sound->DCLoopStart = Loop.dwStart;
+		Sound->DCLoopEnd = Loop.dwEnd + 1;
+	}
 
 	// For large sounds, pass full WAV data for in-memory streaming
 	const uint8_t* full_wav_data = nullptr;
@@ -214,9 +268,10 @@ void UAICAAudioSubsystem::RegisterSound( USound* Sound )
 		*WaveInfo.pSamplesPerSec,
 		*WaveInfo.pChannels,
 		*WaveInfo.pBitsPerSample,
-		Sound->GetName(),
+		Sound->GetPathName(),
 		full_wav_data,
-		full_wav_size
+		full_wav_size,
+		ExactSamples
 	);
 	if( StreamId < 0 )
 	{
@@ -224,7 +279,8 @@ void UAICAAudioSubsystem::RegisterSound( USound* Sound )
 		return;
 	}
 
-	Sound->Handle = (void*)(DWORD)StreamId;
+	// Zero is a valid stream index; reserve NULL for an unregistered sound.
+	Sound->Handle = (void*)(DWORD)(StreamId + 1);
 	Sound->Looping = ( WaveInfo.SampleLoopsNum != 0 );
 
 	// Only free data for small sounds (SFX). Large sounds need to keep data for streaming.
@@ -241,7 +297,7 @@ void UAICAAudioSubsystem::UnregisterSound( USound* Sound )
 	if( !Sound->Handle )
 		return;
 
-	INT StreamId = (INT)(DWORD)Sound->Handle;
+	INT StreamId = (INT)(DWORD)Sound->Handle - 1;
 
 	// Stop any voices using this sound
 	for( INT i = 0; i < MAX_SOURCES; ++i )
@@ -402,7 +458,7 @@ UBOOL UAICAAudioSubsystem::PlaySound( AActor* Actor, INT Id, USound* Sound, FVec
 	if( !Voice || !Sound || !Sound->Handle )
 		return false;
 
-	INT StreamId = (INT)(DWORD)Sound->Handle;
+	INT StreamId = (INT)(DWORD)Sound->Handle - 1;
 
 	Voice->Id = Id;
 	Voice->StreamId = StreamId;
@@ -423,7 +479,7 @@ UBOOL UAICAAudioSubsystem::PlaySound( AActor* Actor, INT Id, USound* Sound, FVec
 	// Play the sound
 	// For mono sounds, AICA uses a single pan value: 0=left, 128=center, 255=right
 	// Pass the same pan value for both left and right (AudioEngine will average it for mono)
-	AudioEngine_Play( StreamId, VolumeByte, Pan, Pan, Voice->Looping, 0 );
+	AudioEngine_Play( StreamId, VolumeByte, Pan, Pan, Voice->Looping, Sound->DCLoopStart, Sound->DCLoopEnd );
 
 	return true;
 
@@ -659,4 +715,3 @@ void UAICAAudioSubsystem::ClearMusicBuffers()
 
 	unguard;
 }
-

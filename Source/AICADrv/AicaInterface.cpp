@@ -2,7 +2,17 @@
 
 #include "AicaInterface.h"
 
-int aica_play_chn(int chn, int size, uint32_t aica_buffer, int fmt, int vol, int pan, int loop, int freq) {
+int aica_play_chn(
+	int chn,
+	int size,
+	uint32_t aica_buffer,
+	int fmt,
+	int vol,
+	int pan,
+	int loop,
+	int freq,
+	uint32_t loop_start )
+{
 	// assert(size <= 65534);
 	// We gotta fix this at some point
 	if (size >= 65535) {
@@ -20,7 +30,7 @@ int aica_play_chn(int chn, int size, uint32_t aica_buffer, int fmt, int vol, int
     chan->type = fmt;
     chan->length = size;
     chan->loop = loop;
-    chan->loopstart = 0;
+    chan->loopstart = loop_start;
     chan->loopend = size;
     chan->freq = freq;
     chan->vol = vol;

@@ -19,6 +19,7 @@
 #include <assert.h>
 #include <thread>
 #include <mutex>
+#include <atomic>
 
 #include "AicaInterface.h"
 #include "AudioEngine.h"
@@ -30,9 +31,98 @@ static uint8_t sfx_buffer[AICA_MAX_SAMPLES * 2];
 static volatile uint32_t ticks;
 static bool arm_program_loaded = false;
 static int current_playing_music = -1;  // Currently playing music ID
+static bool audio_resources_owned = false;
+static std::atomic<bool> audio_worker_running(false);
+
+extern "C" uint32_t AICA_GetSampleBytes()
+{
+	uint32_t Total = 0;
+	for( int i = 0; i < AUDIO_ENGINE_MAX_STREAMS; ++i )
+	{
+		for( int side = 0; side < 2; ++side )
+		{
+			if( streams[i].aica_buffers[side] )
+				Total += STREAM_CHANNEL_BUFFER_SIZE;
+		}
+	}
+	for( int i = 0; i < AUDIO_ENGINE_MAX_SFX; ++i )
+	{
+		if( sfx[i].aica_buffer && sfx[i].nSfx >= 0 )
+		{
+			int Bits = sfx[i].type == AICA_SM_16BIT ? 16 : sfx[i].type == AICA_SM_8BIT ? 8 : 4;
+			Total += (sfx[i].total_samples * Bits + 7) / 8;
+		}
+	}
+	return Total;
+}
 
 std::mutex channel_mtx;
 std::thread snd_thread;
+
+void AudioEngine_Shutdown(void)
+{
+	// Never hold channel_mtx while joining: the worker needs it to finish.
+	audio_worker_running.store(false);
+	if( snd_thread.joinable() )
+		snd_thread.join();
+	if( !audio_resources_owned )
+		return;
+
+	// No worker can read game memory, submit SQ transfers, or touch the AICA
+	// allocations after this point. Stop every channel before releasing RAM.
+	for( int i = 0; i < AUDIO_ENGINE_MAX_STREAMS; ++i )
+	{
+		for( int side = 0; side < 2; ++side )
+		{
+			if( streams[i].mapped_ch[side] >= 0 )
+			{
+				aica_stop_chn(streams[i].mapped_ch[side]);
+				snd_sfx_chn_free(streams[i].mapped_ch[side]);
+				streams[i].mapped_ch[side] = -1;
+			}
+		}
+	}
+	for( int i = 0; i < AUDIO_ENGINE_MAX_CHANNELS; ++i )
+	{
+		if( sfx_channels[i].mapped_ch >= 0 )
+		{
+			aica_stop_chn(sfx_channels[i].mapped_ch);
+			snd_sfx_chn_free(sfx_channels[i].mapped_ch);
+		}
+		sfx_channels[i].mapped_ch = -1;
+		sfx_channels[i].sfx_index = -1;
+	}
+	// STOP packets are queued, not acknowledgements. Disable the sound CPU
+	// before freeing samples so no queued command can reuse old addresses.
+	spu_disable();
+	for( int i = 0; i < AUDIO_ENGINE_MAX_STREAMS; ++i )
+	{
+		for( int side = 0; side < 2; ++side )
+		{
+			if( streams[i].aica_buffers[side] )
+				snd_mem_free(streams[i].aica_buffers[side]);
+			streams[i].aica_buffers[side] = 0;
+		}
+		if( streams[i].fd >= 0 )
+			fs_close(streams[i].fd);
+		streams[i].fd = -1;
+		streams[i].playing = false;
+		streams[i].mem_data = nullptr;
+		streams[i].mem_size = streams[i].mem_offset = 0;
+		streams[i].is_memory = false;
+	}
+	for( int i = 0; i < AUDIO_ENGINE_MAX_SFX; ++i )
+	{
+		if( sfx[i].aica_buffer )
+			snd_mem_free(sfx[i].aica_buffer);
+		sfx[i].aica_buffer = 0;
+		sfx[i].nSfx = -1;
+	}
+	current_playing_music = -1;
+	snd_shutdown();
+	audio_resources_owned = false;
+	debugf("DCAUDIO shutdown worker_joined=1 sample_bytes=%u\n", AICA_GetSampleBytes());
+}
  
 static void StreamRead(int nStream, void* buf, uint32_t size) {
 	if(streams[nStream].is_memory) {
@@ -71,19 +161,37 @@ void AudioEngine_LoadFirstChunk(int nStream) {
 
 bool AudioEngine_Initialise(void)
 {
+	if( audio_resources_owned || snd_thread.joinable() )
+		AudioEngine_Shutdown();
 	auto init = snd_init();
-	assert(init >= 0);
+	if( init < 0 )
+		return false;
 	ticks = 0;
+	memset(streams, 0, sizeof(streams));
+	memset(sfx, 0, sizeof(sfx));
+	for( int i = 0; i < AUDIO_ENGINE_MAX_STREAMS; ++i )
+	{
+		streams[i].fd = -1;
+		streams[i].mapped_ch[0] = streams[i].mapped_ch[1] = -1;
+	}
+	for( int i = 0; i < AUDIO_ENGINE_MAX_CHANNELS; ++i )
+	{
+		sfx_channels[i].mapped_ch = -1;
+		sfx_channels[i].sfx_index = -1;
+	}
+	audio_resources_owned = true;
 
 	for (int i = 0; i< AUDIO_ENGINE_MAX_STREAMS; i++) {
 		streams[i].mapped_ch[0] = snd_sfx_chn_alloc();
 		streams[i].mapped_ch[1] = snd_sfx_chn_alloc();
 		streams[i].aica_buffers[0] = snd_mem_malloc(STREAM_CHANNEL_BUFFER_SIZE);
 		streams[i].aica_buffers[1] = snd_mem_malloc(STREAM_CHANNEL_BUFFER_SIZE);
-		debugf("Stream %d mapped to: %d, %d\n", i, streams[i].mapped_ch[0], streams[i].mapped_ch[1]);
-		debugf("Stream %d buffers: %p, %p\n", i, (void*)streams[i].aica_buffers[0], (void*)streams[i].aica_buffers[1]);
-		assert(streams[i].mapped_ch[0] != -1);
-		assert(streams[i].mapped_ch[1] != -1);
+		if( streams[i].mapped_ch[0] < 0 || streams[i].mapped_ch[1] < 0
+			|| !streams[i].aica_buffers[0] || !streams[i].aica_buffers[1] )
+		{
+			AudioEngine_Shutdown();
+			return false;
+		}
 		streams[i].fd = -1;
 		 streams[i].is_memory = false;
 		 streams[i].mem_data = nullptr;
@@ -98,8 +206,11 @@ bool AudioEngine_Initialise(void)
 
 	for (int i = 0; i < (AUDIO_ENGINE_MAX_CHANNELS); i++) {
 		sfx_channels[i].mapped_ch = snd_sfx_chn_alloc();   
-		debugf("SFX Channel %d mapped to %d\n", i, sfx_channels[i].mapped_ch);
-		assert(sfx_channels[i].mapped_ch != -1);
+		if( sfx_channels[i].mapped_ch < 0 )
+		{
+			AudioEngine_Shutdown();
+			return false;
+		}
 		sfx_channels[i].last_tick = ticks;
 		sfx_channels[i].sfx_index = -1;
 	}
@@ -119,8 +230,11 @@ bool AudioEngine_Initialise(void)
 	}
 
 	
+	audio_worker_running.store(true);
+	try
+	{
 	snd_thread = std::thread([]() {
-		for(;;) {
+		while( audio_worker_running.load() ) {
 			{
 				std::lock_guard<std::mutex> lk(channel_mtx);
 				for (int i = 0; i < AUDIO_ENGINE_MAX_CHANNELS; i++) {
@@ -239,6 +353,8 @@ bool AudioEngine_Initialise(void)
 							}
 							else {
 								debugf("Auto looping stream: %d -> {%d, %d}, %d total\n", i, streams[i].mapped_ch[0], streams[i].mapped_ch[1], streams[i].total_samples);
+								aica_stop_chn(streams[i].mapped_ch[0]);
+								aica_stop_chn(streams[i].mapped_ch[1]);
 							 if(streams[i].is_memory) {
 								 streams[i].mem_offset = streams[i].loop_offset;
 							 } else {
@@ -247,6 +363,18 @@ bool AudioEngine_Initialise(void)
 								streams[i].played_samples = 0;
 								AudioEngine_LoadFirstChunk(i);
 								streams[i].next_is_upper_half = true;
+								streams[i].first_refill = true;
+								// Restart the hardware decoder too: rewinding encoded
+								// bytes without resetting its predictor corrupts ADPCM.
+								aica_play_chn(streams[i].mapped_ch[0], STREAM_CHANNEL_SAMPLE_COUNT,
+									streams[i].aica_buffers[0], streams[i].type, streams[i].vol,
+									streams[i].pan[0], 1, streams[i].rate);
+								if( streams[i].stereo )
+								{
+									aica_play_chn(streams[i].mapped_ch[1], STREAM_CHANNEL_SAMPLE_COUNT,
+										streams[i].aica_buffers[1], streams[i].type, streams[i].vol,
+										streams[i].pan[1], 1, streams[i].rate);
+								}
 								do_read = 0;
 							}
 						}
@@ -268,7 +396,12 @@ bool AudioEngine_Initialise(void)
 			thd_sleep(50);
 		}
 	});
-
+	}
+	catch( ... )
+	{
+		AudioEngine_Shutdown();
+		return false;
+	}
 	return true;
 }
 
@@ -316,6 +449,9 @@ int AudioEngine_Stop(int nStream) {
 }
 
 int AudioEngine_Unload(int nStream) {
+	std::lock_guard<std::mutex> lock(channel_mtx);
+	if( nStream < 0 || nStream >= AUDIO_ENGINE_MAX_STREAMS + AUDIO_ENGINE_MAX_SFX )
+		return -1;
 	if(nStream < AUDIO_ENGINE_MAX_STREAMS) {
 		debugf("Stopping Stream: %d\n", nStream);
 
@@ -338,17 +474,22 @@ int AudioEngine_Unload(int nStream) {
 		nStream -= AUDIO_ENGINE_MAX_STREAMS; // SFX OFFSET
 		assert(nStream < AUDIO_ENGINE_MAX_SFX);
 
-		int sfx_channel = getSfxChannelIndex(nStream);
-		assert(sfx_channel > -1);
-
 		if(sfx[nStream].nSfx == -1) {
 			return 0;
 		}
 
-		aica_stop_chn(sfx_channels[sfx_channel].mapped_ch);
-		sfx_channels[sfx_channel].sfx_index = -1; // Unmap AICA Channel -> SFX
+		// A cached sound need not currently have a playing channel.
+		for( int i = 0; i < AUDIO_ENGINE_MAX_CHANNELS; ++i )
+		{
+			if( sfx_channels[i].sfx_index == nStream )
+			{
+				aica_stop_chn(sfx_channels[i].mapped_ch);
+				sfx_channels[i].sfx_index = -1;
+			}
+		}
 
 		snd_mem_free(sfx[nStream].aica_buffer);  // Release SRAM buffer
+		sfx[nStream].aica_buffer = 0;
 		sfx[nStream].nSfx = -1; // Release SFX
 	}
 
@@ -385,11 +526,9 @@ int AudioEngine_GetOpenStreamIndex(const char * fname, file_t fd) {
 }
 
 int AudioEngine_GetOpenSFXIndex(const char * fname) {
-	uint32_t last_tick = sfx[0].last_tick;
 	// 1. Check for Duplicate File Name
-	size_t fileNameLength = std::min(strlen(fname), (size_t)128);
     for(int i = 0; i < AUDIO_ENGINE_MAX_SFX; i++) {
-        if (strncmp(fname, sfx[i].fname, fileNameLength) == 0){
+        if (sfx[i].nSfx != -1 && strcmp(fname, sfx[i].fname) == 0){
 			debugf("AudioEngine: File Already In SFX Cache! %i, %s, %s\n", i, fname, sfx[i].fname);
             return i;
         }
@@ -400,16 +539,10 @@ int AudioEngine_GetOpenSFXIndex(const char * fname) {
             return i;
         }
     }
-	// 3. Force Close The Stream Which Was Accessed The Least Recently
-	int index = 0;
-    for(int i = 0; i < AUDIO_ENGINE_MAX_SFX; i++) {
-        if(sfx[i].last_tick < last_tick) {
-            index = i;
-			last_tick = sfx[i].last_tick;
-        }
-    }
-
-	return AudioEngine_Unload(index + AUDIO_ENGINE_MAX_STREAMS);
+	// USound owns this slot until UnregisterSound. Reusing it here leaves
+	// the original sound with a stale handle to an unrelated sample.
+	debugf("AudioEngine: all registered SFX slots are occupied\n");
+	return -1;
 }
 
 bool AudioEngine_ParseWaveHeader(file_t fd, WavHeader * hdr) {
@@ -564,7 +697,16 @@ int AudioEngine_Load(const char * fname, uint32_t seek_bytes_aligned)
     }    
 }
 
-int AudioEngine_LoadFromWaveInfo(const uint8_t * sample_data, uint32_t sample_size, int sample_rate, int channels, int bits_per_sample, const char * name, const uint8_t * full_wav_data, uint32_t full_wav_size)
+int AudioEngine_LoadFromWaveInfo(
+	const uint8_t* sample_data,
+	uint32_t sample_size,
+	int sample_rate,
+	int channels,
+	int bits_per_sample,
+	const char* name,
+	const uint8_t* full_wav_data,
+	uint32_t full_wav_size,
+	uint32_t sample_count )
 {
 	if(!sample_data || sample_size == 0) {
 		return -1;
@@ -596,6 +738,20 @@ int AudioEngine_LoadFromWaveInfo(const uint8_t * sample_data, uint32_t sample_si
 		total_samples = (int)((float)sample_size / (((float)bits_per_sample / 8) * (float)channels));
 	}
 
+	if( channels < 1 || channels > 2 )
+	{
+		return -1;
+	}
+	total_samples /= channels;
+	if( sample_count )
+	{
+		if( sample_count > (uint32_t)total_samples )
+		{
+			return -1;
+		}
+		total_samples = sample_count;
+	}
+
 	// Handle large sounds with in-memory streaming
     if(total_samples > AICA_MAX_SAMPLES)
 	{
@@ -617,40 +773,14 @@ int AudioEngine_LoadFromWaveInfo(const uint8_t * sample_data, uint32_t sample_si
 			}
 		}
 		if(nStream < 0) {
-			// Find LRU stream
-			uint32_t last_tick = streams[0].last_tick;
-			nStream = 0;
-			for(int i = 0; i < AUDIO_ENGINE_MAX_STREAMS; i++) {
-				if(streams[i].last_tick < last_tick) {
-					nStream = i;
-					last_tick = streams[i].last_tick;
-				}
-			}
-			// Stop and unload the LRU stream
-			if(streams[nStream].playing) {
-				aica_stop_chn(streams[nStream].mapped_ch[0]);
-				aica_stop_chn(streams[nStream].mapped_ch[1]);
-				streams[nStream].playing = false;
-			}
-			if(streams[nStream].is_memory) {
-				// Memory stream - just clear it
-				streams[nStream].mem_data = nullptr;
-			} else if(streams[nStream].fd >= 0) {
-				fs_close(streams[nStream].fd);
-			}
+			debugf("AudioEngine: all registered memory-stream slots are occupied\n");
+			return -1;
 		}
 
-		// Parse WAV header to find data chunk offset
-		uint32_t data_offset = 0;
-		for(uint32_t i = 0; i < full_wav_size - 8; i++) {
-			if(full_wav_data[i] == 'd' && full_wav_data[i+1] == 'a' && 
-			   full_wav_data[i+2] == 't' && full_wav_data[i+3] == 'a') {
-				data_offset = i + 8; // Skip "data" and size
-				break;
-			}
-		}
-		if(data_offset == 0) {
-			debugf("AudioEngine_LoadFromWaveInfo: Could not find data chunk in WAV for %s\n", name);
+		// Use the already validated data span, not a bytewise RIFF tag search.
+		if( sample_data < full_wav_data || sample_data - full_wav_data > full_wav_size
+			|| sample_size > full_wav_size - (sample_data - full_wav_data) )
+		{
 			return -1;
 		}
 
@@ -658,7 +788,7 @@ int AudioEngine_LoadFromWaveInfo(const uint8_t * sample_data, uint32_t sample_si
 		strncpy(streams[nStream].fname, name, 127);
 		streams[nStream].fname[127] = '\0';
 		streams[nStream].is_memory = true;
-		streams[nStream].mem_data = full_wav_data + data_offset;
+		streams[nStream].mem_data = sample_data;
 		streams[nStream].mem_size = sample_size;
 		streams[nStream].mem_offset = 0;
 		streams[nStream].fd = -1;
@@ -745,7 +875,8 @@ int AudioEngine_LoadFromWaveInfo(const uint8_t * sample_data, uint32_t sample_si
 		return -1;
 	}
 	
-	sfx[nStream].aica_buffer = snd_mem_malloc(sample_size); 
+	uint32_t upload_size = (sample_size + 31u) & ~31u;
+	sfx[nStream].aica_buffer = snd_mem_malloc(upload_size);
 	if(sfx[nStream].aica_buffer == 0) {
 		debugf("AudioEngine_LoadFromWaveInfo: Failed to allocate AICA buffer for %s (size=%d) - out of sound RAM!\n", name, sample_size);
 		sfx[nStream].nSfx = -1; // Mark as free
@@ -754,7 +885,7 @@ int AudioEngine_LoadFromWaveInfo(const uint8_t * sample_data, uint32_t sample_si
 	
 	// Copy sample data directly from memory
 	// Ensure we don't overflow sfx_buffer
-	if(sample_size > sizeof(sfx_buffer)) {
+	if(upload_size > sizeof(sfx_buffer)) {
 		debugf("AudioEngine_LoadFromWaveInfo: Sample size %d exceeds buffer size %d for %s\n", sample_size, sizeof(sfx_buffer), name);
 		snd_mem_free(sfx[nStream].aica_buffer);
 		sfx[nStream].aica_buffer = 0;
@@ -785,7 +916,8 @@ int AudioEngine_LoadFromWaveInfo(const uint8_t * sample_data, uint32_t sample_si
 		memcpy(sfx_buffer, sample_data, sample_size);
 	}
 	
-	spu_memload_sq(sfx[nStream].aica_buffer, sfx_buffer, sample_size);
+	memset(sfx_buffer + sample_size, 0, upload_size - sample_size);
+	spu_memload_sq(sfx[nStream].aica_buffer, sfx_buffer, upload_size);
 
     return nStream + AUDIO_ENGINE_MAX_STREAMS; // Offset for SFX
 }
@@ -817,7 +949,14 @@ int getOpenSfxChannel() {
 	 return index;
 }
 
-void AudioEngine_Play(int nStream, uint8_t volume, uint8_t panl, uint8_t panr, bool loop, uint32_t loop_offset)
+void AudioEngine_Play(
+	int nStream,
+	uint8_t volume,
+	uint8_t panl,
+	uint8_t panr,
+	bool loop,
+	uint32_t loop_offset,
+	uint32_t loop_end )
 {
     if(nStream < AUDIO_ENGINE_MAX_STREAMS) {
         std::lock_guard<std::mutex> lk(channel_mtx);
@@ -826,11 +965,24 @@ void AudioEngine_Play(int nStream, uint8_t volume, uint8_t panl, uint8_t panr, b
         }
 
         streams[nStream].vol = volume;
-		streams[nStream].pan[0] = (streams[nStream].stereo) ? panl : ((panl + panr) >> 2);
+		streams[nStream].pan[0] = (streams[nStream].stereo) ? panl : ((panl + panr) >> 1);
 		streams[nStream].pan[1] = panr;
 
 		streams[nStream].loop = loop;
+		if( streams[nStream].is_memory && loop && loop_offset )
+		{
+			debugf("AudioEngine: nonzero long ADPCM loop start is unsupported\n");
+			return;
+		}
 		streams[nStream].loop_offset = loop_offset;
+		if( streams[nStream].is_memory )
+		{
+			streams[nStream].mem_offset = 0;
+			streams[nStream].played_samples = 0;
+			streams[nStream].next_is_upper_half = true;
+			streams[nStream].first_refill = true;
+			AudioEngine_LoadFirstChunk(nStream);
+		}
 
 
 		streams[nStream].last_tick = ticks;
@@ -872,9 +1024,9 @@ void AudioEngine_Play(int nStream, uint8_t volume, uint8_t panl, uint8_t panr, b
 		sfx[nStream].last_tick = ticks;
 		sfx[nStream].loop = loop;
 		sfx[nStream].loop_offset = loop_offset;
-		sfx[nStream].pan = (panl + panr) >> 2;
+		sfx[nStream].pan = (panl + panr) >> 1;
 		 sfx[nStream].has_offset = false; // Reset for new playback
-		 sfx[nStream].in_hnd_loop = false; // Reset loop state
+		 sfx[nStream].in_hnd_loop = loop; // Hardware owns short-sample looping.
 
 		 // Check if this SFX is already playing on a channel
 		 int sfx_channel = getSfxChannelIndex(nStream);
@@ -894,13 +1046,14 @@ void AudioEngine_Play(int nStream, uint8_t volume, uint8_t panl, uint8_t panr, b
 
         aica_play_chn(
             sfx_channels[sfx_channel].mapped_ch,
-            sfx[nStream].total_samples,
+            loop && loop_end ? loop_end : sfx[nStream].total_samples,
             sfx[nStream].aica_buffer,
-            sfx[nStream].type,
+            sfx[nStream].type == AICA_SM_ADPCM_LS ? AICA_SM_ADPCM : sfx[nStream].type,
             sfx[nStream].vol,
             sfx[nStream].pan, // PAN
-            0,
-            sfx[nStream].rate
+            loop,
+            sfx[nStream].rate,
+            loop_offset
         );    
     }
 }
@@ -930,4 +1083,3 @@ struct stream_info * AudioEngine_getStreamInfo(int nStream) {
 	 
 	 return sfx_channels[sfx_channel].mapped_ch;
  }
-

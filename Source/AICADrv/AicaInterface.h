@@ -16,7 +16,16 @@
 #define AICA_PAN_CENTER 128
 #define AICA_PAN_RIGHT 255
 
-int aica_play_chn(int chn, int size, uint32_t aica_buffer, int fmt, int vol, int pan, int loop, int freq);
+int aica_play_chn(
+	int chn,
+	int size,
+	uint32_t aica_buffer,
+	int fmt,
+	int vol,
+	int pan,
+	int loop,
+	int freq,
+	uint32_t loop_start = 0 );
 void aica_stop_chn(int chn);
 void aica_volpan_chn(int chn, int vol, int pan);
 void aica_snd_sfx_volume(int chn, int vol);

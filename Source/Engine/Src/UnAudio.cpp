@@ -36,6 +36,13 @@ void USound::Serialize( FArchive& Ar )
 			DWORD FreqThreshold = 11050;
 
 			// Reduce sound frequency and/or bit depth if required.
+#if defined(PLATFORM_DREAMCAST)
+			if( FileType == FName("dca") )
+			{
+				Force8Bit = 0;
+				ForceHalve = 0;
+			}
+#endif
 			if( Force8Bit || ForceHalve )
 			{		
 				// If ReadWaveInfo returns true, all relevant Wave chunks were found and 
@@ -76,11 +83,8 @@ void USound::Serialize( FArchive& Ar )
 			if( Audio && !GIsEditor )
 			{
 				Audio->RegisterSound( this );
-#if defined(PLATFORM_DREAMCAST)
-				// On Dreamcast, once the audio backend has uploaded the sample
-				// into AICA RAM we do not need to keep another copy in system RAM.
-				Data.Empty();
-#endif
+				// The backend owns release: memory streams still reference Data,
+				// and a failed registration must retain bytes for a later retry.
 			}
 		}
 	}
@@ -513,8 +517,23 @@ void UMusic::Serialize( FArchive& Ar )
 	guard(UMusic::Serialize);
 	Super::Serialize( Ar );
 	Ar << FileType;
-#ifndef PLATFORM_LOW_MEMORY
-	if( Ar.IsLoading() || Ar.IsSaving() )
+	UBOOL SkipMusicData = 0;
+#if defined(PLATFORM_LOW_MEMORY)
+	SkipMusicData = 1;
+#elif defined(DC_RESOURCE_COOKER)
+	// Session recipes must reproduce the DC serializer, including omitted
+	// array lengths. Even a stripped music export has a zero-length byte.
+	// Do not change normal package cooking/saving: its format still includes it.
+	SkipMusicData = Ar.IsLoading()
+		&& (ParseParam(appCmdLine(), "COOKSESSION")
+			|| ParseParam(appCmdLine(), "VERIFYSESSION"));
+#endif
+	if( SkipMusicData )
+	{
+		OriginalSize = 0;
+		Ar.CountBytes( OriginalSize );
+	}
+	else if( Ar.IsLoading() || Ar.IsSaving() )
 	{
 		Ar << Data;
 		if( Ar.IsLoading() )
@@ -523,13 +542,9 @@ void UMusic::Serialize( FArchive& Ar )
 		}
 	}
 	else
-#endif
 	{
 		Ar.CountBytes( OriginalSize );
 	}
-#ifdef PLATFORM_LOW_MEMORY
-	OriginalSize = 0;
-#endif
 	unguard;
 }
 void UMusic::Destroy()
