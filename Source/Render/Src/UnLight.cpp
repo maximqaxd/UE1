@@ -172,7 +172,11 @@ public:
 		FLOAT		Brightness;				// Center brightness at this instance, 1.0=max, 0.0=none.
 		FLOAT		Diffuse;				// BaseNormalDelta * RRadius.
 		BYTE*		IlluminationMap;		// Temporary illumination map pointer.
-		BYTE*		ShadowBits;				// Temporary shadow map.
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+		INT         ShadowOffset;           // Logical offset; decoded only on cache miss.
+#else
+		BYTE*       ShadowBits;
+#endif
 		UBOOL		IsVolumetric;			// Whether it's volumetric.
 
 		// Clipping region.
@@ -1584,11 +1588,21 @@ void FLightManager::SetupForSurf
 		Mover = NULL;
 
 		// Static lights.
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+		INT ShadowBase = Index->DataOffset;
+#else
 		BYTE* ShadowBase = &Model->LightBits(Index->DataOffset);
+#endif
 		if( Index->iLightActors != INDEX_NONE )
 			for( INT i=0; Model->Lights(i+Index->iLightActors); i++,ShadowBase+=ShadowMaskSpace )
 				if( AddLight( Mover, Model->Lights(i+Index->iLightActors) ) )
+				{
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+					LastLight[-1].ShadowOffset = ShadowBase;
+#else
 					LastLight[-1].ShadowBits = ShadowBase;
+#endif
+				}
 
 		// Dynamic lights.
 		for( FActorLink* Link=Draw->SurfLights; Link; Link=Link->Next )
@@ -1858,7 +1872,11 @@ void FLightManager::SetupForSurf
 				// Static lighting.
 				Info->ComputeFromActor( LightMap, Frame, 1 );
 				BYTE* ShadowMap = New<BYTE>(GMem,ShadowMaskSpace*8);
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+				ShadowMapGen( LightMap, Model->ShadowBits( Info->ShadowOffset, ShadowMaskSpace ), ShadowMap );
+#else
 				ShadowMapGen( LightMap, Info->ShadowBits, ShadowMap );
+#endif
 				Info->IlluminationMap = New<BYTE>(GMem,LightMap.UClamp*LightMap.VClamp);
 				Info->Effect.SpatialFxFunc( LightMap, Info, ShadowMap, Info->IlluminationMap );
 				Merge( LightMap, Info->Actor->LightEffect, 0, Info, Stream, Stream );
@@ -1947,7 +1965,11 @@ void FLightManager::SetupForSurf
 					{
 						// Create and generate its shadow map.
 						ShadowMap = (BYTE *)GCache.Create( CacheID, TopItemToUnlock[-1], ShadowMaskSpace*8 );
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+						ShadowMapGen( LightMap, Model->ShadowBits( Info->ShadowOffset, ShadowMaskSpace ), ShadowMap );
+#else
 						ShadowMapGen( LightMap, Info->ShadowBits, ShadowMap );
+#endif
 					}
 
 					// Build a temporary illumination map:
@@ -1965,7 +1987,11 @@ void FLightManager::SetupForSurf
 					{
 						// Build a temporary shadow map.
 						ShadowMap = New<BYTE>(GMem,ShadowMaskSpace*8);
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+						ShadowMapGen( LightMap, Model->ShadowBits( Info->ShadowOffset, ShadowMaskSpace ), ShadowMap );
+#else
 						ShadowMapGen( LightMap, Info->ShadowBits, ShadowMap );
+#endif
 
 						// Build and cache an illumination map
 						if( !Info->IlluminationMap )
@@ -2065,7 +2091,11 @@ UBOOL FLightManager::AddLight( AActor* Actor, AActor* Light )
 	// Info.
 	LastLight->Actor        = Light;
 	LastLight->IsVolumetric = 0;
-	LastLight->ShadowBits   = NULL;
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	LastLight->ShadowOffset = INDEX_NONE;
+#else
+	LastLight->ShadowBits = NULL;
+#endif
 	if( Light->bLightChanged )
 		StaticLightingChanged = 1;
 	LastLight++;

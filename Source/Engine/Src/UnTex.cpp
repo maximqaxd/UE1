@@ -271,11 +271,72 @@ UTexture::UTexture()
 void UTexture::Serialize( FArchive& Ar )
 {
 	guard(UTexture::Serialize);
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	if( Ar.IsLoading() )
+	{
+		static UBOOL LayoutChecked = false;
+		if( !LayoutChecked )
+		{
+			INT Checked = 0;
+			for( TFieldIterator<UProperty> It( GetClass() ); It; ++It )
+			{
+				INT Expected = INDEX_NONE;
+				if( !appStricmp( It->GetName(), "DetailTexture" ) )
+				{
+					Expected = STRUCT_OFFSET(UTexture, DetailTexture);
+				}
+				else if( !appStricmp( It->GetName(), "Mips" ) )
+				{
+					Expected = STRUCT_OFFSET(UTexture, Mips);
+				}
+				if( Expected != INDEX_NONE )
+				{
+					if( It->Offset != Expected )
+					{
+						appErrorf( "Texture layout mismatch %s: script=%d native=%d",
+							It->GetName(), It->Offset, Expected );
+					}
+					++Checked;
+				}
+			}
+			if( Checked != 2 )
+			{
+				appErrorf( "Texture layout properties unavailable" );
+			}
+			LayoutChecked = true;
+		}
+	}
+#endif
 	UObject::Serialize( Ar );
 	if( (Ar.IsSaving() || Ar.IsLoading()) && (TextureFlags & TF_Parametric) )
 		for( INT i=0; i<Mips.Num(); i++ )
 			Mips(i).DataArray.Empty();
 	Ar << Mips;
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	if( Ar.IsLoading() && !(TextureFlags & TF_Parametric)
+#if defined(DC_RESOURCE_COOKER) && !defined(PLATFORM_DREAMCAST)
+		&& appDCStreamDeferredMips()
+#endif
+		&& (Format == TEXF_P8 || GetClass() != UTexture::StaticClass
+			|| (TextureFlags & (TF_Realtime | TF_RealtimePalette))) )
+	{
+		// Procedural subclasses can access their pixels before renderer upload.
+		// Only immutable textures may rely exclusively on lazy package reads.
+		FArchiveFileLoad* File = (FArchiveFileLoad*)&Ar;
+		INT Resume = File->Tell();
+		for( INT i = 0; i < Mips.Num(); ++i )
+		{
+			FMipmap& Mip = Mips(i);
+			if( Mip.DCDataSize > 0 )
+			{
+				Mip.DataArray.SetNum( Mip.DCDataSize );
+				Mip.ReadDCData( *File, &Mip.DataArray(0) );
+				Mip.DataPtr = &Mip.DataArray(0);
+			}
+		}
+		File->Seek( Resume );
+	}
+#endif
 	if( (Ar.IsSaving() || Ar.IsLoading()) && (TextureFlags & TF_Parametric) )
 		for( INT i=0; i<Mips.Num(); i++ )
 			Mips(i).DataArray.AddZeroed( Mips(i).USize * Mips(i).VSize );
@@ -302,28 +363,35 @@ void UTexture::Serialize( FArchive& Ar )
 		UBits = FLogTwo(USize);
 		VBits = FLogTwo(VSize);
 	}
-#ifdef PLATFORM_LOW_MEMORY
-	if( Ar.IsLoading() && !GIsEditor )
+#if defined(PLATFORM_LOW_MEMORY) || defined(DC_RESOURCE_COOKER)
+#if defined(DC_RESOURCE_COOKER) && !defined(PLATFORM_LOW_MEMORY)
+	if( appDCStreamDeferredMips() )
+#endif
 	{
-		if( Mips.Num() > 1 )
-			Mips.Remove( 1, Mips.Num() - 1 );
-		if( TextureFlags & (TF_Parametric|TF_Realtime|TF_RealtimePalette) )
+		if( Ar.IsLoading() && !GIsEditor )
 		{
-			if( MaxFrameRate == 0.f || MaxFrameRate > 30.f )
-				MaxFrameRate = 30.f;
+			if( Mips.Num() > 1 )
+			{
+				Mips.Remove( 1, Mips.Num() - 1 );
+			}
+			if( TextureFlags & (TF_Parametric | TF_Realtime | TF_RealtimePalette) )
+			{
+				if( MaxFrameRate == 0.f || MaxFrameRate > 30.f )
+				{
+					MaxFrameRate = 30.f;
+				}
+			}
 		}
-	}
-	if( BumpMap )
-	{
-		if( BumpMap->Mips.Num() )
+		if( BumpMap )
+		{
 			BumpMap->Mips.Empty();
-		BumpMap = nullptr;
-	}
-	if( DetailTexture )
-	{
-		if( DetailTexture->Mips.Num() )
+			BumpMap = nullptr;
+		}
+		if( DetailTexture )
+		{
 			DetailTexture->Mips.Empty();
-		DetailTexture = nullptr;
+			DetailTexture = nullptr;
+		}
 	}
 #endif
 	unguard;
@@ -392,6 +460,44 @@ void UTexture::PostLoad()
 {
 	guard(UTexture::PostLoad);
 	UObject::PostLoad();
+
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	if( appDCStreamDeferredMips() && !(TextureFlags & TF_Parametric) )
+	{
+		// UTDC 0x8c127360 invokes texture upload here, which reads lazy mips.
+		// Resolve our disc slices at the same lifecycle point. Unlike retail's
+		// immediate VRAM upload, keep a locator for the port's eviction/reload.
+		for( INT i = 0; i < Mips.Num(); ++i )
+		{
+			FMipmap& Mip = Mips(i);
+			if( Mip.DCDataSize > 0 && !Mip.DataArray.Num() && !Mip.StreamData.Size() )
+			{
+				if( !GetLinker() )
+				{
+					appErrorf( "Deferred texture has no linker: %s", GetFullName() );
+				}
+				FArchiveFileLoad& File = *(FArchiveFileLoad*)GetLinker();
+#if defined(DC_RESOURCE_COOKER)
+				Mip.DataArray.SetNum( Mip.DCDataSize );
+				Mip.ReadDCData( File, &Mip.DataArray(0) );
+				Mip.DataPtr = &Mip.DataArray(0);
+#else
+				INT Resume = File.Tell();
+				File.Seek( Mip.DCDataOffset );
+				appDCStreamCapture( File.Filename, Mip.DCDataOffset, Mip.DCDataSize, Mip.StreamData );
+				BYTE Scratch[2048];
+				for( INT Remaining = Mip.DCDataSize; Remaining; )
+				{
+					INT Count = Min( Remaining, (INT)sizeof(Scratch) );
+					File.Serialize( Scratch, Count );
+					Remaining -= Count;
+				}
+				File.Seek( Resume );
+#endif
+			}
+		}
+	}
+#endif
 
 	// Handle post editing.
 	if( !Palette && GIsEditor )

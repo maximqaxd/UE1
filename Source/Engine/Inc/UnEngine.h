@@ -61,6 +61,7 @@ class ENGINE_API UEngine : public USubsystem
 #if defined(PLATFORM_DREAMCAST)
 // Dreamcast profiling: dump memory statistics
 ENGINE_API void DumpMemStatsDC( const char* Tag );
+ENGINE_API void DCProfileMemory( const char* Phase );
 #endif
 
 /*-----------------------------------------------------------------------------

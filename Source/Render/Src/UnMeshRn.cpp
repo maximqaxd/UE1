@@ -273,7 +273,11 @@ void RenderSubsurface
 //
 struct FMeshTriSort
 {
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	FMeshTri Tri;
+#else
 	FMeshTri* Tri;
+#endif
 	INT Key;
 };
 INT Compare( const FMeshTriSort& A, const FMeshTriSort& B )
@@ -303,6 +307,18 @@ void URender::DrawMesh
 	STAT(uclock(GStat.MeshTime));
 	FMemMark Mark(GMem);
 	UMesh*  Mesh = Owner->Mesh;
+	INT TriangleCount = Mesh->Tris.Num();
+	FMeshTri* Triangles = TriangleCount ? &Mesh->Tris(0) : NULL;
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	if( Mesh->DCRuns.Num() )
+	{
+		TriangleCount = 0;
+		for( INT Run = 0; Run < Mesh->DCRuns.Num(); ++Run )
+			TriangleCount += Mesh->DCRuns(Run).Count - 2;
+		Triangles = NULL;
+	}
+	FVector* DCVertexNormals = NULL;
+#endif
 	FVector Hack = FVector(0,-8,0);
 	UBOOL NotWeaponHeuristic=(Owner->Owner!=Frame->Viewport->Actor);
 	if( !Engine->Client->CurvedSurfaces )
@@ -344,9 +360,19 @@ void URender::DrawMesh
 		// Render each wireframe triangle.
 		guardSlow(RenderWire);
 		FPlane Color = Owner->bSelected ? FPlane(.2,.8,.1,0) : FPlane(.6,.4,.1,0);
-		for( INT i=0; i<Mesh->Tris.Num(); i++ )
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+		FDCMeshTriangleCursor DCWireCursor( *Mesh );
+#endif
+		for( INT i=0; i<TriangleCount; i++ )
 		{
-			FMeshTri& Tri    = Mesh->Tris(i);
+			FMeshTri DecodedTri;
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+			FMeshTri& Tri = Mesh->DCRuns.Num() ? DecodedTri : Triangles[i];
+			if( Mesh->DCRuns.Num() && !DCWireCursor.Next(Tri) )
+				appErrorf( "Cooked mesh strip ended early" );
+#else
+			FMeshTri& Tri = Triangles[i];
+#endif
 			FVector*  P1     = &Samples[Tri.iVertex[2]].Point;
 			for( int j=0; j<3; j++ )
 			{
@@ -424,15 +450,32 @@ void URender::DrawMesh
 	{
 		// Process triangles.
 		guardSlow(Process);
-		TriPool    = New<FMeshTriSort>(GMem,Mesh->Tris.Num());
-		TriNormals = New<FVector>(GMem,Mesh->Tris.Num());
+		TriPool    = New<FMeshTriSort>(GMem,TriangleCount);
+		TriNormals = New<FVector>(GMem,TriangleCount);
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+		if( Mesh->DCRuns.Num() )
+		{
+			DCVertexNormals = New<FVector>( GMem, Mesh->FrameVerts );
+			appMemset( DCVertexNormals, 0, Mesh->FrameVerts * sizeof(FVector) );
+		}
+#endif
 
 		// Set up list for triangle sorting, adding all possibly visible triangles.
 		STAT(uclock(GStat.MeshProcessTime));
 		FMeshTriSort* TriTop = &TriPool[0];
-		for( INT i=0; i<Mesh->Tris.Num(); i++ )
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+		FDCMeshTriangleCursor DCTriangleCursor( *Mesh );
+#endif
+		for( INT i=0; i<TriangleCount; i++ )
 		{
-			FMeshTri*   Tri = &Mesh->Tris(i);
+			FMeshTri DecodedTri;
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+			FMeshTri* Tri = Mesh->DCRuns.Num() ? &DecodedTri : &Triangles[i];
+			if( Mesh->DCRuns.Num() && !DCTriangleCursor.Next(*Tri) )
+				appErrorf( "Cooked mesh strip ended early" );
+#else
+			FMeshTri* Tri = &Triangles[i];
+#endif
 			FTransform& V1  = Samples[Tri->iVertex[0]];
 			FTransform& V2  = Samples[Tri->iVertex[1]];
 			FTransform& V3  = Samples[Tri->iVertex[2]];
@@ -441,6 +484,15 @@ void URender::DrawMesh
 			// Compute triangle normal.
 			TriNormals[i] = (V1.Point-V2.Point) ^ (V3.Point-V1.Point);
 			TriNormals[i] *= DivSqrtApprox(TriNormals[i].SizeSquared()+0.001);
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+			if( DCVertexNormals )
+			{
+				for( INT Corner = 0; Corner < 3; ++Corner )
+				{
+					DCVertexNormals[Tri->iVertex[Corner]] += TriNormals[i];
+				}
+			}
+#endif
 
 			// See if potentially visible.
 			if( !(V1.Flags & V2.Flags & V3.Flags) )
@@ -450,7 +502,11 @@ void URender::DrawMesh
 				||	Frame->Mirror*FTriple(V1.Point,V2.Point,V3.Point)>0.0 )
 				{
 					// This is visible.
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+					TriTop->Tri = *Tri;
+#else
 					TriTop->Tri = Tri;
+#endif
 
 					// Set the sort key.
 					TriTop->Key
@@ -512,7 +568,11 @@ void URender::DrawMesh
 		guardSlow(Light);
 		for( INT i=0; i<VisibleTriangles; i++ )
 		{
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+			FMeshTri& Tri = TriPool[i].Tri;
+#else
 			FMeshTri& Tri = *TriPool[i].Tri;
+#endif
 			for( INT j=0; j<3; j++ )
 			{
 				INT iVert = Tri.iVertex[j];
@@ -521,9 +581,18 @@ void URender::DrawMesh
 				{
 					// Compute vertex normal.
 					FVector Norm(0,0,0);
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+					if( DCVertexNormals )
+					{
+						Norm = DCVertexNormals[iVert];
+					}
+					else
+#endif
+					{
 					FMeshVertConnect& Connect = Mesh->Connects(iVert);
 					for( INT k=0; k<Connect.NumVertTriangles; k++ )
 						Norm += TriNormals[Mesh->VertLinks(Connect.TriangleListOffset + k)];
+					}
 					Vert.Normal = FPlane( Vert.Point, Norm * DivSqrtApprox(Norm.SizeSquared()) );
 
 					// Fatten it if desired.
@@ -551,12 +620,16 @@ void URender::DrawMesh
 		for( INT i=0; i<VisibleTriangles; i++ )
 		{
 			// Set up the triangle.
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+			FMeshTri& Tri = TriPool[i].Tri;
+#else
 			FMeshTri& Tri = *TriPool[i].Tri;
+#endif
 			if( !(Tri.PolyFlags & PF_Invisible) )
 			{
 				// Get texture.
 				DWORD PolyFlags = Tri.PolyFlags | ExtraFlags;
-				INT Index = TriPool[i].Tri->TextureIndex;
+				INT Index = Tri.TextureIndex;
 				FTextureInfo& Info = (Textures[Index] && !(PolyFlags & PF_Environment)) ? TextureInfo[Index] : EnvironmentInfo;
 				UScale = Info.UScale * Info.USize / 256.0;
 				VScale = Info.VScale * Info.VSize / 256.0;

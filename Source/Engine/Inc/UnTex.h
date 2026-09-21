@@ -185,12 +185,17 @@ struct ENGINE_API FMipmap
 	INT				USize,  VSize;	// Power of two tile dimensions.
 	BYTE			UBits,  VBits;	// Power of two tile bits.
 	TArray<BYTE>	DataArray;		// Data.
-#if defined(PLATFORM_DREAMCAST)
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	FDCStreamSlice  StreamData;
 	// Dreamcast: lazy streaming support (do not keep texture bytes in RAM)
 	INT             DCDataOffset;   // Byte offset in package file to mip data start
 	INT             DCDataSize;     // Size in bytes of mip data
 #endif
 	FMipmap()
+	: DataPtr(NULL), USize(0), VSize(0), UBits(0), VBits(0)
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	, DCDataOffset(0), DCDataSize(0)
+#endif
 	{}
 	FMipmap( BYTE InUBits, BYTE InVBits )
 	:	DataPtr		(0)
@@ -199,18 +204,101 @@ struct ENGINE_API FMipmap
 	,	VSize		(1<<InVBits)
 	,	UBits		(InUBits)
 	,	VBits		(InVBits)
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	, DCDataOffset(0), DCDataSize(0)
+#endif
 	{
 		DataArray.Add( USize * VSize );
 	}
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	void ReadDCData( FArchiveFileLoad& File, void* Destination )
+	{
+		if( StreamData.Size() )
+		{
+			StreamData.Read( Destination );
+			return;
+		}
+		INT Resume = File.Tell();
+		File.Seek( DCDataOffset );
+		if( appDCStreamActive() )
+		{
+			appDCStreamCapture( File.Filename, DCDataOffset, DCDataSize, StreamData );
+		}
+		File.Serialize( Destination, DCDataSize );
+		File.Seek( Resume );
+	}
+#endif
 	friend FArchive& operator<<( FArchive& Ar, FMipmap& M )
 	{
 		guard(FMipmap<<);
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+		if( Ar.IsLoading() && appDCStreamDeferredMips() )
+		{
+			// UTDC 0x8c126c20 forces lazy mips. A logical seek skips pixels;
+			// the forward stream contains their bodies only at first use.
+			INT Count = 0;
+			Ar << AR_INDEX(Count);
+			FArchiveFileLoad& File = (FArchiveFileLoad&)Ar;
+			if( Count < 0 || File.Tell() < 0 || File.Tell() > File.Eof
+				|| Count > File.Eof - File.Tell() )
+			{
+				appErrorf( "Invalid deferred DAT mip length: %d", Count );
+			}
+			M.DCDataOffset = File.Tell();
+			M.DCDataSize = Count;
+			File.Seek( File.Tell() + Count );
+			Ar << M.USize << M.VSize << M.UBits << M.VBits;
+			M.DataArray.Empty();
+			M.DataPtr = NULL;
+			return Ar;
+		}
+		if( Ar.IsLoading() && appDCStreamActive() )
+		{
+			INT Count = 0;
+			Ar << AR_INDEX(Count);
+			FArchiveFileLoad* File = (FArchiveFileLoad*)&Ar;
+			if( Count < 0 || File->Tell() < 0 || File->Tell() > File->Eof
+				|| Count > File->Eof - File->Tell() )
+			{
+				appErrorf( "Invalid DAT mip payload length: %d", Count );
+			}
+#if defined(PLATFORM_DREAMCAST)
+			M.DCDataOffset = File->Tell();
+			M.DCDataSize = Count;
+#endif
+			if( Count )
+			{
+				appDCStreamCapture( File->Filename, File->Tell(), Count, M.StreamData );
+#if defined(DC_RESOURCE_COOKER)
+				// Keep a reference image for the host lifetime/CRC test.
+				M.DataArray.SetNum( Count );
+				Ar.Serialize( &M.DataArray(0), Count );
+#else
+				// Consume the dependency stream in order without retaining pixels.
+				BYTE Scratch[2048];
+				for( INT Remaining = Count; Remaining; )
+				{
+					INT Chunk = Min( Remaining, (INT)sizeof(Scratch) );
+					Ar.Serialize( Scratch, Chunk );
+					Remaining -= Chunk;
+				}
+#endif
+			}
+			Ar << M.USize << M.VSize << M.UBits << M.VBits;
+			M.DataPtr = M.DataArray.Num() ? &M.DataArray(0) : NULL;
+			return Ar;
+		}
+#endif
 #if defined(PLATFORM_DREAMCAST)
 		if( Ar.IsLoading() )
 		{
 			// Manually deserialize the data blob length (compact index) to capture its file offset, then skip the bytes.
 			INT Count = 0;
 			Ar << AR_INDEX(Count);
+			if( Count < 0 )
+			{
+				appErrorf( "Invalid mip payload length: %d", Count );
+			}
 			M.DCDataSize = Count;
 			if( Count > 0 )
 			{
@@ -262,6 +350,11 @@ class ENGINE_API UBitmap : public UObject
 	FColor		MipZero;			// Overall average color of texture.
 	FColor		MaxColor;			// Maximum color for normalization.
 	DOUBLE		LastUpdateTime GCC_PACK(4);	// Last time texture was locked for rendering.
+#if defined(PLATFORM_DREAMCAST)
+	// Bitmap.uc reserves InternalTime[2]. Single-only DOUBLE occupies one word;
+	// preserve the second word so inherited script properties keep their offsets.
+	DWORD       LastUpdateTimePadding;
+#endif
 
 	// Static.
 	static class UClient* Client;
@@ -369,6 +462,9 @@ enum ETextureFormat
 	TEXF_EXT_ARGB1555_VQ   = 130, // [Dreamcast] VQ-compressed pre-twiddled ARGB1555
 	TEXF_EXT_RGB565_TWID   = 131, // [Dreamcast] pre-twiddled RGB565
 	TEXF_EXT_RGB565_VQ     = 132, // [Dreamcast] VQ-compressed pre-twiddled RGB565
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	TEXF_EXT_DCTEX         = 133, // Complete versioned DT header and hardware mip chain.
+#endif
 	
 	TEXF_EXT_MAX
 };

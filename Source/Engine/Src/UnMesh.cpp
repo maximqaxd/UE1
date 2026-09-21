@@ -22,6 +22,9 @@ UMesh::UMesh()
 	Scale			= FVector(1,1,1);
 	Origin			= FVector(0,0,0);
 	RotOrigin		= FRotator(0,0,0);
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	DCTemporalFrames = 0;
+#endif
 
 	// Flags.
 	AndFlags		= ~(DWORD)0;
@@ -37,13 +40,25 @@ void UMesh::Serialize( FArchive& Ar )
 	UPrimitive::Serialize(Ar);
 
 	// Serialize this.
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	SerializeDCVerts( Ar );
+	SerializeDCTopology( Ar );
+	Ar << AnimSeqs;
+#else
 	Ar << Verts << Tris << AnimSeqs;
+#endif
 	Ar << Connects << BoundingBox << BoundingSphere << VertLinks << Textures;
 	Ar << BoundingBoxes << BoundingSpheres;
 	Ar << FrameVerts << AnimFrames;
 	Ar << AndFlags << OrFlags;
 	Ar << Scale << Origin << RotOrigin;
 	Ar << CurPoly << CurVertex;
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	if( Ar.IsLoading() )
+	{
+		ValidateDCMesh();
+	}
+#endif
 
 	unguard;
 }
@@ -143,6 +158,12 @@ void UMesh::GetFrame
 )
 {
 	guard(UMesh::GetFrame);
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	if( FrameVerts <= 0 )
+	{
+		return;
+	}
+#endif
 
 	// Create or get cache memory.
 	FCacheItem* Item;
@@ -192,12 +213,22 @@ void UMesh::GetFrame
 		}
 
 		// Interpolate two frames.
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+		FDCMeshFrameCursor Frame1( *this, iFrameOffset1 / FrameVerts );
+		FDCMeshFrameCursor Frame2( *this, iFrameOffset2 / FrameVerts );
+#else
 		FMeshVert* MeshVertex1 = &Verts( iFrameOffset1 );
 		FMeshVert* MeshVertex2 = &Verts( iFrameOffset2 );
+#endif
 		for( INT i=0; i<FrameVerts; i++ )
 		{
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+			FVector V1 = Frame1.Next();
+			FVector V2 = Frame2.Next();
+#else
 			FVector V1( MeshVertex1[i].X, MeshVertex1[i].Y, MeshVertex1[i].Z );
 			FVector V2( MeshVertex2[i].X, MeshVertex2[i].Y, MeshVertex2[i].Z );
+#endif
 			CachedVerts[i] = V1 + (V2-V1)*Alpha;
 			*ResultVerts = (CachedVerts[i] - Origin).TransformPointBy(Coords);
 			*(BYTE**)&ResultVerts += Size;
@@ -217,10 +248,18 @@ void UMesh::GetFrame
 		}
 
 		// Tween all points.
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+		FDCMeshFrameCursor Frame( *this, iFrameOffset / FrameVerts );
+#else
 		FMeshVert* MeshVertex = &Verts( iFrameOffset );
+#endif
 		for( INT i=0; i<FrameVerts; i++ )
 		{
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+			FVector V2 = Frame.Next();
+#else
 			FVector V2( MeshVertex[i].X, MeshVertex[i].Y, MeshVertex[i].Z );
+#endif
 			CachedVerts[i] += (V2 - CachedVerts[i]) * Alpha;
 			*ResultVerts = (CachedVerts[i] - Origin).TransformPointBy(Coords);
 			*(BYTE**)&ResultVerts += Size;
@@ -243,6 +282,10 @@ void UMesh::GetFrame
 UMesh::UMesh( INT NumPolys, INT NumVerts, INT NumFrames )
 {
 	guard(UMesh::UMesh);
+
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	DCTemporalFrames = 0;
+#endif
 
 	// Set counts.
 	FrameVerts	= NumVerts;

@@ -134,6 +134,30 @@ struct FMeshVertConnect
 // A mesh, completely describing a 3D object (creature, weapon, etc) and
 // its animation sequences.  Does not reference textures.
 //
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+struct FDCMeshRun
+{
+	_WORD Material;
+	_WORD Reserved;
+	_WORD First;
+	_WORD Count;
+	friend FArchive& operator<<( FArchive& Ar, FDCMeshRun& Run )
+	{
+		return Ar << Run.Material << Run.Reserved << Run.First << Run.Count;
+	}
+};
+
+struct FDCMeshMaterial
+{
+	DWORD Flags;
+	INT Texture;
+	friend FArchive& operator<<( FArchive& Ar, FDCMeshMaterial& Material )
+	{
+		return Ar << Material.Flags << Material.Texture;
+	}
+};
+#endif
+
 class ENGINE_API UMesh : public UPrimitive
 {
 	DECLARE_CLASS_WITHOUT_CONSTRUCT(UMesh,UPrimitive,0)
@@ -147,6 +171,23 @@ class ENGINE_API UMesh : public UPrimitive
 	TArray<FSphere>			BoundingSpheres;
 	TArray<INT>				VertLinks;
 	TArray<UTexture*>		Textures;
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	TArray<_WORD>            DCFrameWords;
+	TArray<INT>              DCFrameOffsets;
+	FDCStreamSlice           DCFrameStreamData;
+	TArray<FDCMeshRun>       DCRuns;
+	TArray<FDCMeshMaterial>  DCMaterials;
+	TArray<_WORD>            DCIndices;
+	TArray<_WORD>            DCUVs;
+	UBOOL                    DCTemporalFrames;
+	void SerializeDCVerts( FArchive& Ar );
+	void SerializeDCTopology( FArchive& Ar );
+	void ValidateDCMesh();
+	FMeshTri* GetDCTriangles( INT& Count );
+#if defined(DC_RESOURCE_COOKER)
+	void CookDCMesh();
+#endif
+#endif
 
 	// Counts.
 	INT						FrameVerts;
@@ -216,6 +257,47 @@ class ENGINE_API UMesh : public UPrimitive
 		unguardSlow;
 	}
 };
+
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+class ENGINE_API FDCMeshFrameCursor
+{
+public:
+	FDCMeshFrameCursor( const UMesh& InMesh, INT Frame );
+	FVector Next();
+	UBOOL AtEnd() const;
+
+private:
+	const UMesh& Mesh;
+	INT X;
+	INT Y;
+	INT Z;
+	INT TargetFrame;
+	INT KeyFrame;
+	INT Positions[8];
+	INT Ends[8];
+#if defined(PLATFORM_DREAMCAST)
+	const FMeshVert* Decoded;
+#endif
+};
+
+#if defined(PLATFORM_DREAMCAST)
+ENGINE_API DWORD GetDCMeshDecodeCacheBytes();
+#endif
+
+// Walk cooked strips without expanding all topology into a scratch triangle
+// array every time the mesh is rendered.
+class ENGINE_API FDCMeshTriangleCursor
+{
+public:
+	FDCMeshTriangleCursor( const UMesh& InMesh );
+	UBOOL Next( FMeshTri& Triangle );
+
+private:
+	const UMesh& Mesh;
+	INT RunIndex;
+	INT RunVertex;
+};
+#endif
 
 /*----------------------------------------------------------------------------
 	The End.

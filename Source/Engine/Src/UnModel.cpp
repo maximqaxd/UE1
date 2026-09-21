@@ -305,7 +305,12 @@ void UModel::Serialize( FArchive& Ar )
 	UPrimitive::Serialize( Ar );
 
 	Ar << Vectors << Points << Nodes << Surfs << Verts << Polys;
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	Ar << LightMap;
+	SerializeLightBits( Ar );
+#else
 	Ar << LightMap << LightBits;
+#endif
 	Ar << Bounds;
 	Ar << LeafHulls << Leaves << Lights << LeafZone << LeafLeaf;
 	if( Ar.Ver() <= 41 ) //oldver
@@ -482,6 +487,13 @@ void UModel::EmptyModel( int EmptySurfInfo, int EmptyPolys )
 	Lights.Empty();
 	LightMap.Empty();
 	LightBits.Empty();
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	LightBlockOffsets.Empty();
+	LightStreamData = FDCStreamSlice();
+	LightRawSize = 0;
+	LightDecodeCalls = 0;
+	LightDecodeBytes = 0;
+#endif
 
 	if( EmptyPolys )
 		Polys->Empty();

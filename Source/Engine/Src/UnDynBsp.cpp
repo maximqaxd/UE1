@@ -156,7 +156,7 @@ public:
 	///////////////////////////////////
 
 private:
-#ifdef PLATFORM_LOW_MEMORY
+#if defined(PLATFORM_LOW_MEMORY) || defined(DC_RESOURCE_COOKER)
 	enum {MAX_MOVING_BRUSH_POLYS=2048};  // Maximum moving brush polys per level.
 	enum {MAX_MOVING_BRUSH_ACTORS=256};  // Maximum moving brush actors per level.
 	enum {MAX_TOUCHING_ACTORS=256};		 // Maximum actors touched by a moving brush during update.
@@ -167,6 +167,10 @@ private:
 #endif
 
 	ULevel*	Level;
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	INT DCPeakNodes, DCPeakPoints, DCPeakVerts;
+	void DCMeasure();
+#endif
 	FVector FPolyNormal;
 
 	int iTopNode,iTopSurf,iTopPoint,iTopVector,iTopVertPool,iTopBrushMap;
@@ -175,6 +179,7 @@ private:
 
 	// Mechanism to pair actor indices with Bsp surfaces:
 	AActor **BrushMapOwners;
+	INT BrushMapCapacity;
 	INT  *iBrushMapSurfs;
 	INT  *iNodeParents;
 
@@ -210,6 +215,8 @@ private:
 INT* AllocDbIndex( UDatabase* Res, char* Descr )
 {
 	guard(FMovingBrushTracker::AllocDbIndex);
+	if( Res->GetMax() == Res->GetNum() )
+		return NULL;
 
 	INT* Result = (INT *)MallocArray(Res->GetMax() - Res->GetNum(),INT,Descr);
 
@@ -223,6 +230,8 @@ INT* AllocDbIndex( UDatabase* Res, char* Descr )
 AActor** AllocDbActor( UDatabase* Res, char* Descr )
 {
 	guard(FMovingBrushTracker::AllocDbActor);
+	if( Res->GetMax() == Res->GetNum() )
+		return NULL;
 
 	AActor** Result = (AActor **)MallocArray(Res->GetMax() - Res->GetNum(),AActor *,Descr);
 
@@ -305,13 +314,14 @@ FMovingBrushTracker::FMovingBrushTracker( ULevel* ThisLevel )
 	guard(FMovingBrushTracker::FMovingBrushTracker);
 
 	Level				= ThisLevel;
-
+#if !defined(PLATFORM_DREAMCAST) && !defined(DC_RESOURCE_COOKER)
 	iTopNode			= ExpandDb(Level->Model->Nodes);
 	iTopSurf			= ExpandDb(Level->Model->Surfs);
 	iTopPoint			= ExpandDb(Level->Model->Points,16384);
 	iTopVector			= ExpandDb(Level->Model->Vectors,16384);
 	iTopVertPool		= ExpandDb(Level->Model->Verts);
 	iTopBrushMap		= 0;
+#endif
 
 	// Note that all actors are unassimilated and count all movers.
 	INT i;
@@ -334,13 +344,66 @@ FMovingBrushTracker::FMovingBrushTracker( ULevel* ThisLevel )
 
 	debugf( NAME_Init, "%s has %d moving brushes with %d polys", Level->GetFullName(), NumMovers, NumMoverPolys );
 
-	BrushMapOwners		= (AActor **)MallocArray(MAX_MOVING_BRUSH_POLYS,AActor*,"BrushMapOwners");
-	for( i=0; i<MAX_MOVING_BRUSH_POLYS; i++ )
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	DCPeakNodes = DCPeakPoints = DCPeakVerts = 0;
+	if( NumMovers >= MAX_MOVING_BRUSH_ACTORS || NumMoverPolys > MAX_MOVING_BRUSH_POLYS )
+		appErrorf( "Mover tracker limits exceeded: %s", Level->GetFullName() );
+	UBOOL Probe = 0;
+#if defined(DC_RESOURCE_COOKER)
+	Probe = ParseParam(appCmdLine(), "DCPROBEMOVERS");
+#endif
+	INT Nodes = 0, Points = 0, Verts = 0;
+	if( NumMovers && !Probe )
+	{
+		const char* Map = Level->GetParent()->GetName();
+		if( !GetConfigInt(Map, "Nodes", Nodes, "DCMover.ini")
+			|| !GetConfigInt(Map, "Points", Points, "DCMover.ini")
+			|| !GetConfigInt(Map, "Verts", Verts, "DCMover.ini")
+			|| Nodes <= 0 || Points <= NumMoverPolys || Verts <= 0
+			|| Nodes > 1048576 || Points > 1048576 || Verts > 4194304 )
+			appErrorf( "Missing/invalid measured mover budget for %s", Map );
+	}
+	if( Probe && NumMovers )
+	{
+		ExpandDb(Level->Model->Nodes);
+		ExpandDb(Level->Model->Points,16384);
+		ExpandDb(Level->Model->Verts);
+	}
+	else
+	{
+		Level->Model->Nodes->SetMax(Level->Model->Nodes->Num() + Nodes);
+		Level->Model->Points->SetMax(Level->Model->Points->Num() + Points);
+		Level->Model->Verts->SetMax(Level->Model->Verts->Num() + Verts);
+		Level->Model->Nodes->Realloc();
+		Level->Model->Points->Realloc();
+		Level->Model->Verts->Realloc();
+	}
+	// SetupActorBrush allocates one surface and three vectors per mover poly.
+	Level->Model->Surfs->SetMax(Level->Model->Surfs->Num() + (NumMovers ? NumMoverPolys + 32 : 0));
+	Level->Model->Vectors->SetMax(Level->Model->Vectors->Num() + (NumMovers ? 3 * NumMoverPolys + 96 : 0));
+	Level->Model->Surfs->Realloc();
+	Level->Model->Vectors->Realloc();
+	iTopNode = Level->Model->Nodes->Num();
+	iTopSurf = Level->Model->Surfs->Num();
+	iTopPoint = Level->Model->Points->Num();
+	iTopVector = Level->Model->Vectors->Num();
+	iTopVertPool = Level->Model->Verts->Num();
+	iTopBrushMap = 0;
+#endif
+
+	BrushMapCapacity = MAX_MOVING_BRUSH_POLYS;
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	BrushMapCapacity = NumMovers ? Min(NumMoverPolys + 32, (INT)MAX_MOVING_BRUSH_POLYS) : 0;
+#endif
+	BrushMapOwners = BrushMapCapacity
+		? (AActor**)MallocArray(BrushMapCapacity, AActor*, "BrushMapOwners") : NULL;
+	for( i=0; i<BrushMapCapacity; i++ )
 		BrushMapOwners[i] = NULL;
 
-	iBrushMapSurfs		= (INT *)MallocArray(MAX_MOVING_BRUSH_POLYS,INT,"BrushMapSurfs");
+	iBrushMapSurfs = BrushMapCapacity
+		? (INT*)MallocArray(BrushMapCapacity, INT, "BrushMapSurfs") : NULL;
 
-	VertPoolOwners		= (AActor **)MallocArray(Level->Model->Verts->Max() - Level->Model->Verts->Num(),AActor*,"VertPoolOwners");
+	VertPoolOwners = AllocDbActor(Level->Model->Verts, "VertPoolOwners");
 	for( i=0; i<(Level->Model->Verts->Max() - Level->Model->Verts->Num()); i++ )
 		VertPoolOwners[i] = NULL;
 
@@ -350,10 +413,59 @@ FMovingBrushTracker::FMovingBrushTracker( ULevel* ThisLevel )
 	PointOwners			= AllocDbActor( Level->Model->Points,  "PointOwners"  );
 	VectorOwners		= AllocDbActor( Level->Model->Vectors, "VectorOwners" );
 
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	const INT ExtraNodes = Level->Model->Nodes->Max() - Level->Model->Nodes->Num();
+	const INT ExtraPoints = Level->Model->Points->Max() - Level->Model->Points->Num();
+	const INT ExtraVerts = Level->Model->Verts->Max() - Level->Model->Verts->Num();
+	const INT ExtraSurfs = Level->Model->Surfs->Max() - Level->Model->Surfs->Num();
+	const INT ExtraVectors = Level->Model->Vectors->Max() - Level->Model->Vectors->Num();
+	debugf( "DCBSPRESERVE map=%s nodes=%d points=%d verts=%d array_bytes=%d owner_bytes=%d",
+		Level->GetParent()->GetName(), ExtraNodes, ExtraPoints, ExtraVerts,
+		ExtraNodes * sizeof(FBspNode) + ExtraPoints * sizeof(FVector)
+			+ ExtraVerts * sizeof(FVert) + ExtraSurfs * sizeof(FBspSurf)
+			+ ExtraVectors * sizeof(FVector),
+		(ExtraNodes + ExtraPoints + ExtraVerts + ExtraSurfs + ExtraVectors) * sizeof(AActor*)
+			+ ExtraNodes * sizeof(INT) + BrushMapCapacity * (sizeof(AActor*) + sizeof(INT)) );
+#endif
+
 	debugf( NAME_Init, "Initialized moving brush tracker for %s", Level->GetFullName() );
 
 	// Now setup and update all brushes.
 	UpdateBrushes(NULL,0);
+
+#if defined(DC_RESOURCE_COOKER)
+	if( Probe || ParseParam(appCmdLine(), "DCTESTMOVERS") )
+	{
+		// Probe each key interval at eighths, with the other brushes in their
+		// startup poses. This is a measured sample, not a proof of every state.
+		for( INT a = 0; a < Level->Num(); ++a )
+		{
+			AMover* Mover = Cast<AMover>(Level->Actors(a));
+			if( !Mover || !Mover->IsMovingBrush() )
+				continue;
+			FVector SavedLocation = Mover->Location;
+			FRotator SavedRotation = Mover->Rotation;
+			for( INT key = 0; key < Min((INT)Mover->NumKeys, 8); ++key )
+			{
+				INT next = Min(key + 1, Min((INT)Mover->NumKeys, 8) - 1);
+				for( INT step = 0; step <= 8; ++step )
+				{
+					FLOAT Alpha = step / 8.f;
+					Mover->Location = Mover->BasePos + Mover->KeyPos[key]
+						+ (Mover->KeyPos[next] - Mover->KeyPos[key]) * Alpha;
+					Mover->Rotation = Mover->BaseRot + Mover->KeyRot[key]
+						+ (Mover->KeyRot[next] - Mover->KeyRot[key]) * Alpha;
+					Update(Mover);
+				}
+			}
+			Mover->Location = SavedLocation;
+			Mover->Rotation = SavedRotation;
+			Update(Mover);
+		}
+		debugf( "DCMOVERPEAK map=%s nodes=%d points=%d verts=%d polys=%d",
+			Level->GetParent()->GetName(), DCPeakNodes, DCPeakPoints, DCPeakVerts, NumMoverPolys );
+	}
+#endif
 
 	// Drop polys from all brushes that aren't attached to a mover.
 	for( TObjectIterator<UModel> It; It; ++It )
@@ -361,9 +473,10 @@ FMovingBrushTracker::FMovingBrushTracker( ULevel* ThisLevel )
 		if( It->Polys && It->Polys->Num() )
 		{
 			UBOOL NotMoving = true;
-			for( INT i = 0; i < NumGroupActors; ++i )
+			for( INT i = 0; i < Level->Num(); ++i )
 			{
-				if( GroupActors[i] && GroupActors[i]->Brush == *It )
+				AActor* Owner = Level->Actors(i);
+				if( Owner && Owner->IsMovingBrush() && Owner->Brush == *It )
 				{
 					NotMoving = false;
 					break;
@@ -417,14 +530,22 @@ FMovingBrushTracker::~FMovingBrushTracker()
 	guard(FMovingBrushTracker::~FMovingBrushTracker);
 
 	// Free memory.
-	appFree(BrushMapOwners);
-	appFree(iBrushMapSurfs);
-	appFree(NodeOwners);
-	appFree(iNodeParents);
-	appFree(SurfOwners);
-	appFree(PointOwners);
-	appFree(VectorOwners);
-	appFree(VertPoolOwners);
+	if( BrushMapOwners )
+		appFree(BrushMapOwners);
+	if( iBrushMapSurfs )
+		appFree(iBrushMapSurfs);
+	if( NodeOwners )
+		appFree(NodeOwners);
+	if( iNodeParents )
+		appFree(iNodeParents);
+	if( SurfOwners )
+		appFree(SurfOwners);
+	if( PointOwners )
+		appFree(PointOwners);
+	if( VectorOwners )
+		appFree(VectorOwners);
+	if( VertPoolOwners )
+		appFree(VertPoolOwners);
 
 	debugf( NAME_Exit, "Shut down moving brush tracker for %s", Level->GetName() );
 
@@ -447,6 +568,12 @@ inline int NewThingActor
 	AActor*		Actor
 )
 {
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	if( MaxThings <= NumThings )
+		appErrorf( "Mover reserve exhausted actor=%s capacity=0", Actor->GetFullName() );
+	if( TopThing < NumThings || TopThing >= MaxThings )
+		TopThing = NumThings;
+#endif
 #if CHECK_ALL
 	if( (TopThing<NumThings) || (TopThing>=MaxThings) )
 		appErrorf ("TopThing inconsistency %i<%i>%i",NumThings,TopThing,MaxThings);
@@ -476,8 +603,9 @@ inline int NewThingActor
 		TopThing++;
 		ThingOwner++;
 	}
-#if CHECK_ALL
-		appError("NewThingActor overflow");
+#if CHECK_ALL || defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+		appErrorf("Moving brush allocation exhausted: actor=%s first=%i max=%i",
+			Actor->GetName(), NumThings, MaxThings);
 #endif
 	return INDEX_NONE;
 }
@@ -535,7 +663,7 @@ inline int FMovingBrushTracker::NewVectorIndex( AActor* Actor )
 inline int FMovingBrushTracker::NewBrushMapIndex( AActor* Actor )
 {
 	guardSlow(FMovingBrushTracker::NewBrushMapIndex);
-	return NewThingActor(iTopBrushMap,0,MAX_MOVING_BRUSH_POLYS,BrushMapOwners,Actor);
+	return NewThingActor(iTopBrushMap,0,BrushMapCapacity,BrushMapOwners,Actor);
 	unguardSlow;
 }
 
@@ -543,6 +671,34 @@ inline int FMovingBrushTracker::NewBrushMapIndex( AActor* Actor )
 inline int FMovingBrushTracker::NewVertPoolIndex( AActor* Actor, int NumVerts )
 {
 	guardSlow(FMovingBrushTracker::NewVertPoolIndex);
+
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	const INT First = Level->Model->Verts->Num();
+	const INT End = Level->Model->Verts->Max();
+	if( NumVerts <= 0 || NumVerts > End - First )
+		appErrorf( "Mover vertex reserve exhausted actor=%s request=%d capacity=%d",
+			Actor->GetFullName(), NumVerts, End - First );
+	const INT Start = Clamp(iTopVertPool, First, End);
+	for( INT Pass = 0; Pass < 2; ++Pass )
+	{
+		INT Run = 0;
+		for( INT Index = Pass ? First : Start; Index < End; ++Index )
+		{
+			Run = VertPoolOwners[Index - First] ? 0 : Run + 1;
+			if( Run == NumVerts )
+			{
+				INT Result = Index + 1 - NumVerts;
+				for( INT j = Result; j <= Index; ++j )
+					VertPoolOwners[j - First] = Actor;
+				iTopVertPool = Index + 1;
+				return Result;
+			}
+		}
+	}
+	appErrorf( "Mover vertex reserve fragmented/full actor=%s request=%d capacity=%d",
+		Actor->GetFullName(), NumVerts, End - First );
+	return INDEX_NONE;
+#else
 
 #if CHECK_ALL
 	if( (iTopVertPool<Level->Model->Verts->Num()) || (iTopVertPool>=Level->Model->Verts->Max()) )
@@ -592,6 +748,7 @@ inline int FMovingBrushTracker::NewVertPoolIndex( AActor* Actor, int NumVerts )
 		appError("NewVertPoolIndex overflow");
 #endif
 	return -1;
+#endif
 	unguardSlow;
 }
 
@@ -770,8 +927,8 @@ void FMovingBrushTracker::RemoveActorBrush( AActor* Actor )
 	check(Actor->bAssimilated);
 
 	// Find all surfaces owned by this actor, and free them and their contents.
-	AActor **BrushMapOwner = &BrushMapOwners[0];
-	for( int i=0; i<MAX_MOVING_BRUSH_POLYS; i++ )
+	AActor **BrushMapOwner = BrushMapOwners;
+	for( int i=0; i<BrushMapCapacity; i++ )
 	{
 		if( *BrushMapOwner == Actor )
 		{
@@ -1062,7 +1219,7 @@ void FMovingBrushTracker::AddActorBrush( AActor* Actor )
 		for( i=0; i<Brush->Polys->Num(); i++ )
 		{
 			int Found=0;
-			for( int j=0; j<MAX_MOVING_BRUSH_POLYS; j++ )
+			for( int j=0; j<BrushMapCapacity; j++ )
 			{
 				if( BrushMapOwners[j]==Actor )
 				{
@@ -1384,12 +1541,32 @@ void FMovingBrushTracker::UpdateBrushes( AActor** Actors, int Num )
 			AddActorBrush( Actor );
 		}
 	}
+#if defined(DC_RESOURCE_COOKER)
+	if( ParseParam(appCmdLine(), "DCPROBEMOVERS") || ParseParam(appCmdLine(), "DCTESTMOVERS") )
+		DCMeasure();
+#endif
 	unguard;
 }
 
 /*---------------------------------------------------------------------------------------
 	Instantiation.
 ---------------------------------------------------------------------------------------*/
+
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+void FMovingBrushTracker::DCMeasure()
+{
+	INT Nodes = 0, Points = 0, Verts = 0;
+	for( INT i = 0; i < Level->Model->Nodes->Max() - Level->Model->Nodes->Num(); ++i )
+		Nodes += NodeOwners[i] != NULL;
+	for( INT i = 0; i < Level->Model->Points->Max() - Level->Model->Points->Num(); ++i )
+		Points += PointOwners[i] != NULL;
+	for( INT i = 0; i < Level->Model->Verts->Max() - Level->Model->Verts->Num(); ++i )
+		Verts += VertPoolOwners[i] != NULL;
+	DCPeakNodes = Max(DCPeakNodes, Nodes);
+	DCPeakPoints = Max(DCPeakPoints, Points);
+	DCPeakVerts = Max(DCPeakVerts, Verts);
+}
+#endif
 
 ENGINE_API FMovingBrushTrackerBase* GNewBrushTracker( ULevel* InLevel )
 {
