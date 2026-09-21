@@ -86,6 +86,13 @@ UKOSViewport::UKOSViewport( ULevel* InLevel, UKOSClient* InClient )
 
 	ColorBytes = 2;
 	Caps = 0;
+	appMemset( KeyState, 0, sizeof(KeyState) );
+	appMemset( KeyStatePrev, 0, sizeof(KeyStatePrev) );
+	JoyState = 0;
+	JoyStatePrev = 0;
+	InputUpdateTime = appSeconds();
+	SavedX = 0;
+	SavedY = 0;
 
 	// Init input.
 	if( GIsEditor )
@@ -362,7 +369,36 @@ void UKOSViewport::UpdateInput( UBOOL Reset )
 {
 	guard(UKOSViewport::UpdateInput);
 
+	if( Reset )
+	{
+		appMemset( KeyState, 0, sizeof(KeyState) );
+		appMemset( KeyStatePrev, 0, sizeof(KeyStatePrev) );
+		JoyState = 0;
+		JoyStatePrev = 0;
 
+		maple_device_t* Keyboard = maple_enum_type( 0, MAPLE_FUNC_KEYBOARD );
+		if( Keyboard )
+		{
+			kbd_state_t* State = (kbd_state_t*)maple_dev_status( Keyboard );
+			if( State )
+			{
+				appMemcpy( KeyState, State->matrix, sizeof(KeyState) );
+				appMemcpy( KeyStatePrev, State->matrix, sizeof(KeyStatePrev) );
+			}
+		}
+
+		maple_device_t* Controller = maple_enum_type( 0, MAPLE_FUNC_CONTROLLER );
+		if( Controller )
+		{
+			cont_state_t* State = (cont_state_t*)maple_dev_status( Controller );
+			if( State )
+			{
+				JoyState = State->buttons;
+				JoyStatePrev = State->buttons;
+			}
+		}
+		InputUpdateTime = appSeconds();
+	}
 	unguard;
 }
 

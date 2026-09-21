@@ -25,6 +25,10 @@ KOS_INIT_FLAGS( INIT_DEFAULT | INIT_CDROM | INIT_CONTROLLER | INIT_KEYBOARD | IN
 #include <stdio.h>
 
 #include "Engine.h"
+#if defined(PLATFORM_DREAMCAST)
+#include "UnDCStream.h"
+extern CORE_API void appDCCloseDat();
+#endif
 
 extern CORE_API FGlobalPlatform GTempPlatform;
 extern DLL_IMPORT UBOOL GTickDue;
@@ -57,11 +61,8 @@ static void init_thread_stack(void) {
     }
 }
 
-// What dbgio device was active at startup
-DLL_EXPORT const char* GStartupDbgDev = nullptr;
-
 //
-// Display error and lock up.
+// Report through the active serial/dcload device and lock up.
 //
 void FatalError( const char* Fmt, ... ) __attribute__((noreturn));
 void FatalError( const char* Fmt, ... )
@@ -72,14 +73,6 @@ void FatalError( const char* Fmt, ... )
 	va_start( Args, Fmt );
 	vsnprintf( Msg, sizeof( Msg ), Fmt, Args );
 	va_end( Args );
-
-	if( !dbgio_dev_get() || appStrcmp( dbgio_dev_get(), "fb" ) != 0 )
-	{
-		pvr_shutdown();
-		vid_init( DM_640x480, PM_RGB555 );
-		pvr_init_defaults();
-		dbgio_dev_select( "fb" );
-	}
 
 	printf( "%s\n\n", Msg );
 
@@ -99,9 +92,9 @@ void HandleAssertFail( const char* File, int Line, const char* Expr, const char*
 
 void HandleIrqException( irq_t Code, irq_context_t* Context, void* Data )
 {
-	bfont_draw_str_vram_fmt( 8, 8, true, "UNHANDLED EXCEPTION 0x%08x", Code );
-	bfont_draw_str_vram_fmt( 8, 32, true, "PC: %p PR: %p", (void*)Context->pc, (void*)Context->pr );
-	bfont_draw_str_vram_fmt( 8, 56, true, "SR: %p R0: %p", (void*)Context->sr, (void*)Context->r[0] );
+	printf( "UNHANDLED EXCEPTION 0x%08x\n", Code );
+	printf( "PC: %p PR: %p\n", (void*)Context->pc, (void*)Context->pr );
+	printf( "SR: %p R0: %p\n", (void*)Context->sr, (void*)Context->r[0] );
 
 	arch_stk_trace_at( Context->r[14], 0 );
 
@@ -135,12 +128,81 @@ void HandleError( const char* Exception )
 //
 // Initialize.
 //
-UEngine* InitEngine()
+UEngine* InitEngine( UBOOL InitializePlatform=1 )
 {
 	guard(InitEngine);
 
 	// Platform init.
-	appInit();
+	if( InitializePlatform )
+	{
+		appInit();
+	}
+#if defined(PLATFORM_DREAMCAST)
+	else
+	{
+		// RestartNativeCore has rebuilt objects, names and GSys. The process
+		// platform/config/log state deliberately survives across sessions.
+		GMem.Init( 32768 );
+	}
+#endif
+
+#if defined(PLATFORM_DREAMCAST)
+	// Exercise libc/libm through engine wrappers, with non-constant inputs.
+	volatile DOUBLE Numerator = 17.0;
+	volatile DOUBLE Denominator = 5.0;
+	DOUBLE Remainder = appFmod( Numerator, Denominator );
+	FLOAT Parsed = appAtof( "1.25" );
+	if( Remainder != 2.0 || Parsed != 1.25f )
+	{
+		appErrorf( "Dreamcast floating-point ABI self-test failed" );
+	}
+#endif
+
+#if defined(PLATFORM_DREAMCAST)
+	// The initial DCS2 stream includes Entry and the destination map. Restarted
+	// sessions use direct streams and load only their destination map, avoiding
+	// Entry's world and dependencies at the next map's peak. Missing streams
+	// retain the DCD1 compatibility path.
+	char StartupURL[1024] = "";
+	const char* PendingURL = appDCGetSessionTravelURL();
+	if( PendingURL )
+	{
+		appStrncpy( StartupURL, PendingURL, ARRAY_COUNT(StartupURL) );
+	}
+	else
+	{
+		const char* Cmd = appCmdLine();
+		if( !ParseToken(Cmd,StartupURL,ARRAY_COUNT(StartupURL),0) || StartupURL[0]=='-' )
+			GetConfigString( "URL", "LocalMap", StartupURL, ARRAY_COUNT(StartupURL) );
+	}
+	for( char* Delimiter = StartupURL; *Delimiter; ++Delimiter )
+	{
+		if( *Delimiter=='?' || *Delimiter=='#' )
+		{
+			*Delimiter = 0;
+			break;
+		}
+	}
+	const char* MapName = StartupURL;
+	for( const char* Cursor = StartupURL; *Cursor; ++Cursor )
+		if( *Cursor=='/' || *Cursor=='\\' )
+			MapName = Cursor + 1;
+	char StreamMap[128];
+	appStrncpy( StreamMap, MapName, ARRAY_COUNT(StreamMap) );
+	if( char* Extension = appStrchr(StreamMap,'.') )
+		*Extension = 0;
+	char StreamPath[256];
+	appSprintf( StreamPath, "../Maps/%s.dcs", StreamMap );
+	if( StreamMap[0] && appFSize(StreamPath)>0 )
+	{
+		appDCStreamOpen( StreamPath );
+		debugf( "DCSESSION startup_stream=%s", StreamPath );
+	}
+	else
+	{
+		debugf( "DCSESSION startup_stream_missing map=%s fallback=DCD1", StreamMap );
+	}
+#endif
 
 	// Init subsystems.
 #ifdef PLATFORM_LOW_MEMORY
@@ -224,6 +286,12 @@ void ExitEngine( UEngine* Engine )
 	guard(ExitEngine);
 
 	GObj.Exit();
+#if defined(PLATFORM_DREAMCAST)
+	// Release physical DAT ownership while the allocator is still valid.
+	// Outstanding texture slices must prevent a future session arena reset.
+	appDCCloseDat();
+	appDCStreamShutdown();
+#endif
 	GMem.Exit();
 	GDynMem.Exit();
 	GSceneMem.Exit();
@@ -232,6 +300,23 @@ void ExitEngine( UEngine* Engine )
 
 	unguard;
 }
+
+#if defined(PLATFORM_DREAMCAST)
+void RestartEngineSession()
+{
+	guard(RestartEngineSession);
+	debugf( "DCSESSION teardown_begin" );
+	DCProfileMemory( "session_before_teardown" );
+	GObj.RestartNativeCore( 1 );
+	GMem.Exit();
+	GDynMem.Exit();
+	GSceneMem.Exit();
+	GCache.Exit( 1 );
+	DCProfileMemory( "session_after_teardown" );
+	debugf( "DCSESSION teardown_complete" );
+	unguard;
+}
+#endif
 
 #ifdef PLATFORM_WIN32
 INT WINAPI WinMain( HINSTANCE hInInstance, HINSTANCE hPrevInstance, char* InCmdLine, INT nCmdShow )
@@ -250,10 +335,15 @@ int main( int argc, const char** argv )
 #ifdef PLATFORM_DREAMCAST
 	// fix thread stack underrun
 	init_thread_stack();
-	// Redirect dbgio to the framebuffer if we're not already using dcload.
-	GStartupDbgDev = dbgio_dev_get();
-	if( !GStartupDbgDev || !appStrstr( GStartupDbgDev, "dcl" ) )
-		dbgio_dev_select( "fb" );
+	// Keep dcload logging when present; standalone boots use serial only.
+	const char* DebugDevice = dbgio_dev_get();
+	if( !DebugDevice || !appStrstr( DebugDevice, "dcl" ) )
+	{
+		if( dbgio_dev_select( "scif" ) < 0 )
+		{
+			dbgio_dev_select( "null" );
+		}
+	}
 	assert_set_handler( HandleAssertFail );
 	irq_set_handler( EXC_UNHANDLED_EXC, HandleIrqException, nullptr );
 #ifdef DREAMCAST_USE_FATFS
@@ -297,10 +387,28 @@ int main( int argc, const char** argv )
 		// Start main loop.
 		GIsGuarded=1;
 		GSystem = &GTempPlatform;
+#if defined(PLATFORM_DREAMCAST)
+		UBOOL InitializePlatform = 1;
+		while( !GIsRequestingExit )
+		{
+			UEngine* Engine = InitEngine( InitializePlatform );
+			InitializePlatform = 0;
+			if( !GIsRequestingExit )
+				MainLoop( Engine );
+			if( !GIsRequestingExit && appDCHasSessionTravel() )
+			{
+				RestartEngineSession();
+				continue;
+			}
+			ExitEngine( Engine );
+			break;
+		}
+#else
 		UEngine* Engine = InitEngine();
 		if( !GIsRequestingExit )
 			MainLoop( Engine );
 		ExitEngine( Engine );
+#endif
 		GIsGuarded=0;
 #ifndef _DEBUG
 	}

@@ -54,6 +54,13 @@ class ENGINE_API UGameEngine : public UEngine
 	virtual void PaintProgress();
 };
 
+#if defined(PLATFORM_DREAMCAST)
+// Local travel survives restart as plain process-owned bytes. No UObject,
+// FString, FName or session allocation may escape through this interface.
+ENGINE_API UBOOL appDCHasSessionTravel();
+ENGINE_API const char* appDCGetSessionTravelURL();
+#endif
+
 /*-----------------------------------------------------------------------------
 	The End.
 -----------------------------------------------------------------------------*/

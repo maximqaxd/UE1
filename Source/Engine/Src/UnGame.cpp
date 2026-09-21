@@ -16,6 +16,105 @@
 
 IMPLEMENT_CLASS(UGameEngine);
 
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+extern CORE_API void appDCSetLinkerTablesReleased( UBOOL Released );
+
+static UBOOL GDCGameLinkersReleased = 0;
+
+static void DCReleaseGameLinkers( const char* Phase )
+{
+	if( GDCGameLinkersReleased )
+		return;
+
+	DWORD ReleasedTables = 0;
+	INT ReleasedLinkers = 0;
+	for( FObjectIterator It; It; ++It )
+	{
+		if( It->GetFlags() & (RF_NeedLoad | RF_NeedPostLoad) )
+			appErrorf( "DAT linker release found unfinished object: %s", It->GetFullName() );
+	}
+	for( TObjectIterator<ULinkerLoad> It; It; ++It )
+	{
+		ReleasedTables += It->NameMap.ArrayMax * sizeof(FName)
+			+ It->ImportMap.ArrayMax * sizeof(FObjectImport)
+			+ It->ExportMap.ArrayMax * sizeof(FObjectExport);
+		++ReleasedLinkers;
+	}
+	GObj.ResetLoaders( NULL );
+	appDCSetLinkerTablesReleased( 1 );
+	GDCGameLinkersReleased = 1;
+	debugf( "DCLINKER released phase=%s linkers=%d tables=%u", Phase, ReleasedLinkers, ReleasedTables );
+}
+#endif
+
+#if defined(PLATFORM_DREAMCAST)
+
+enum
+{
+	DC_SESSION_URL_BYTES = 1024,
+	DC_SESSION_ITEMS_BYTES = 16384
+};
+
+static UBOOL GDCSessionTravel = 0;
+static UBOOL GDCPlayProfilePending = 0;
+static char GDCSessionURL[DC_SESSION_URL_BYTES] = "";
+static char GDCSessionItems[DC_SESSION_ITEMS_BYTES] = "";
+
+UBOOL appDCHasSessionTravel()
+{
+	return GDCSessionTravel;
+}
+
+const char* appDCGetSessionTravelURL()
+{
+	return GDCSessionTravel ? GDCSessionURL : NULL;
+}
+
+static void DCSetSessionTravel( const FURL& URL, const char* TravelItems )
+{
+	FString URLText;
+	URL.String( URLText );
+	const char* Items = TravelItems ? TravelItems : "";
+	if( appStrlen(*URLText) >= DC_SESSION_URL_BYTES )
+		appErrorf( "Dreamcast session URL is too long (%d bytes)", appStrlen(*URLText) );
+	if( appStrlen(Items) >= DC_SESSION_ITEMS_BYTES )
+		appErrorf( "Dreamcast travel inventory is too large (%d bytes)", appStrlen(Items) );
+	appStrcpy( GDCSessionURL, *URLText );
+	appStrcpy( GDCSessionItems, Items );
+	GDCSessionTravel = 1;
+	debugf( "DCSESSION travel_pending url=%s items=%d", GDCSessionURL, appStrlen(GDCSessionItems) );
+}
+
+static void DCConsumeSessionTravel()
+{
+	debugf( "DCSESSION travel_restored url=%s items=%d", GDCSessionURL, appStrlen(GDCSessionItems) );
+	GDCSessionTravel = 0;
+	GDCSessionURL[0] = 0;
+	GDCSessionItems[0] = 0;
+}
+
+static UBOOL DCCanRestartTravel( const FURL& URL )
+{
+	return !ParseParam(appCmdLine(),"NODCSESSIONRESTART")
+		&& URL.IsLocalInternal()
+		&& !URL.HasOption("push")
+		&& !URL.HasOption("pop")
+		&& !URL.HasOption("load")
+		&& !URL.HasOption("failed");
+}
+#endif
+
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+static UBOOL DCDirectSessionStartup()
+{
+#if defined(PLATFORM_DREAMCAST)
+	return GDCSessionTravel;
+#else
+	return ParseParam( appCmdLine(), "DCDIRECTSESSION" );
+#endif
+}
+#endif
+
 /*-----------------------------------------------------------------------------
 	Temporary.
 -----------------------------------------------------------------------------*/
@@ -81,6 +180,10 @@ void UGameEngine::Init()
 
 	// Init variables.
 	GLevel = NULL;
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	GDCGameLinkersReleased = 0;
+	appDCSetLinkerTablesReleased( 0 );
+#endif
 
 	// Delete temporary files in cache.
 	appCleanFileCache();
@@ -101,12 +204,16 @@ void UGameEngine::Init()
 
 	// Load the entry level.
 	char Error256[256];
-	if( Client )
+	if( Client
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+		&& !DCDirectSessionStartup()
+#endif
+	)
 	{
 		if( !LoadMap( FURL("Entry"), NULL, Error256 ) )
 			appErrorf( LocalizeError("LoadEntry"), Error256 );
 		Exchange( GLevel, GEntry );
-#ifdef PLATFORM_LOW_MEMORY
+#if defined(PLATFORM_LOW_MEMORY) || defined(DC_RESOURCE_COOKER)
 		// Purge unused objects and flush caches.
 		Flush();
 		GObj.CollectGarbage( GSystem, RF_Intrinsic );
@@ -119,15 +226,30 @@ void UGameEngine::Init()
 
 	// Enter initial world.
 	char AutoURL[1024]="";
-	const char* Tmp = appCmdLine();
-	if
-	(	!ParseToken( Tmp, AutoURL, ARRAY_COUNT(AutoURL), 0 )
-	||	AutoURL[0]=='-' )
-		appStrcpy( AutoURL, *FURL::DefaultLocalMap );
-	FURL URL( &DefaultURL, AutoURL, TRAVEL_Partial );
+	ETravelType InitialTravel = TRAVEL_Partial;
+#if defined(PLATFORM_DREAMCAST)
+	if( GDCSessionTravel )
+	{
+		appStrncpy( AutoURL, GDCSessionURL, ARRAY_COUNT(AutoURL) );
+		InitialTravel = TRAVEL_Absolute;
+	}
+	else
+#endif
+	{
+		const char* Tmp = appCmdLine();
+		if
+		(	!ParseToken( Tmp, AutoURL, ARRAY_COUNT(AutoURL), 0 )
+		||	AutoURL[0]=='-' )
+			appStrcpy( AutoURL, *FURL::DefaultLocalMap );
+	}
+	FURL URL( &DefaultURL, AutoURL, InitialTravel );
 	if( !URL.Valid )
 		appErrorf( LocalizeError("InvalidUrl"), AutoURL );
-	UBOOL Success = Browse( FURL(&LastURL,AutoURL,TRAVEL_Partial), Error256 );
+	UBOOL Success = Browse(
+#if defined(PLATFORM_DREAMCAST)
+		GDCSessionTravel ? URL :
+#endif
+		FURL(&LastURL,AutoURL,TRAVEL_Partial), Error256 );
 
 	// If waiting for a network connection, go into the starting level.
 	if( !Success && !Error256[0] && appStricmp( AutoURL, *FURL::DefaultLocalMap )!=0 )
@@ -141,10 +263,27 @@ void UGameEngine::Init()
 	if( Client )
 	{
 		UViewport* Viewport = Client->NewViewport( GLevel, NAME_None );
-		if( !GLevel->SpawnPlayActor( Viewport, ROLE_SimulatedProxy, URL, "", Error256 ) )
+		const char* InitialItems =
+#if defined(PLATFORM_DREAMCAST)
+			GDCSessionTravel ? GDCSessionItems :
+#endif
+			"";
+		if( !GLevel->SpawnPlayActor( Viewport, ROLE_SimulatedProxy, URL, InitialItems, Error256 ) )
 			appErrorf( Error256 );
+#if defined(PLATFORM_DREAMCAST)
+		if( GDCSessionTravel )
+			DCConsumeSessionTravel();
+#endif
 		Viewport->Input->Init( Viewport, GSystem );
-		Viewport->OpenWindow( NULL, 0, Client->ViewportX, Client->ViewportY, INDEX_NONE, INDEX_NONE );
+		UBOOL OpenRuntimeWindow = 1;
+#if defined(DC_RESOURCE_COOKER)
+		OpenRuntimeWindow = !ParseParam(appCmdLine(),"COOKSESSION")
+			&& !ParseParam(appCmdLine(),"VERIFYSESSION");
+		if( !OpenRuntimeWindow )
+			debugf( "DCSESSION host_window_skipped" );
+#endif
+		if( OpenRuntimeWindow )
+			Viewport->OpenWindow( NULL, 0, Client->ViewportX, Client->ViewportY, INDEX_NONE, INDEX_NONE );
 		if( Audio )
 			Audio->SetViewport( Viewport );
 		if( GPendingLevel )
@@ -156,6 +295,29 @@ void UGameEngine::Init()
 			SetProgress( Msg1, Msg2, 60.0 );
 		}
 	}
+#if defined(PLATFORM_DREAMCAST)
+	else if( GDCSessionTravel )
+	{
+		// Dedicated sessions have no local viewport/player to receive inventory.
+		DCConsumeSessionTravel();
+	}
+	if( appDCStreamActive() )
+	{
+		appDCStreamFinish();
+		appDCStreamClose();
+	}
+	if( (!GLevel || !GLevel->NetDriver) && !GDCGameLinkersReleased )
+	{
+		DCReleaseGameLinkers( "engine_ready" );
+	}
+#elif defined(DC_RESOURCE_COOKER)
+	if( DCDirectSessionStartup()
+		&& (!GLevel || !GLevel->NetDriver)
+		&& !GDCGameLinkersReleased )
+	{
+		DCReleaseGameLinkers( "engine_ready" );
+	}
+#endif
 	debugf( NAME_Init, "Game engine initialized" );
 	unguard;
 }
@@ -456,6 +618,20 @@ ULevel* UGameEngine::LoadMap( const FURL& URL, UPendingLevel* Pending, char* Err
 	FString Str;
 	URL.String(Str);
 	debugf( NAME_Log, "LoadMap: %s", *Str );
+#if defined(PLATFORM_DREAMCAST)
+	DCProfileMemory( "load_begin" );
+	char DatPath[256];
+	char MapName[128];
+	appStrncpy( MapName, *URL.Map, ARRAY_COUNT(MapName) );
+	char* Extension = appStrchr( MapName, '.' );
+	if( Extension )
+	{
+		*Extension = 0;
+	}
+	snprintf( DatPath, sizeof(DatPath), "../Maps/%s.dat", MapName );
+	if( !appDCStreamActive() )
+		appDCOpenDat( DatPath );
+#endif
 
 	// Remember current level's stack level.
 	INT SavedHubStackLevel = GLevel ? GLevel->GetLevelInfo()->HubStackLevel : 0;
@@ -545,6 +721,9 @@ ULevel* UGameEngine::LoadMap( const FURL& URL, UPendingLevel* Pending, char* Err
 		guard(CleanupAfterExit);
 		Flush();
 		GObj.CollectGarbage( GSystem, RF_Intrinsic );
+#if defined(PLATFORM_DREAMCAST)
+		DCProfileMemory( "after_unload_gc" );
+#endif
 		unguard;
 	}
 	unguard;
@@ -554,6 +733,9 @@ ULevel* UGameEngine::LoadMap( const FURL& URL, UPendingLevel* Pending, char* Err
 	if( MapParent && Guid )
 		GObj.GetPackageLinker( MapParent, NULL, LOAD_Verify | LOAD_Throw | LOAD_KeepImports | LOAD_NoWarn, NULL, Guid );
 	GLevel = LoadObject<ULevel>( MapParent, "MyLevel", *URL.Map, LOAD_KeepImports | LOAD_NoFail, NULL );
+#if defined(PLATFORM_DREAMCAST)
+	appDCDatStats();
+#endif
 	check(!GLevel->NetDriver);
 	unguard;
 
@@ -623,6 +805,17 @@ ULevel* UGameEngine::LoadMap( const FURL& URL, UPendingLevel* Pending, char* Err
 	Flush();
 	GObj.CollectGarbage( GSystem, RF_Intrinsic );
 	unguard;
+
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	// The final session map has completed preload/postload here. Detach package
+	// tables before moving-brush reserves and BeginPlay allocations. A normal
+	// boot excludes Entry; a direct restarted session has no Entry level.
+	if( GEntry
+		&& !Pending
+		&& !GLevel->NetDriver
+		&& appDCStreamActive() )
+		DCReleaseGameLinkers( "map_loaded" );
+#endif
 
 	// Init collision.
 	GLevel->SetActorCollision( 1 );
@@ -853,6 +1046,10 @@ ULevel* UGameEngine::LoadMap( const FURL& URL, UPendingLevel* Pending, char* Err
 	unguard;
 
 	// Successfully started local level.
+#if defined(PLATFORM_DREAMCAST)
+	DCProfileMemory( "level_ready" );
+	GDCPlayProfilePending = 1;
+#endif
 	return GLevel;
 	unguard;
 }
@@ -1027,6 +1224,13 @@ INT UGameEngine::GetMaxTickRate()
 void UGameEngine::Tick( FLOAT DeltaSeconds )
 {
 	guard(UGameEngine::Tick);
+#if defined(PLATFORM_DREAMCAST)
+	if( GDCPlayProfilePending )
+	{
+		GDCPlayProfilePending = 0;
+		DCProfileMemory( "play" );
+	}
+#endif
 	INT LocalTickCycles=0;
 	uclock(LocalTickCycles);
 
@@ -1074,7 +1278,7 @@ void UGameEngine::Tick( FLOAT DeltaSeconds )
 		{
 			// Travel to new level, and exit.
 			TArray<FString> TravelNames;
-			TArray<FString>	TravelItems;
+			TArray<FString> TravelItems;
 			for( INT i=0; i<GLevel->Num(); i++ )
 			{
 				APlayerPawn* P = Cast<APlayerPawn>( GLevel->Element(i) );
@@ -1083,13 +1287,32 @@ void UGameEngine::Tick( FLOAT DeltaSeconds )
 					P->Player->TravelItems="";
 					if( Cast<UNetConnection>(P->Player) )
 						SetClientTravel( P->Player, GLevel->GetLevelInfo()->NextURL, 1, GLevel->GetLevelInfo()->bNextItems, TRAVEL_Relative );
-					if( Cast<UViewport>( P->Player ) )
+					if( Cast<UViewport>(P->Player) )
+					{
+#if defined(PLATFORM_DREAMCAST)
+						if( GLevel->GetLevelInfo()->bNextItems )
+							SetClientTravel( P->Player, NULL, 0, 1, TRAVEL_Relative );
+#endif
 						Cast<UViewport>( P->Player )->TravelURL = "";
+					}
 					new(TravelNames)FString(P->PlayerName);
 					new(TravelItems)FString(P->Player->TravelItems);
 				}
 			}
 			debugf( "Server switch level: %s", GLevel->GetLevelInfo()->NextURL );
+#if defined(PLATFORM_DREAMCAST)
+			FURL SessionURL( &LastURL, GLevel->GetLevelInfo()->NextURL, TRAVEL_Relative );
+			if( DCCanRestartTravel(SessionURL) )
+			{
+				const char* SessionItems = "";
+				if( Client && Client->Viewports.Num() )
+					SessionItems = *Client->Viewports(0)->TravelItems;
+				DCSetSessionTravel( SessionURL, SessionItems );
+				*GLevel->GetLevelInfo()->NextURL = 0;
+				GIsRunning = 0;
+				return;
+			}
+#endif
 			char Error256[256];
 			Browse( FURL(&LastURL,GLevel->GetLevelInfo()->NextURL,TRAVEL_Relative), Error256 );
 			*GLevel->GetLevelInfo()->NextURL = 0;
@@ -1106,9 +1329,19 @@ void UGameEngine::Tick( FLOAT DeltaSeconds )
 	{
 		// Travel to new level, and exit.
 		FString NextURL = Client->Viewports(0)->TravelURL;
+		ETravelType TravelType = Client->Viewports(0)->TravelType;
 		Client->Viewports(0)->TravelURL="";
+#if defined(PLATFORM_DREAMCAST)
+		FURL SessionURL( &LastURL, *NextURL, TravelType );
+		if( DCCanRestartTravel(SessionURL) )
+		{
+			DCSetSessionTravel( SessionURL, *Client->Viewports(0)->TravelItems );
+			GIsRunning = 0;
+			return;
+		}
+#endif
 		char Error256[256];
-		Browse( FURL(&LastURL,*NextURL,Client->Viewports(0)->TravelType), Error256 );
+		Browse( FURL(&LastURL,*NextURL,TravelType), Error256 );
 		return;
 	}
 	unguard;

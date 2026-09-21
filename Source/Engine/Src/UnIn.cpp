@@ -54,12 +54,15 @@ IMPLEMENT_CLASS(UInput);
 UInput::UInput()
 {
 	guard(UInput::UInput);
-	static UBOOL Registered=0;
 	InputKeys = FindObjectChecked<UEnum>( AActor::StaticClass, "EInputKey" );
+	UClass* Class = GetClass();
+#if defined(PLATFORM_DREAMCAST)
+	if( !::FindField<UProperty>(Class,"Aliases") )
+#else
+	static UBOOL Registered=0;
 	if( !Registered )
+#endif
 	{
-		UClass* Class=GetClass();
-
 		// Create input alias struct.
 		UStruct* AliasStruct = new(Class,"Alias")UStruct( NULL );
 		AliasStruct->SetPropertiesSize( sizeof(FName) + 64*sizeof(char));
@@ -78,7 +81,9 @@ UInput::UInput()
 		// Load config.
 		Class->GetDefaultObject()->LoadConfig( NAME_Config );
 
+#if !defined(PLATFORM_DREAMCAST)
 		Registered=1;
+#endif
 	}
 	unguard;
 }

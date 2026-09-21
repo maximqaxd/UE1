@@ -38,7 +38,13 @@ void ULevelBase::Destroy()
 		delete NetDriver;
 		NetDriver = NULL;
 	}
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	// The level owns its actor-pointer database. Bypassing UDatabase here
+	// leaks that allocation on every level unload or session restart.
+	UDatabase::Destroy();
+#else
 	UObject::Destroy();
+#endif
 	unguard;
 }
 void ULevelBase::NotifyProgress( const char* Str1, const char* Str2, FLOAT Seconds )
