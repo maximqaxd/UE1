@@ -5,7 +5,6 @@
 
 #define dcache_pref_block(a)	__builtin_prefetch(a)
 
-extern DLL_IMPORT const char* GStartupDbgDev;
 
 // Global PVR DR state 
 static pvr_dr_state_t GPVRDRState;
@@ -27,11 +26,33 @@ struct FPVRRenderCallback
 {
     virtual ~FPVRRenderCallback() {}
     virtual void Execute() = 0;
+    virtual DWORD MemoryBytes() const = 0;
 };
 
-static TArray<FPVRRenderCallback*> GPVROPCallbacks;
 static TArray<FPVRRenderCallback*> GPVRPTCallbacks;
 static TArray<FPVRRenderCallback*> GPVRTRCallbacks;
+static UBOOL GPVROpaqueListOpen = 0;
+static DWORD GPVROpaqueDirectBytes = 0;
+static DWORD GPVROpaqueDirectCount = 0;
+
+static void QueuePVRCallback( pvr_list_t List, FPVRRenderCallback* Callback )
+{
+	if( List == PVR_LIST_OP_POLY && GPVROpaqueListOpen )
+	{
+		GPVROpaqueDirectBytes += Callback->MemoryBytes();
+		++GPVROpaqueDirectCount;
+		Callback->Execute();
+		delete Callback;
+	}
+	else if( List == PVR_LIST_PT_POLY )
+	{
+		GPVRPTCallbacks.AddItem( Callback );
+	}
+	else
+	{
+		GPVRTRCallbacks.AddItem( Callback );
+	}
+}
 
 // Software viewport matrix for PVR (row-major 4x4)
 static FLOAT GPVRScreenView[4][4];
@@ -231,6 +252,15 @@ static inline void BuildPolyHeader( UPVRRenderDevice* RD, DWORD PolyFlags, const
         else
             PvrFmt |= PVR_TXRFMT_NONTWIDDLED;
         pvr_poly_cxt_txr( &Cxt, OutList, PvrFmt, USize, VSize, RD->TexInfo.CurrentBind->Tex, RD->NoFiltering ? PVR_FILTER_NONE : PVR_FILTER_BILINEAR );
+#if defined(PLATFORM_DREAMCAST)
+		if( Info->Format == TEXF_EXT_DCTEX )
+		{
+			const UPVRRenderDevice::FTexBind& Bind = *RD->TexInfo.CurrentBind;
+			pvr_poly_cxt_txr( &Cxt, OutList, Bind.DCFormat, Bind.DCWidth, Bind.DCHeight,
+				Bind.Tex, RD->NoFiltering ? PVR_FILTER_NONE : PVR_FILTER_BILINEAR );
+			Cxt.txr.mipmap = Bind.DCMipMapped;
+		}
+#endif
     }
     else
     {
@@ -317,27 +347,39 @@ void UPVRRenderDevice::InternalClassInitializer( UClass* Class )
 }
 
 static UPVRRenderDevice* GPVRDeviceInstance = NULL;
+#if defined(PLATFORM_DREAMCAST)
+static UBOOL GPVRSessionInitialized = 0;
+extern ENGINE_API UBOOL appDCHasSessionTravel();
+#endif
 
 UPVRRenderDevice::UPVRRenderDevice()
 {
 	NoFiltering = false;
 	VRAMUsed = 0;
+	TextureFrame = 0;
 }
 
 UBOOL UPVRRenderDevice::Init( UViewport* InViewport )
 {
 	guard(UPVRRenderDevice::Init)
 
-	// if we were using fb dbgio, disable it before initializing PVR
-	const char* DbgDev = dbgio_dev_get();
-	if( DbgDev && !appStrcmp( DbgDev, "fb" ) )
+#if defined(PLATFORM_DREAMCAST)
+	struct mallinfo InitBefore = mallinfo();
+	UBOOL ReusedPVR = GPVRSessionInitialized;
+	if( !GPVRSessionInitialized )
 	{
-		// try to drop back to whatever we had at startup first
-		if( !GStartupDbgDev || dbgio_dev_select( GStartupDbgDev ) < 0 )
-			dbgio_dev_select( "null" );
+		if( pvr_init(&params) < 0 )
+			appErrorf("PVR initialization failed");
+		GPVRSessionInitialized = 1;
 	}
-
+	struct mallinfo InitAfter = mallinfo();
+	debugf( "DCPVRLIFETIME phase=init reused=%d heap_before=%u heap_after=%u delta=%d",
+		ReusedPVR,
+		(DWORD)InitBefore.uordblks, (DWORD)InitAfter.uordblks,
+		(INT)InitAfter.uordblks - (INT)InitBefore.uordblks );
+#else
     pvr_init(&params);
+#endif
     InitScreenViewMatrix();
 	SupportsFogMaps = false; // true;
 	SupportsDistanceFog = false; // true;
@@ -366,7 +408,11 @@ void UPVRRenderDevice::Exit()
 {
 	guard(UPVRRenderDevice::Exit);
 
-	debugf( NAME_Log, "Shutting down OpenGL renderer" );
+	debugf( NAME_Log, "Shutting down PVR renderer" );
+
+	// Texture and command-list memory may still be referenced by the previous
+	// scene. Session teardown must not reclaim either until TA/PVR is idle.
+	pvr_wait_ready();
 
 	Flush();
 
@@ -377,6 +423,26 @@ void UPVRRenderDevice::Exit()
 	}
 	ComposeSize = 0;
 	GPVRDeviceInstance = NULL;
+#if defined(PLATFORM_DREAMCAST)
+	// Level travel rebuilds the UObject graph, but the KOS PVR subsystem owns
+	// process-wide command buffers and interrupt state. Keep it alive across
+	// sessions; Flush above has released all renderer-owned textures.
+	if( !appDCHasSessionTravel() )
+	{
+		struct mallinfo ShutdownBefore = mallinfo();
+		pvr_shutdown();
+		GPVRSessionInitialized = 0;
+		struct mallinfo ShutdownAfter = mallinfo();
+		debugf( "DCPVRLIFETIME phase=shutdown heap_before=%u heap_after=%u delta=%d",
+			(DWORD)ShutdownBefore.uordblks, (DWORD)ShutdownAfter.uordblks,
+			(INT)ShutdownAfter.uordblks - (INT)ShutdownBefore.uordblks );
+	}
+	else
+	{
+		struct mallinfo TravelHeap = mallinfo();
+		debugf( "DCPVRLIFETIME phase=travel_keepalive heap=%u", (DWORD)TravelHeap.uordblks );
+	}
+#endif
 
 	unguard;
 }
@@ -415,10 +481,24 @@ UBOOL UPVRRenderDevice::Exec( const char* Cmd, FOutputDevice* Out )
 void UPVRRenderDevice::Lock( FPlane FlashScale, FPlane FlashFog, FPlane ScreenClear, DWORD RenderLockFlags, BYTE* InHitData, INT* InHitSize )
 {
 	guard(UPVRRenderDevice::Lock);
+	// Texture uploads and eviction happen while building this frame's lists.
+	// Wait here, before either can alter memory used by the previous scene.
+	pvr_wait_ready();
+	++TextureFrame;
 
-	GPVROPCallbacks.Empty();
 	GPVRPTCallbacks.Empty();
 	GPVRTRCallbacks.Empty();
+	GPVROpaqueDirectBytes = 0;
+	GPVROpaqueDirectCount = 0;
+
+	// Opaque geometry is the dominant callback allocation. It is already
+	// generated in opaque order, so send it straight to the TA and retain only
+	// the later translucent and punch-through lists.
+	pvr_set_bg_color( 0.f, 0.f, 0.f );
+	pvr_scene_begin();
+	pvr_dr_init( &GPVRDRState );
+	pvr_list_begin( PVR_LIST_OP_POLY );
+	GPVROpaqueListOpen = 1;
 
 	if( FlashScale != FPlane(0.5f, 0.5f, 0.5f, 0.0f) || FlashFog != FPlane(0.0f, 0.0f, 0.0f, 0.0f) )
 		ColorMod = FPlane( FlashFog.X, FlashFog.Y, FlashFog.Z, 1.f - Min( FlashScale.X * 2.f, 1.f ) );
@@ -428,33 +508,50 @@ void UPVRRenderDevice::Lock( FPlane FlashScale, FPlane FlashFog, FPlane ScreenCl
 	unguard;
 }
 
-// Forward decl for engine mem dump
-ENGINE_API void DumpMemStatsDC( const char* Tag );
-
 void UPVRRenderDevice::Unlock( UBOOL Blit )
 {
 	guard(UPVRRenderDevice::Unlock);
 
-	static DWORD Frame = 0;
+	DWORD CallbackBytes = 0;
+	for( INT i = 0; i < GPVRPTCallbacks.Num(); ++i )
+		CallbackBytes += GPVRPTCallbacks(i)->MemoryBytes();
+	for( INT i = 0; i < GPVRTRCallbacks.Num(); ++i )
+		CallbackBytes += GPVRTRCallbacks(i)->MemoryBytes();
+	DWORD QueueBytes = (GPVRPTCallbacks.ArrayMax + GPVRTRCallbacks.ArrayMax)
+		* sizeof(FPVRRenderCallback*);
+	static DWORD CallbackPeak = 0;
+	if( TextureFrame == 1 )
+		CallbackPeak = 0;
+	CallbackPeak = Max(CallbackPeak, CallbackBytes + QueueBytes);
+	if( TextureFrame <= 3 )
+	{
+		struct mallinfo Heap = mallinfo();
+		debugf(
+			"DCPVRMEM phase=before_submit heap=%u callbacks=%u opaque_direct=%u "
+			"queue_capacity=%u queue_peak=%u compose=%u op=%u pt=%d tr=%d",
+			(DWORD)Heap.uordblks, CallbackBytes, GPVROpaqueDirectBytes, QueueBytes,
+			CallbackPeak, ComposeSize, GPVROpaqueDirectCount,
+			GPVRPTCallbacks.Num(), GPVRTRCallbacks.Num());
+	}
 
-	pvr_wait_ready();
-	pvr_set_bg_color( 0.f, 0.f, 0.f );
-	pvr_scene_begin();
+	// The opaque list has been populated directly since Lock().
+	pvr_list_finish();
+	GPVROpaqueListOpen = 0;
 
-	// Render OP_POLY list
-	if( GPVROPCallbacks.Num() > 0 )
+	// Render TR_POLY list.
+	if( GPVRTRCallbacks.Num() > 0 )
 	{
 		pvr_dr_init( &GPVRDRState );
-		pvr_list_begin( PVR_LIST_OP_POLY );
-		for( INT i = 0; i < GPVROPCallbacks.Num(); i++ )
+		pvr_list_begin( PVR_LIST_TR_POLY );
+		for( INT i = 0; i < GPVRTRCallbacks.Num(); i++ )
 		{
-			GPVROPCallbacks(i)->Execute();
-			delete GPVROPCallbacks(i);
+			GPVRTRCallbacks(i)->Execute();
+			delete GPVRTRCallbacks(i);
 		}
 		pvr_list_finish();
 	}
 
-	// Render PT_POLY list
+	// Render PT_POLY list.
 	if( GPVRPTCallbacks.Num() > 0 )
 	{
 		PVR_SET(0x11C, 64); // PT Alpha test value
@@ -468,48 +565,18 @@ void UPVRRenderDevice::Unlock( UBOOL Blit )
 		pvr_list_finish();
 	}
 
-	// Render TR_POLY list
-	if( GPVRTRCallbacks.Num() > 0 )
-	{
-		pvr_dr_init( &GPVRDRState );
-		pvr_list_begin( PVR_LIST_TR_POLY );
-		for( INT i = 0; i < GPVRTRCallbacks.Num(); i++ )
-		{
-			GPVRTRCallbacks(i)->Execute();
-			delete GPVRTRCallbacks(i);
-		}
-		pvr_list_finish();
-	}
-
 	// Measure TA vertex-buffer usage BEFORE scene_finish (which resets POS).
 	// If the buffer fills, the TA silently drops subsequent polys -> geometry
 	// vanishes depending on view angle. Track peak usage / detect overflow.
-	static DWORD MaxVertUsed = 0;
 	{
 		const size_t End  = PVR_GET(PVR_TA_VERTBUF_END);
 		const size_t Pos  = PVR_GET(PVR_TA_VERTBUF_POS);
 		const DWORD  Free = (End > Pos) ? (DWORD)(End - Pos) : 0;
-		const DWORD  Used = (DWORD)params.vertex_buf_size - Free;
-		if( Used > MaxVertUsed ) MaxVertUsed = Used;
 		if( Free == 0 )
 			debugf( "PVR: TA VERTEX BUFFER FULL (Pos=%u End=%u) - geometry being dropped!", (unsigned)Pos, (unsigned)End );
 	}
 
 	pvr_scene_finish();
-
-	++Frame;
-	if( Frame == 1 )
-	{
-		DumpMemStatsDC( "after first scene" );
-	}
-	if( ( Frame & 0xff ) == 0 )
-	{
-		debugf( "Frame %d: OP=%d PT=%d TR=%d, peak TA vert used=%u / %u",
-			Frame, GPVROPCallbacks.Num(), GPVRPTCallbacks.Num(), GPVRTRCallbacks.Num(),
-			(unsigned)MaxVertUsed, (unsigned)params.vertex_buf_size );
-		PrintMemStats();
-		DumpMemStatsDC( "after several scenes" );
-	}
 
 	unguard;
 }
@@ -535,6 +602,10 @@ void UPVRRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& Surf
 		FSceneNode* Frame;
 		TArray<FPVRClipVert> ClippedVerts;
 		UBOOL ReverseWinding;
+		virtual DWORD MemoryBytes() const override
+		{
+			return sizeof(*this) + ClippedVerts.ArrayMax * sizeof(FPVRClipVert);
+		}
 		
 		virtual void Execute() override
 		{
@@ -598,13 +669,7 @@ void UPVRRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& Surf
             for( INT i = 0; i < C; i++ )
                 CB->ClippedVerts.AddItem( Clipped[i] );
             
-            // Add to appropriate list
-            if( List == PVR_LIST_OP_POLY )
-                GPVROPCallbacks.AddItem( CB );
-            else if( List == PVR_LIST_PT_POLY )
-                GPVRPTCallbacks.AddItem( CB );
-            else
-                GPVRTRCallbacks.AddItem( CB );
+            QueuePVRCallback( List, CB );
         }
     }
 
@@ -644,12 +709,7 @@ void UPVRRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& Surf
             for( INT i = 0; i < C; i++ )
                 CB->ClippedVerts.AddItem( Clipped[i] );
             
-            if( List == PVR_LIST_OP_POLY )
-                GPVROPCallbacks.AddItem( CB );
-            else if( List == PVR_LIST_PT_POLY )
-                GPVRPTCallbacks.AddItem( CB );
-            else
-                GPVRTRCallbacks.AddItem( CB );
+            QueuePVRCallback( List, CB );
         }
     }
 
@@ -690,12 +750,7 @@ void UPVRRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& Surf
 			for( INT i = 0; i < C; i++ )
 				CB->ClippedVerts.AddItem( Clipped[i] );
 			
-			if( List == PVR_LIST_OP_POLY )
-				GPVROPCallbacks.AddItem( CB );
-			else if( List == PVR_LIST_PT_POLY )
-				GPVRPTCallbacks.AddItem( CB );
-			else
-				GPVRTRCallbacks.AddItem( CB );
+			QueuePVRCallback( List, CB );
 		}
 	}
 
@@ -721,6 +776,10 @@ void UPVRRenderDevice::DrawGouraudPolygon( FSceneNode* Frame, FTextureInfo& Text
 		pvr_poly_hdr_t Hdr;
 		FSceneNode* Frame;
 		TArray<FPVRClipVert> ClippedVerts;
+		virtual DWORD MemoryBytes() const override
+		{
+			return sizeof(*this) + ClippedVerts.ArrayMax * sizeof(FPVRClipVert);
+		}
 		
 		virtual void Execute() override
 		{
@@ -766,12 +825,7 @@ void UPVRRenderDevice::DrawGouraudPolygon( FSceneNode* Frame, FTextureInfo& Text
             for( INT i = 0; i < C; i++ )
                 CB->ClippedVerts.AddItem( Clipped[i] );
             
-            if( List == PVR_LIST_OP_POLY )
-                GPVROPCallbacks.AddItem( CB );
-            else if( List == PVR_LIST_PT_POLY )
-                GPVRPTCallbacks.AddItem( CB );
-            else
-                GPVRTRCallbacks.AddItem( CB );
+            QueuePVRCallback( List, CB );
         }
     }
 
@@ -804,12 +858,7 @@ void UPVRRenderDevice::DrawGouraudPolygon( FSceneNode* Frame, FTextureInfo& Text
             for( INT i = 0; i < CF; i++ )
                 FogCB->ClippedVerts.AddItem( ClipF[i] );
             
-            if( FogList == PVR_LIST_OP_POLY )
-                GPVROPCallbacks.AddItem( FogCB );
-            else if( FogList == PVR_LIST_PT_POLY )
-                GPVRPTCallbacks.AddItem( FogCB );
-            else
-                GPVRTRCallbacks.AddItem( FogCB );
+            QueuePVRCallback( FogList, FogCB );
         }
 	}
 
@@ -887,6 +936,7 @@ void UPVRRenderDevice::DrawTile( FSceneNode* Frame, FTextureInfo& Texture, FLOAT
 
 	struct FDrawTileCallback : public FPVRRenderCallback
 	{
+		virtual DWORD MemoryBytes() const override { return sizeof(*this); }
 		pvr_poly_hdr_t Hdr;
 		FSceneNode* Frame;
 		FLOAT Ax, Ay, Bx, By, Cx, Cy, Dx, Dy;
@@ -960,6 +1010,7 @@ void UPVRRenderDevice::EndFlash( )
 	// Create callback for flash (always TR_POLY for 2D)
 	struct FEndFlashCallback : public FPVRRenderCallback
 	{
+		virtual DWORD MemoryBytes() const override { return sizeof(*this); }
 		pvr_poly_hdr_t Hdr;
 		FLOAT W, H, Z;
 		DWORD ARGB;
@@ -1153,7 +1204,13 @@ void UPVRRenderDevice::SetTexture( FTextureInfo& Info, DWORD PolyFlags, FLOAT Pa
 	const QWORD NewCacheID = Info.CacheID;
 	const UBOOL RealtimeChanged = ( Info.TextureFlags & TF_RealtimeChanged ) != 0;
 	if( !RealtimeChanged && NewCacheID == Tex.CurrentCacheID )
-		return;
+	{
+		if( Tex.CurrentBind && Tex.CurrentBind->Tex )
+		{
+			Tex.CurrentBind->LastUsedFrame = TextureFrame;
+			return;
+		}
+	}
 
 	const QWORD LookupID = NewCacheID & ~0xFFULL;
 	const BYTE NewType = NewCacheID & 0xFF;
@@ -1168,8 +1225,9 @@ void UPVRRenderDevice::SetTexture( FTextureInfo& Info, DWORD PolyFlags, FLOAT Pa
 	// Make current.
 	Tex.CurrentCacheID = NewCacheID;
 	Tex.CurrentBind = Bind;
+	Bind->LastUsedFrame = TextureFrame;
 
-	if( NewTexture || RealtimeChanged || Bind->LastType != NewType )
+	if( NewTexture || !Bind->Tex || RealtimeChanged || Bind->LastType != NewType )
 	{
 		// New texture or it has changed, upload it to VRAM.
 		Bind->LastType = NewType;
@@ -1330,6 +1388,35 @@ void* UPVRRenderDevice::ConvertTextureMipBGRA7777( const FMipmap* Mip )
 	return Compose;
 }
 
+pvr_ptr_t UPVRRenderDevice::AllocateTexture( INT Size )
+{
+	pvr_ptr_t Result = pvr_mem_malloc( Size );
+	while( !Result )
+	{
+		FTexBind* Oldest = NULL;
+		for( INT i = 0; i < BindMap.Size(); ++i )
+		{
+			FTexBind& Candidate = BindMap[i];
+			if( Candidate.Tex && &Candidate != TexInfo.CurrentBind
+				&& Candidate.LastUsedFrame != TextureFrame
+				&& (!Oldest || Candidate.LastUsedFrame < Oldest->LastUsedFrame) )
+			{
+				Oldest = &Candidate;
+			}
+		}
+		if( !Oldest )
+		{
+			appErrorf( "PVR frame working set exceeds VRAM: request=%i resident=%u", Size, VRAMUsed );
+		}
+		pvr_mem_free( Oldest->Tex );
+		VRAMUsed -= Oldest->SizeBytes;
+		Oldest->Tex = NULL;
+		Oldest->SizeBytes = 0;
+		Result = pvr_mem_malloc( Size );
+	}
+	return Result;
+}
+
 void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, const UBOOL NewTexture )
 {
 	guard(UPVRRenderDevice::UploadTexture);
@@ -1350,11 +1437,23 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, const UBOOL NewTexture
 #if defined(PLATFORM_DREAMCAST)
 	if( !Mip0->DataPtr )
 	{
-		if( Info.Texture && Info.Texture->GetLinker() )
+		if( Mip0->StreamData.Size() )
+		{
+			DCLoaded = (BYTE*)appMalloc( Mip0->StreamData.Size(), "DatTexStream" );
+			Mip0->StreamData.Read( DCLoaded );
+			Mip0->DataPtr = DCLoaded;
+		}
+		else if( Info.Texture && Info.Texture->GetLinker() )
 		{
 			ULinkerLoad* L = Info.Texture->GetLinker();
 			FArchiveFileLoad* FL = (FArchiveFileLoad*)L; 
-			if( Mip0->DCDataSize > 0 && Mip0->DCDataOffset > 0 )
+			if( appDCStreamActive() && Mip0->DCDataSize > 0 )
+			{
+				DCLoaded = (BYTE*)appMalloc( Mip0->DCDataSize, "DatTexFirstUse" );
+				Mip0->ReadDCData( *FL, DCLoaded );
+				Mip0->DataPtr = DCLoaded;
+			}
+			else if( Mip0->DCDataSize > 0 && Mip0->DCDataOffset > 0 )
 			{
 				FILE* F = appFopen( FL->Filename, "rb" );
 				if( F )
@@ -1380,7 +1479,46 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, const UBOOL NewTexture
 		}
 	}
 #endif
-	if( Info.Format == TEXF_EXT_ARGB1555_VQ )
+	if( Info.Format == TEXF_EXT_DCTEX )
+	{
+		const BYTE* Data = Mip0->DataPtr;
+		INT Size = Mip0->DataArray.Num() ? Mip0->DataArray.Num() : Mip0->DCDataSize;
+		DWORD Header[8];
+		if( !Data || Size < 32 )
+		{
+			appErrorf( "Missing DT texture data" );
+		}
+		appMemcpy( Header, Data, sizeof(Header) );
+		INT HeaderSize = (Data[9] + 1) * 32;
+		DWORD Mode = Header[4];
+		INT Width = 8 << ((Mode >> 3) & 7);
+		INT Height = 8 << (Mode & 7);
+		if( Header[0] != 0x78546344 || Header[1] != (DWORD)Size || Data[8] != 0
+			|| HeaderSize >= Size || ((Mode & 0x40000000) && Data[10] != 255)
+			|| ((Mode & 0x80000000) && Width != Height) )
+		{
+			appErrorf( "Unsupported or invalid DT texture header" );
+		}
+
+		if( Bind->Tex )
+		{
+			pvr_mem_free( Bind->Tex );
+			VRAMUsed -= Bind->SizeBytes;
+		}
+		Bind->SizeBytes = Size - HeaderSize;
+		Bind->Tex = AllocateTexture( Bind->SizeBytes );
+		if( !Bind->Tex )
+		{
+			appErrorf( "DT VRAM allocation failed: %i bytes", Bind->SizeBytes );
+		}
+		pvr_txr_load( Data + HeaderSize, Bind->Tex, Bind->SizeBytes );
+		VRAMUsed += Bind->SizeBytes;
+		Bind->DCFormat = Mode & 0x7e000000;
+		Bind->DCWidth = Width;
+		Bind->DCHeight = Height;
+		Bind->DCMipMapped = (Mode & 0x80000000) != 0;
+	}
+	else if( Info.Format == TEXF_EXT_ARGB1555_VQ )
 	{
 		const INT SizeBytes =
 			(Mip0->DataArray.Num() > 0) ? Mip0->DataArray.Num() :
@@ -1397,7 +1535,7 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, const UBOOL NewTexture
 			Bind->Tex = NULL;
 			Bind->SizeBytes = 0;
 		}
-		Bind->Tex = pvr_mem_malloc( SizeBytes );
+		Bind->Tex = AllocateTexture( SizeBytes );
 		if( Bind->Tex )
 		{
 			pvr_txr_load( Mip0->DataPtr ? Mip0->DataPtr : (Mip0->DataArray.Num() ? &Mip0->DataArray(0) : nullptr), Bind->Tex, SizeBytes );
@@ -1420,7 +1558,7 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, const UBOOL NewTexture
 			Bind->Tex = NULL;
 			Bind->SizeBytes = 0;
 		}
-		Bind->Tex = pvr_mem_malloc( SizeBytes );
+		Bind->Tex = AllocateTexture( SizeBytes );
 		if( Bind->Tex )
 		{
 			pvr_txr_load( Lin, Bind->Tex, SizeBytes );
@@ -1443,7 +1581,7 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, const UBOOL NewTexture
 			Bind->Tex = NULL;
 			Bind->SizeBytes = 0;
 		}
-		Bind->Tex = pvr_mem_malloc( SizeBytes );
+		Bind->Tex = AllocateTexture( SizeBytes );
 		if( Bind->Tex )
 		{
 			pvr_txr_load( Lin, Bind->Tex, SizeBytes );
@@ -1461,7 +1599,8 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, const UBOOL NewTexture
 	}
 #endif
 	// If this wasn't a lightmap, UI texture or realtime texture, free SH4-side data.
-	if( !TexInfo.bIsTile && Info.Format != TEXF_BGRA8_LM && !( Info.TextureFlags & (TF_Realtime|TF_RealtimePalette|TF_Parametric) ) )
+	if( !TexInfo.bIsTile && Info.Format != TEXF_BGRA8_LM && Info.Format != TEXF_P8
+		&& !( Info.TextureFlags & (TF_Realtime|TF_RealtimePalette|TF_Parametric) ) )
 	{
 		for( INT i = 0; i < Info.NumMips; ++i )
 		{
@@ -1488,4 +1627,3 @@ extern "C" DLL_EXPORT DWORD PVR_GetVRAMUsed()
 {
 	return GPVRDeviceInstance ? GPVRDeviceInstance->GetVRAMUsed() : 0;
 }
- 

@@ -28,6 +28,11 @@ class DLL_EXPORT UPVRRenderDevice : public URenderDevice
         pvr_ptr_t Tex;
 		BYTE LastType;
 		INT  SizeBytes;
+		DWORD DCFormat;
+		INT DCWidth;
+		INT DCHeight;
+		UBOOL DCMipMapped;
+		DWORD LastUsedFrame;
 	};
 	TMap<QWORD, FTexBind> BindMap;
 
@@ -51,6 +56,7 @@ class DLL_EXPORT UPVRRenderDevice : public URenderDevice
 	FLOAT RFX2, RFY2;
 	FPlane ColorMod;
 	DWORD VRAMUsed;
+	DWORD TextureFrame;
 
 	struct FCachedSceneNode
 	{
@@ -91,6 +97,7 @@ class DLL_EXPORT UPVRRenderDevice : public URenderDevice
 	void SetTexture( FTextureInfo& Info, DWORD PolyFlags, FLOAT PanBias );
 	void ResetTexture( );
 	void UploadTexture( FTextureInfo& Info, const UBOOL NewTexture );
+	pvr_ptr_t AllocateTexture( INT Size );
 	void EnsureComposeSize( const DWORD NewSize );
 	void* ConvertTextureMipI8( const FMipmap* Mip, const FColor* Palette );
 	void* ConvertTextureMipBGRA7777( const FMipmap* Mip );

@@ -29,8 +29,76 @@ IMPLEMENT_CLASS(URender);
 // URender statics.
 DWORD 								URender::Stamp;
 FMemStack							URender::VectorMem;
+#if defined(PLATFORM_DREAMCAST)
+FTransform**						URender::PointCache;
+BYTE*							URender::PointCacheStamps;
+#else
 URender::FStampedPoint*				URender::PointCache;
+#endif
 URender::FDynamicsCache*			URender::DynamicsCache;
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+INT URender::PointCacheCapacity = 0;
+INT URender::DynamicsCacheCapacity = 0;
+
+void URender::EnsureDCModelCaches()
+{
+	INT Points = 0;
+	INT Nodes = 0;
+	// Include all loaded worlds: warp-zone child frames can use another level.
+	// Max(), not Num(), includes the moving-brush sparse allocation reserve.
+	for( TObjectIterator<ULevel> It; It; ++It )
+	{
+		if( It->Model && It->Model->Points && It->Model->Nodes )
+		{
+			Points = Max( Points, It->Model->Points->Max() );
+			Nodes = Max( Nodes, It->Model->Nodes->Max() );
+		}
+	}
+	UBOOL Changed = 0;
+	if( Points > PointCacheCapacity )
+	{
+		delete[] PointCache;
+#if defined(PLATFORM_DREAMCAST)
+		delete[] PointCacheStamps;
+#endif
+		PointCacheCapacity = Points;
+#if defined(PLATFORM_DREAMCAST)
+		PointCache = new FTransform*[PointCacheCapacity];
+		PointCacheStamps = new BYTE[PointCacheCapacity];
+		appMemset( PointCache, 0, PointCacheCapacity * sizeof(FTransform*) );
+		appMemset( PointCacheStamps, 0xff, PointCacheCapacity * sizeof(BYTE) );
+#else
+		PointCache = new FStampedPoint[PointCacheCapacity];
+		for( INT i = 0; i < PointCacheCapacity; ++i )
+		{
+			PointCache[i].Point = NULL;
+			PointCache[i].Stamp = Stamp;
+		}
+#endif
+		Changed = 1;
+	}
+	if( Nodes > DynamicsCacheCapacity )
+	{
+		delete[] DynamicsCache;
+		DynamicsCacheCapacity = Nodes;
+		DynamicsCache = new FDynamicsCache[DynamicsCacheCapacity];
+		appMemset( DynamicsCache, 0, DynamicsCacheCapacity * sizeof(FDynamicsCache) );
+		Changed = 1;
+	}
+	if( Changed )
+	{
+		debugf( "DCRCACHE points=%d nodes=%d bytes=%u",
+			PointCacheCapacity, DynamicsCacheCapacity,
+			(DWORD)(PointCacheCapacity *
+#if defined(PLATFORM_DREAMCAST)
+				(sizeof(FTransform*) + sizeof(BYTE))
+#else
+				sizeof(FStampedPoint)
+#endif
+				+ DynamicsCacheCapacity * sizeof(FDynamicsCache)) );
+	}
+}
+#endif
 INT									URender::NumDynLightSurfs;
 INT									URender::NumDynLightLeaves;
 INT									URender::MaxSurfLights;
@@ -98,15 +166,26 @@ void URender::Init( UEngine* InEngine )
 	NumDynLightLeaves = 0;
 
 	// Allocate rendering stuff.
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	PointCache = NULL;
+	DynamicsCache = NULL;
+	PointCacheCapacity = DynamicsCacheCapacity = 0;
+#if defined(PLATFORM_DREAMCAST)
+	PointCacheStamps = NULL;
+#endif
+#else
 	PointCache		= new FStampedPoint [MAX_POINTS];
 	DynamicsCache   = new FDynamicsCache[MAX_NODES];
 	appMemset( DynamicsCache, 0, MAX_NODES * sizeof(FDynamicsCache) );
+#endif
 
 	GCache.Flush();
 
 	// Caches.
+#if !defined(PLATFORM_DREAMCAST) && !defined(DC_RESOURCE_COOKER)
 	for( INT i=0; i<MAX_POINTS;  i++ )
 		PointCache [i].Stamp = Stamp;
+#endif
 	VectorMem.Init( 16384 );
 
 	// Init stats.
@@ -126,10 +205,27 @@ void URender::Destroy()
 {
 	guard(URender::Destroy);
 
-	delete PointCache;
-	delete DynamicsCache;
+	delete[] PointCache;
+#if defined(PLATFORM_DREAMCAST)
+	delete[] PointCacheStamps;
+#endif
+	delete[] DynamicsCache;
+	PointCache = NULL;
+	DynamicsCache = NULL;
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	PointCacheCapacity = DynamicsCacheCapacity = 0;
+#if defined(PLATFORM_DREAMCAST)
+	PointCacheStamps = NULL;
+#endif
+#endif
 	if( SurfLights ) appFree(SurfLights);
 	if( LeafLights ) appFree(LeafLights);
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	SurfLights = NULL;
+	LeafLights = NULL;
+	MaxSurfLights = MaxLeafLights = 0;
+	GRender = NULL;
+#endif
 
 	GLightManager->Exit();
 	VectorMem.Exit();
@@ -425,6 +521,19 @@ void URender::PostRender( FSceneNode* Frame )
 UBOOL URender::Exec(const char *Cmd,FOutputDevice *Out)
 {
 	guard(URender::Exec);
+#if defined(DC_RESOURCE_COOKER)
+	if( ParseCommand(&Cmd, "DCCACHECHECK") )
+	{
+		EnsureDCModelCaches();
+		FStampedPoint* SavedPoints = PointCache;
+		FDynamicsCache* SavedNodes = DynamicsCache;
+		EnsureDCModelCaches();
+		if( PointCache != SavedPoints || DynamicsCache != SavedNodes )
+			appErrorf( "Stable model capacities reallocated renderer caches" );
+		debugf( "DCRCACHE verified points=%d nodes=%d", PointCacheCapacity, DynamicsCacheCapacity );
+		return 1;
+	}
+#endif
 	const char* Str = Cmd;
 
 	if( ParseCommand(&Str,"STAT") )
@@ -539,6 +648,16 @@ INT URender::ClipBspSurf( INT iNode, FTransform**& Result )
 	for( INT i=0; i<NumPts; i++ )
 	{
 		INT pPoint = VertPool[i].pVertex;
+#if defined(PLATFORM_DREAMCAST)
+		if( PointCacheStamps[pPoint] != (BYTE)Stamp )
+		{
+			PointCacheStamps[pPoint] = (BYTE)Stamp;
+			PointCache[pPoint] = new(VectorMem)FTransform;
+			Pipe( *PointCache[pPoint], GFrame, GPoints[pPoint] );
+			STAT(GStat.NumPoints++);
+		}
+		FTransform* Point = PointCache[pPoint];
+#else
 		FStampedPoint& S = PointCache[pPoint];
 		if( S.Stamp != Stamp )
 		{
@@ -547,8 +666,10 @@ INT URender::ClipBspSurf( INT iNode, FTransform**& Result )
 			Pipe( *S.Point, GFrame, GPoints[pPoint] );
 			STAT(GStat.NumPoints++);
 		}
-		LocalPts[i] = S.Point;
-		BYTE Flags  = S.Point->Flags; 
+		FTransform* Point = S.Point;
+#endif
+		LocalPts[i] = Point;
+		BYTE Flags  = Point->Flags;
 		Outcode    &= Flags;
 		AllCodes   |= Flags;
 	}
@@ -1228,6 +1349,16 @@ void Traverse( FSceneNode* Frame, INT iNode )
 		for( INT i=0; i<Plane->NumVertices; i++ )
 		{
 			INT pPoint = _Verts[Plane->iVertPool+i].pVertex;
+#if defined(PLATFORM_DREAMCAST)
+			if( URender::PointCacheStamps[pPoint] != (BYTE)URender::Stamp )
+			{
+				URender::PointCacheStamps[pPoint] = (BYTE)URender::Stamp;
+				URender::PointCache[pPoint] = New<FTransform>( URender::VectorMem );
+				Pipe( *URender::PointCache[pPoint], Frame, Model->Points->Element(pPoint) );
+				STAT(GStat.NumPoints++);
+			}
+			FTransform* Point = URender::PointCache[pPoint];
+#else
 			URender::FStampedPoint& S = URender::PointCache[pPoint];
 			if( S.Stamp != URender::Stamp )
 			{
@@ -1236,10 +1367,12 @@ void Traverse( FSceneNode* Frame, INT iNode )
 				Pipe( *S.Point, Frame, Model->Points->Element(pPoint) );
 				STAT(GStat.NumPoints++);
 			}
-			if( !S.Point->Flags )
+			FTransform* Point = S.Point;
+#endif
+			if( !Point->Flags )
 			{
-				INT X = Clamp( appFloor( S.Point->ScreenX ), 0, Frame->X-1 );
-				INT Y = Clamp( S.Point->IntY, 0, Frame->Y-1 );
+				INT X = Clamp( appFloor( Point->ScreenX ), 0, Frame->X-1 );
+				INT Y = Clamp( Point->IntY, 0, Frame->Y-1 );
 				*Frame->Screen(X,Y) = 0xfe;
 			}
 		}
@@ -1277,8 +1410,16 @@ void URender::OccludeBsp( FSceneNode* Frame )
 	INT                 NumActiveZones;
 	BYTE                ActiveZones[64];
 	guard(URender::OccludeBsp);
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	if( Frame->Level->Model->Nodes->Max() > DynamicsCacheCapacity
+		|| Frame->Level->Model->Points->Max() > PointCacheCapacity )
+	{
+		appErrorf( "BSP capacity changed during rendering" );
+	}
+#else
 	check(Frame->Level->Model->Nodes->Max()<MAX_NODES);
 	check(Frame->Level->Model->Points->Max()<MAX_POINTS);
+#endif
 
 	// If unrenderable.
 	Model = Frame->Level->Model;
@@ -1318,6 +1459,10 @@ void URender::OccludeBsp( FSceneNode* Frame )
 
 	// Init temporary caches.
 	Stamp++;
+#if defined(PLATFORM_DREAMCAST)
+	if( (BYTE)Stamp == 0 && PointCacheStamps )
+		appMemset( PointCacheStamps, 0xff, PointCacheCapacity * sizeof(BYTE) );
+#endif
 
 	// Init.
 	UViewport* Viewport = Frame->Viewport;
@@ -1941,6 +2086,13 @@ void URender::OccludeFrame( FSceneNode* Frame )
 	UViewport* Viewport = Frame->Viewport;
 	ULevel*    Level    = Frame->Level;
 	UModel*	   Model    = Level->Model;
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	if( Model->Nodes->Max() > DynamicsCacheCapacity
+		|| Model->Points->Max() > PointCacheCapacity )
+	{
+		appErrorf( "BSP cache capacity exceeded before dynamics setup" );
+	}
+#endif
 	check(Model->Nodes->Num()>0);
 
 	// Init rendering info.
@@ -2263,6 +2415,10 @@ void URender::DrawFrame( FSceneNode* Frame )
 void URender::DrawWorld( FSceneNode* Frame )
 {
 	guard(URender::DrawWorld);
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	// Resize only before traversal: PostDynamics holds pointers into the cache.
+	EnsureDCModelCaches();
+#endif
 	FMemMark SceneMark(GSceneMem);
 	FMemMark MemMark(GMem);
 	FMemMark DynMark(GDynMem);

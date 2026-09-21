@@ -508,12 +508,23 @@ class RENDER_API URender : public URenderBase
 	{
 		FDynamicItem* Dynamics[2];
 	}* DynamicsCache;
-	static struct FStampedPoint
+	struct FStampedPoint
 	{
 		FTransform* Point;
 		DWORD		Stamp;
-	}* PointCache;
+	};
+#if defined(PLATFORM_DREAMCAST)
+	static FTransform** PointCache;
+	static BYTE* PointCacheStamps;
+#else
+	static FStampedPoint* PointCache;
+#endif
 	static FMemStack VectorMem;
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	static INT PointCacheCapacity;
+	static INT DynamicsCacheCapacity;
+	void EnsureDCModelCaches();
+#endif
 	static DWORD Stamp;
 	INT						NumPostDynamics;
 	FDynamicsCache**		PostDynamics;
