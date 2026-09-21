@@ -128,9 +128,6 @@ void UModel::SerializeLightBits( FArchive& Ar )
 		}
 		LightDecodeCalls = 0;
 		LightDecodeBytes = 0;
-		debugf( "DC LIGHT %s raw=%i resident=%i streamed=%i blocks=%i", GetPathName(), LightRawSize,
-			LightBits.Num() + LightBlockOffsets.Num() * 4, LightStreamData.Size(),
-			Max( 0, LightBlockOffsets.Num() - 1 ) );
 	}
 
 	unguard;
