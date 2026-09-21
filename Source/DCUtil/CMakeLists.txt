@@ -1,6 +1,6 @@
 project(DCUtil)
 
-set(SRC_FILES "Src/Main.cpp" "Src/Texture.cpp")
+set(SRC_FILES "Src/Main.cpp" "Src/Texture.cpp" "Src/Resources.cpp")
 
 add_executable(${PROJECT_NAME} ${SRC_FILES})
 
@@ -21,3 +21,13 @@ else()
 endif()
 
 target_compile_definitions(${PROJECT_NAME} PRIVATE DCUTIL_EXPORTS UPACKAGE_NAME=${PROJECT_NAME})
+
+# The map replay harness may load any configured native package dynamically.
+# Rebuild them with Core so registration checks never use stale libraries.
+if(DC_RESOURCE_COOKER AND NOT BUILD_STATIC)
+  foreach(PACKAGE IN LISTS INSTALL_TARGETS)
+    if(TARGET ${PACKAGE} AND NOT PACKAGE STREQUAL "DCUtil" AND NOT PACKAGE STREQUAL "Unreal")
+      add_dependencies(${PROJECT_NAME} ${PACKAGE})
+    endif()
+  endforeach()
+endif()

@@ -3,6 +3,10 @@
 #include "Engine.h"
 #include "Texture.h"
 
+#if defined(DC_RESOURCE_COOKER)
+void CompactBspVerts( UModel* Model );
+#endif
+
 class FDCUtil
 {
 public:
@@ -19,6 +23,11 @@ private:
 	void ConvertSoundPkg( const FString& PkgPath, UPackage* Pkg );
 	void ConvertMusicPkg( const FString& PkgPath, UPackage* Pkg );
 	void CommitChanges();
+	void CookDat( const char* MapPath, const char* DatPath, UBOOL Verify );
+	void AuditBsp( const char* MapPath, const char* OutPath );
+#if defined(DC_RESOURCE_COOKER)
+	void ProcessResources( const char* PackagePath, const char* ResourceDir, const char* OutPath );
+#endif
 
 private:
 	UEngine* Engine = nullptr;

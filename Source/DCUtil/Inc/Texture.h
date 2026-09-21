@@ -12,6 +12,10 @@ public:
 	static const char* Blacklist[];
 
 	static UBOOL AutoConvertTexture( UTexture* Tex );
+	static UBOOL IsBlacklisted( UTexture* Tex );
+#if defined(DC_RESOURCE_COOKER)
+	static void ExportDCTexture( UTexture* Texture, const char* Filename );
+#endif
 
 protected:
 	FTextureConverter( UTexture* InTexture, const ETextureFormat InFormat );

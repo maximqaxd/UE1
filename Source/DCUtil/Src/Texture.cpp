@@ -3,6 +3,14 @@
 #include "stb_image_write.h"
 #include <stdlib.h>
 
+#if defined(DC_RESOURCE_COOKER)
+void FTextureConverter::ExportDCTexture( UTexture* Texture, const char* Filename )
+{
+	FTextureConverter Converter( Texture, TEXF_EXT_ARGB1555_VQ );
+	Converter.ExportMip( Texture->Mips(0), Filename );
+}
+#endif
+
 // HACK: It isn't possible to reliably determine which textures are referenced by fx
 // without loading all packages, which I can't be arsed to do, so
 const char* FTextureConverter::Blacklist[] =
@@ -35,6 +43,29 @@ const char* FTextureConverter::Blacklist[] =
 	"HubEffects.Lavab",
 	"UnrealI.MenuGfx.*"
 };
+
+UBOOL FTextureConverter::IsBlacklisted( UTexture* Texture )
+{
+	for( INT i = 0; i < ARRAY_COUNT(Blacklist); ++i )
+	{
+		char Pattern[1024];
+		appStrncpy( Pattern, Blacklist[i], ARRAY_COUNT(Pattern) );
+		char* Glob = appStrchr( Pattern, '*' );
+		if( Glob )
+		{
+			*Glob = 0;
+			if( !appStrnicmp( Texture->GetPathName(), Pattern, appStrlen(Pattern) ) )
+			{
+				return true;
+			}
+		}
+		else if( !appStricmp( Texture->GetPathName(), Pattern ) )
+		{
+			return true;
+		}
+	}
+	return false;
+}
 
 UBOOL FTextureConverter::AutoConvertTexture( UTexture* InTexture )
 {
@@ -113,21 +144,9 @@ void FTextureConverter::Convert()
 		return;
 
 	// Do not convert format if texture is blacklisted
-	for( INT i = 0; i < ARRAY_COUNT( Blacklist ); ++i )
+	if( IsBlacklisted( Texture ) )
 	{
-		char TempStr[1024];
-		appStrncpy( TempStr, Blacklist[i], sizeof( TempStr ) );
-		char* Glob = appStrchr( TempStr, '*' );
-		if( Glob )
-		{
-			*Glob = 0;
-			if( appStrstr( Texture->GetPathName(), TempStr ) )
-				return;
-		}
-		else if ( !appStricmp( Texture->GetPathName(), TempStr ) )
-		{
-			return;
-		}
+		return;
 	}
 
 	// Convert and scale if needed
@@ -198,7 +217,7 @@ void FTextureConverter::ExportMip( const FMipmap& Mip, const char *Filename )
 
 	stbi_write_png( Filename, Mip.USize, Mip.VSize, 4, (const void*)OutData, Mip.USize * 4 );
 
-	delete OutData;
+	delete[] OutData;
 }
 
 void FTextureConverter::ConvertMip( FMipmap &Mip, const char* Filename )
