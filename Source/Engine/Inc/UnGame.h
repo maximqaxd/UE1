@@ -24,6 +24,9 @@ class ENGINE_API UGameEngine : public UEngine
 	FURL			LastURL;
 	char			ServerActors[16][96];
 	char			ServerPackages[16][96];
+#if defined(PLATFORM_DREAMCAST)
+	void TickDCMemorySimulation();
+#endif
 
 	// Constructors.
 	static void InternalClassInitializer( UClass* Class );

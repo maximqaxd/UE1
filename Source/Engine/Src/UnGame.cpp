@@ -60,6 +60,120 @@ static UBOOL GDCPlayProfilePending = 0;
 static char GDCSessionURL[DC_SESSION_URL_BYTES] = "";
 static char GDCSessionItems[DC_SESSION_ITEMS_BYTES] = "";
 
+enum
+{
+	DC_MEMORY_SIM_MAGIC = 0x4443534d,
+	DC_MEMORY_SIM_READY = 0x44534352,
+	DC_MEMORY_SIM_COMPLETE = -1,
+	DC_MEMORY_SIM_FRAMES_PER_MAP = 180
+};
+
+// The ready word lets Flycast wait for the executable instead of writing into
+// its eventual address while the BIOS is still using that RAM. Real hardware
+// never writes the opt-in magic, so normal play remains unaffected.
+extern "C"
+{
+	DLL_EXPORT volatile DWORD GDCMemorySimMagic = 0;
+	DLL_EXPORT volatile DWORD GDCMemorySimState = 0;
+	DLL_EXPORT volatile DWORD GDCMemorySimReady = 0;
+}
+
+void UGameEngine::TickDCMemorySimulation()
+{
+	GDCMemorySimReady = DC_MEMORY_SIM_READY;
+	if( GDCMemorySimMagic != DC_MEMORY_SIM_MAGIC || !GLevel )
+	{
+		return;
+	}
+
+	static const char* Route[] =
+	{
+		"Unreal",
+		"Vortex2",
+		"Nyleve",
+		"Dig",
+		"Dug",
+		"Passage",
+		"Chizra",
+		"Ceremony",
+		"Dark",
+		"Harobed",
+		"TerraLift",
+		"Terraniux",
+		"Noork",
+		"Ruins",
+		"Trench",
+		"IsvKran4",
+		"IsvKran32",
+		"IsvDeck1",
+		"SpireVillage",
+		"TheSunspire",
+		"SkyCaves",
+		"SkyTown",
+		"SkyBase",
+		"VeloraEnd",
+		"Bluff",
+		"DasaPass",
+		"DasaCellars",
+		"NaliBoat",
+		"NaliC",
+		"NaliLord",
+		"DCrater",
+		"ExtremeBeg",
+		"ExtremeLab",
+		"ExtremeCore",
+		"ExtremeGen",
+		"ExtremeDGen",
+		"ExtremeDark",
+		"ExtremeEnd",
+		"QueenEnd",
+		"endgame"
+	};
+	static char ActiveMap[64] = "";
+	static INT RouteIndex = INDEX_NONE;
+	static INT Frames = 0;
+
+	const char* Map = GLevel->GetParent()->GetName();
+	if( appStricmp(ActiveMap, Map) )
+	{
+		appStrncpy( ActiveMap, Map, ARRAY_COUNT(ActiveMap) );
+		RouteIndex = INDEX_NONE;
+		for( INT i = 0; i < ARRAY_COUNT(Route); ++i )
+		{
+			if( !appStricmp(Route[i], Map) )
+			{
+				RouteIndex = i;
+				break;
+			}
+		}
+		if( RouteIndex == INDEX_NONE )
+		{
+			appErrorf( "DCSIM unexpected map %s", Map );
+		}
+		Frames = 0;
+		GDCMemorySimState = RouteIndex + 1;
+		debugf( "DCSIM map_begin index=%d map=%s", RouteIndex, Map );
+	}
+
+	if( ++Frames != DC_MEMORY_SIM_FRAMES_PER_MAP )
+	{
+		return;
+	}
+
+	DCProfileMemory( "sim_pretravel" );
+	if( RouteIndex + 1 == ARRAY_COUNT(Route) )
+	{
+		debugf( "DCSIM complete maps=%d", ARRAY_COUNT(Route) );
+		GDCMemorySimState = DC_MEMORY_SIM_COMPLETE;
+		return;
+	}
+
+	ALevelInfo* Info = GLevel->GetLevelInfo();
+	appStrncpy( Info->NextURL, Route[RouteIndex + 1], ARRAY_COUNT(Info->NextURL) );
+	Info->NextSwitchCountdown = 0.0f;
+	debugf( "DCSIM travel from=%s to=%s", Map, Route[RouteIndex + 1] );
+}
+
 UBOOL appDCHasSessionTravel()
 {
 	return GDCSessionTravel;
@@ -1225,6 +1339,7 @@ void UGameEngine::Tick( FLOAT DeltaSeconds )
 {
 	guard(UGameEngine::Tick);
 #if defined(PLATFORM_DREAMCAST)
+	TickDCMemorySimulation();
 	if( GDCPlayProfilePending )
 	{
 		GDCPlayProfilePending = 0;
