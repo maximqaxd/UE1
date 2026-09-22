@@ -6,7 +6,10 @@ set -euo pipefail
 SRC_DIR="./Source"
 BUILD_DIR="./build_dc"
 
-EXTRA_FLAGS=( -DDREAMCAST_BUILD_CDI=ON )
+EXTRA_FLAGS=(
+  -DDREAMCAST_BUILD_CDI=ON
+  -DDREAMCAST_ELF_FILE="$BUILD_DIR/Unreal/Unreal.elf"
+)
 
 # Now build Dreamcast target
 cmake -S "$SRC_DIR" -B "$BUILD_DIR" \
@@ -23,10 +26,10 @@ echo "Creating ISO image..."
 
 # Find the ELF file (check common locations)
 ELF_FILE=""
-if [[ -f "$BUILD_DIR/RelWithDebInfo/Unreal.elf" ]]; then
-  ELF_FILE="$BUILD_DIR/RelWithDebInfo/Unreal.elf"
-elif [[ -f "$BUILD_DIR/Unreal/Unreal.elf" ]]; then
-  ELF_FILE="$BUILD_DIR/Unreal/Unreal.elf"
+if [[ -f "$BUILD_DIR/Unreal/Unreal.elf" ]]; then
+	ELF_FILE="$BUILD_DIR/Unreal/Unreal.elf"
+elif [[ -f "$BUILD_DIR/RelWithDebInfo/Unreal.elf" ]]; then
+	ELF_FILE="$BUILD_DIR/RelWithDebInfo/Unreal.elf"
 elif [[ -f "$BUILD_DIR/Release/Unreal.elf" ]]; then
   ELF_FILE="$BUILD_DIR/Release/Unreal.elf"
 elif [[ -f "$BUILD_DIR/Debug/Unreal.elf" ]]; then
