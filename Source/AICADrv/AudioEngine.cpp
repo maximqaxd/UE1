@@ -502,31 +502,53 @@ int AudioEngine_Unload(int nStream) {
 	return nStream;
 }
 
+// A slot is only reusable when it holds neither an open file nor a registered
+// in-memory sound. RegisterSound keeps Sound->Data for sounds too long to fit a
+// single AICA channel, and the USound holds its stream handle for its whole
+// lifetime, so a memory stream stays claimed even while silent. Overwriting one
+// leaves that sound pointing at unrelated data.
+static bool StreamSlotFree(int nStream) {
+	return streams[nStream].fd == -1
+		&& (!streams[nStream].is_memory || streams[nStream].mem_data == nullptr);
+}
+
 int AudioEngine_GetOpenStreamIndex(const char * fname, file_t fd) {
-	// 1. Check for Duplicate File Name
-	size_t fileNameLength = std::min(strlen(fname), (size_t)128);
+	// 1. Reuse the slot already holding this exact file. Only file-backed slots
+	// qualify: a memory stream's name is a USound path, not a filename.
     for(int i = 0; i < AUDIO_ENGINE_MAX_STREAMS; i++) {
-        if (strncmp(fname, streams[i].fname, fileNameLength) == 0){
+        if(streams[i].fd >= 0 && strcmp(fname, streams[i].fname) == 0) {
 			fs_close(streams[i].fd);
-			debugf("AudioEngine: File Already In Stream Cache! %i, %s, %s\n", i, fname, streams[i].fname);
+			streams[i].fd = -1;
+			debugf("AudioEngine: File Already In Stream Cache! %i, %s\n", i, fname);
             return i;
         }
     }
-	// 2. Check for Free Index
+	// 2. Take a genuinely free slot. Testing fd alone would hand out a slot that
+	// a registered long sound still owns, which is how opening a music track
+	// used to silently break whichever ambient or speech sound held slot 0.
     for(int i = 0; i < AUDIO_ENGINE_MAX_STREAMS; i++) {
-        if(streams[i].fd == -1) {
+        if(StreamSlotFree(i)) {
             return i;
         }
     }
-	// 3. Force Close The Stream Which Was Accessed The Least Recently
-	uint32_t last_tick = streams[0].last_tick;
-	int index = 0;
+	// 3. Evict the least recently started stream that is not currently playing.
+	// last_tick is never refreshed during playback, so a long track is always
+	// the oldest; evicting by age alone would cut off live audio.
+	int index = -1;
+	uint32_t oldest = 0;
     for(int i = 0; i < AUDIO_ENGINE_MAX_STREAMS; i++) {
-        if(streams[i].last_tick < last_tick) {
+        if(streams[i].playing) {
+			continue;
+        }
+        if(index < 0 || streams[i].last_tick < oldest) {
             index = i;
-			last_tick = streams[i].last_tick;
+			oldest = streams[i].last_tick;
         }
     }
+	if(index < 0) {
+		debugf("AudioEngine: every stream slot is busy; cannot open %s\n", fname);
+		return -1;
+	}
 
 	return AudioEngine_Unload(index);
 }

@@ -7,7 +7,10 @@
 extern "C" {
 #endif
 
-#define AUDIO_ENGINE_MAX_STREAMS 8
+// Eight sounds in the retail game exceed one AICA channel and each holds a
+// stream slot for as long as its USound is registered, not just while audible.
+// A streamed music track needs one more, which left no margin at eight.
+#define AUDIO_ENGINE_MAX_STREAMS 10
 #define AUDIO_ENGINE_MAX_CHANNELS (64 - (AUDIO_ENGINE_MAX_STREAMS * 2))
 #define AUDIO_ENGINE_MAX_SFX 512
 
