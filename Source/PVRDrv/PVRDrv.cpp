@@ -1338,6 +1338,28 @@ void UPVRRenderDevice::EnsureComposeSize( const DWORD NewSize )
 	}
 }
 
+void* UPVRRenderDevice::TwiddleTextureMipP8( const FMipmap* Mip )
+{
+	check(Mip);
+	check(Mip->DataPtr);
+	check(Mip->USize >= MinTexSize && Mip->VSize >= MinTexSize);
+
+	const DWORD SizeBytes = Mip->USize * Mip->VSize;
+	EnsureComposeSize( SizeBytes );
+
+	// KOS' extended loader performs the required PAL8 twiddle with ordinary
+	// CPU stores. Target cached system RAM first, then use pvr_txr_load() for
+	// one sequential Store Queue transfer instead of scattered VRAM writes.
+	pvr_txr_load_ex(
+		Mip->DataPtr,
+		(pvr_ptr_t)Compose,
+		Mip->USize,
+		Mip->VSize,
+		PVR_TXRLOAD_8BPP );
+
+	return Compose;
+}
+
 void* UPVRRenderDevice::VerticalUpscale( const INT USize, const INT VSize, const INT VTimes )
 {
 	DWORD i;
@@ -1681,12 +1703,8 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, UBOOL NewTexture, UBOO
 			if( UploadPixels )
 			{
 				check(Mip0->DataPtr);
-				pvr_txr_load_ex(
-					Mip0->DataPtr,
-					Bind->Tex,
-					Mip0->USize,
-					Mip0->VSize,
-					PVR_TXRLOAD_8BPP );
+				void* Twiddled = TwiddleTextureMipP8( Mip0 );
+				pvr_txr_load( Twiddled, Bind->Tex, SizeBytes );
 			}
 
 			UploadPalette( Bank, Info, Masked );

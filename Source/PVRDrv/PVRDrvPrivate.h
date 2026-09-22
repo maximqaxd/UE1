@@ -112,6 +112,7 @@ class DLL_EXPORT UPVRRenderDevice : public URenderDevice
 	void UploadPalette( INT Bank, const FTextureInfo& Info, UBOOL Masked );
 	pvr_ptr_t AllocateTexture( INT Size );
 	void EnsureComposeSize( const DWORD NewSize );
+	void* TwiddleTextureMipP8( const FMipmap* Mip );
 	void* ConvertTextureMipI8( const FMipmap* Mip, const FColor* Palette );
 	void* ConvertTextureMipBGRA7777( const FMipmap* Mip );
 	void* VerticalUpscale( const INT USize, const INT VSize, const INT VTimes );
