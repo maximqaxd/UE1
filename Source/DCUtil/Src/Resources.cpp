@@ -43,8 +43,30 @@ static void ReadResource( const char* Path, TArray<BYTE>& Data )
 	appFclose( File );
 }
 
+static UBOOL IsFrozenDreamcastProcedural( UTexture* Texture )
+{
+	const char* Path = Texture->GetPathName();
+	return !appStricmp(Path, "UnrealI.MenuGfx.menu2")
+		|| !appStricmp(Path, "UnrealI.MenuGfx.MenuBarrier");
+}
+
+static void BakeDreamcastProcedural( UTexture* Texture )
+{
+	// Give menu effects a representative frame before converting them to an
+	// immutable VQ texture. Gameplay/world procedurals remain live PAL8.
+	for( INT Frame=0; Frame<32; ++Frame )
+	{
+		Texture->Tick( 1.f / 30.f );
+	}
+}
+
 static UBOOL TextureNeedsMipmaps( UTexture* Texture, UPackage* Package )
 {
+	if( IsFrozenDreamcastProcedural(Texture) )
+	{
+		return 0;
+	}
+
 	// Font glyph atlases are always sampled in screen space. Their character
 	// metrics remain in UFont; only the immutable bitmap is cooked to DT.
 	if( Texture->IsA(UFont::StaticClass) )
@@ -166,12 +188,15 @@ void FDCUtil::ProcessResources( const char* PackagePath, const char* ResourceDir
 
 	for( TObjectIterator<UTexture> It; It; ++It )
 	{
+		const UBOOL FrozenProcedural = IsFrozenDreamcastProcedural( *It );
 		const UBOOL ConvertibleClass = It->GetClass() == UTexture::StaticClass
-			|| It->IsA(UFont::StaticClass);
+			|| It->IsA(UFont::StaticClass)
+			|| FrozenProcedural;
 		if( !It->IsIn( Package ) || !ConvertibleClass
 			|| It->Format != TEXF_P8 || !It->Palette || !It->Mips.Num()
 			|| FTextureConverter::IsBlacklisted( *It )
-			|| (It->TextureFlags & (TF_Realtime | TF_RealtimePalette | TF_Parametric)) )
+			|| (!FrozenProcedural
+				&& (It->TextureFlags & (TF_Realtime | TF_RealtimePalette | TF_Parametric))) )
 		{
 			continue;
 		}
@@ -194,9 +219,18 @@ void FDCUtil::ProcessResources( const char* PackagePath, const char* ResourceDir
 			It->Mips(0).DataArray = Data;
 			It->Mips(0).DataPtr = &It->Mips(0).DataArray(0);
 			It->Format = TEXF_EXT_DCTEX;
+			if( FrozenProcedural )
+			{
+				It->TextureFlags &= ~(TF_Parametric | TF_Realtime
+					| TF_RealtimeChanged | TF_RealtimePalette);
+			}
 		}
 		else
 		{
+			if( FrozenProcedural )
+			{
+				BakeDreamcastProcedural( *It );
+			}
 			FTextureConverter::ExportDCTexture( *It, Path );
 
 			// Preserve the source package's authoring decision and screen-space
