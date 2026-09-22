@@ -12,6 +12,10 @@
 #include <math.h>
 #endif
 
+#if defined(PLATFORM_DREAMCAST)
+#include <sh4zam/shz_sh4zam.h>
+#endif
+
 /*-----------------------------------------------------------------------------
 	Defintions.
 -----------------------------------------------------------------------------*/
@@ -346,7 +350,12 @@ public:
 		FLOAT SquareSum = X*X+Y*Y+Z*Z;
 		if( SquareSum >= SMALL_NUMBER )
 		{
+#if defined(PLATFORM_DREAMCAST)
+			// One FSRRA, rather than a square root followed by a divide.
+			FLOAT Scale = shz_inv_sqrtf_fsrra(SquareSum);
+#else
 			FLOAT Scale = 1.0/appSqrt(SquareSum);
+#endif
 			X *= Scale; Y *= Scale; Z *= Scale;
 			return 1;
 		}
@@ -359,7 +368,11 @@ public:
 	}
 	FVector UnsafeNormal() const
 	{
+#if defined(PLATFORM_DREAMCAST)
+		FLOAT Scale = shz_inv_sqrtf_fsrra(X*X+Y*Y+Z*Z);
+#else
 		FLOAT Scale = 1.0/appSqrt(X*X+Y*Y+Z*Z);
+#endif
 		return FVector( X*Scale, Y*Scale, Z*Scale );
 	}
 
@@ -868,23 +881,35 @@ public:
 #ifdef PLATFORM_DREAMCAST
 	FLOAT Sqrt( int i )
 	{
-		return fsqrt( (FLOAT)i / 16384.f );
+		return shz_sqrtf( (FLOAT)i / 16384.f );
 	}
+	// Unreal angles are already the 16-bit fixed-point format FSCA consumes,
+	// so the shift, mask and radian conversion the table lookup used to need
+	// all disappear: (i >> 2) & 16383 over 16384 is the same fraction of a
+	// turn as (i & 65535) over 65536.
 	FLOAT SinTab( int i )
 	{
-		return fsin( ((i>>ANGLE_SHIFT)&(NUM_ANGLES-1)) * 2.f * (FLOAT)PI / (FLOAT)NUM_ANGLES );
+		return shz_sincosu16( (uint16_t)i ).sin;
 	}
 	FLOAT CosTab( int i )
 	{
-		return fcos( ((i>>ANGLE_SHIFT)&(NUM_ANGLES-1)) * 2.f * (FLOAT)PI / (FLOAT)NUM_ANGLES );
+		return shz_sincosu16( (uint16_t)i ).cos;
+	}
+	// FSCA produces both at once; callers that need a matching pair should
+	// ask for them together rather than issuing two instructions.
+	void SinCosTab( int i, FLOAT& OutSin, FLOAT& OutCos )
+	{
+		const shz_sincos_t SC = shz_sincosu16( (uint16_t)i );
+		OutSin = SC.sin;
+		OutCos = SC.cos;
 	}
 	FLOAT SinFloat( FLOAT F )
 	{
-		return fsin( F );
+		return shz_sinf( F );
 	}
 	FLOAT CosFloat( FLOAT F )
 	{
-		return fcos( F );
+		return shz_cosf( F );
 	}
 #elif defined(PLATFORM_LOW_MEMORY)
 	FLOAT Sqrt( int i )
@@ -898,6 +923,11 @@ public:
 	FLOAT CosTab( int i )
 	{
 		return cosf( ((i>>ANGLE_SHIFT)&(NUM_ANGLES-1)) * 2.f * (FLOAT)PI / (FLOAT)NUM_ANGLES );
+	}
+	void SinCosTab( int i, FLOAT& OutSin, FLOAT& OutCos )
+	{
+		OutSin = sinf( ((i>>ANGLE_SHIFT)&(NUM_ANGLES-1)) * 2.f * (FLOAT)PI / (FLOAT)NUM_ANGLES );
+		OutCos = cosf( ((i>>ANGLE_SHIFT)&(NUM_ANGLES-1)) * 2.f * (FLOAT)PI / (FLOAT)NUM_ANGLES );
 	}
 	FLOAT SinFloat( FLOAT F )
 	{
@@ -919,6 +949,11 @@ public:
 	FLOAT CosTab( int i )
 	{
 		return TrigFLOAT[(((i+16384)>>ANGLE_SHIFT)&(NUM_ANGLES-1))];
+	}
+	void SinCosTab( int i, FLOAT& OutSin, FLOAT& OutCos )
+	{
+		OutSin = TrigFLOAT[((i>>ANGLE_SHIFT)&(NUM_ANGLES-1))];
+		OutCos = TrigFLOAT[(((i+16384)>>ANGLE_SHIFT)&(NUM_ANGLES-1))];
 	}
 	FLOAT SinFloat( FLOAT F )
 	{
@@ -1205,12 +1240,19 @@ inline FCoords FCoords::operator*( const FCoords &TransformCoords ) const
 //
 inline FCoords& FCoords::operator*=( const FRotator &Rot )
 {
+	// Each axis needs its sine and cosine together, which is one instruction
+	// on hardware that has FSCA; asking for them separately issued two.
+	FLOAT SinYaw, CosYaw, SinPitch, CosPitch, SinRoll, CosRoll;
+	GMath.SinCosTab( Rot.Yaw,   SinYaw,   CosYaw   );
+	GMath.SinCosTab( Rot.Pitch, SinPitch, CosPitch );
+	GMath.SinCosTab( Rot.Roll,  SinRoll,  CosRoll  );
+
 	// Apply yaw rotation.
 	*this *= FCoords
 	(	
 		FVector( 0.0, 0.0, 0.0 ),
-		FVector( +GMath.CosTab(Rot.Yaw), +GMath.SinTab(Rot.Yaw), +0.0 ),
-		FVector( -GMath.SinTab(Rot.Yaw), +GMath.CosTab(Rot.Yaw), +0.0 ),
+		FVector( +CosYaw, +SinYaw, +0.0 ),
+		FVector( -SinYaw, +CosYaw, +0.0 ),
 		FVector( +0.0, +0.0, +1.0 )
 	);
 
@@ -1218,9 +1260,9 @@ inline FCoords& FCoords::operator*=( const FRotator &Rot )
 	*this *= FCoords
 	(	
 		FVector( 0.0, 0.0, 0.0 ),
-		FVector( +GMath.CosTab(Rot.Pitch), +0.0, +GMath.SinTab(Rot.Pitch) ),
+		FVector( +CosPitch, +0.0, +SinPitch ),
 		FVector( +0.0, +1.0, +0.0 ),
-		FVector( -GMath.SinTab(Rot.Pitch), +0.0, +GMath.CosTab(Rot.Pitch) )
+		FVector( -SinPitch, +0.0, +CosPitch )
 	);
 
 	// Apply roll rotation.
@@ -1228,8 +1270,8 @@ inline FCoords& FCoords::operator*=( const FRotator &Rot )
 	(	
 		FVector( 0.0, 0.0, 0.0 ),
 		FVector( +1.0, +0.0, +0.0 ),
-		FVector( +0.0, +GMath.CosTab(Rot.Roll), -GMath.SinTab(Rot.Roll) ),
-		FVector( +0.0, +GMath.SinTab(Rot.Roll), +GMath.CosTab(Rot.Roll) )
+		FVector( +0.0, +CosRoll, -SinRoll ),
+		FVector( +0.0, +SinRoll, +CosRoll )
 	);
 	return *this;
 }
@@ -1253,30 +1295,35 @@ inline FCoords FCoords::operator*( const FVector &Point ) const
 //
 inline FCoords& FCoords::operator/=( const FRotator &Rot )
 {
+	FLOAT SinYaw, CosYaw, SinPitch, CosPitch, SinRoll, CosRoll;
+	GMath.SinCosTab( Rot.Yaw,   SinYaw,   CosYaw   );
+	GMath.SinCosTab( Rot.Pitch, SinPitch, CosPitch );
+	GMath.SinCosTab( Rot.Roll,  SinRoll,  CosRoll  );
+
 	// Apply inverse roll rotation.
 	*this *= FCoords
 	(
 		FVector( 0.0, 0.0, 0.0 ),
 		FVector( +1.0, -0.0, +0.0 ),
-		FVector( -0.0, +GMath.CosTab(Rot.Roll), +GMath.SinTab(Rot.Roll) ),
-		FVector( +0.0, -GMath.SinTab(Rot.Roll), +GMath.CosTab(Rot.Roll) )
+		FVector( -0.0, +CosRoll, +SinRoll ),
+		FVector( +0.0, -SinRoll, +CosRoll )
 	);
 
 	// Apply inverse pitch rotation.
 	*this *= FCoords
 	(
 		FVector( 0.0, 0.0, 0.0 ),
-		FVector( +GMath.CosTab(Rot.Pitch), +0.0, -GMath.SinTab(Rot.Pitch) ),
+		FVector( +CosPitch, +0.0, -SinPitch ),
 		FVector( +0.0, +1.0, -0.0 ),
-		FVector( +GMath.SinTab(Rot.Pitch), +0.0, +GMath.CosTab(Rot.Pitch) )
+		FVector( +SinPitch, +0.0, +CosPitch )
 	);
 
 	// Apply inverse yaw rotation.
 	*this *= FCoords
 	(
 		FVector( 0.0, 0.0, 0.0 ),
-		FVector( +GMath.CosTab(Rot.Yaw), -GMath.SinTab(Rot.Yaw), -0.0 ),
-		FVector( +GMath.SinTab(Rot.Yaw), +GMath.CosTab(Rot.Yaw), +0.0 ),
+		FVector( +CosYaw, -SinYaw, -0.0 ),
+		FVector( +SinYaw, +CosYaw, +0.0 ),
 		FVector( -0.0, +0.0, +1.0 )
 	);
 	return *this;
