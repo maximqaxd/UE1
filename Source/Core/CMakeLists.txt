@@ -4,6 +4,7 @@ set(SRC_FILES
   "Src/UnCache.cpp"
   "Src/UnDCDat.cpp"
   "Src/UnDCStream.cpp"
+  "Src/UnDCLoading.cpp"
   "Src/UnClass.cpp"
   "Src/UnCorSc.cpp"
   "Src/UnFile.cpp"
