@@ -30,6 +30,7 @@ class DLL_EXPORT UPVRRenderDevice : public URenderDevice
 	UBOOL UseTriStrips;
 	UBOOL DistanceFog;
 	UBOOL VolumetricFog;
+	INT   FogDistanceDefault;
 	INT   CommandBufferKB;
 
     // All currently cached textures (CacheID -> VRAM ptr + last type).

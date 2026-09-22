@@ -332,6 +332,7 @@ void UPVRRenderDevice::InternalClassInitializer( UClass* Class )
 	new(Class, "UseTriStrips",    RF_Public)UBoolProperty( CPP_PROPERTY(UseTriStrips),    "Options", CPF_Config );
 	new(Class, "DistanceFog",     RF_Public)UBoolProperty( CPP_PROPERTY(DistanceFog),     "Options", CPF_Config );
 	new(Class, "VolumetricFog",   RF_Public)UBoolProperty( CPP_PROPERTY(VolumetricFog),   "Options", CPF_Config );
+	new(Class, "FogDistanceDefault", RF_Public)UIntProperty( CPP_PROPERTY(FogDistanceDefault), "Options", CPF_Config );
 	new(Class, "CommandBufferKB", RF_Public)UIntProperty ( CPP_PROPERTY(CommandBufferKB), "Options", CPF_Config );
 	unguardSlow;
 }
@@ -348,6 +349,7 @@ UPVRRenderDevice::UPVRRenderDevice()
 	UseTriStrips = true;
 	DistanceFog = true;
 	VolumetricFog = false;
+	FogDistanceDefault = 0;
 	CommandBufferKB = 256;
 	OverlayZFlash = 1024.f;
 	OverlayZUI = 4096.f;
@@ -405,6 +407,10 @@ UBOOL UPVRRenderDevice::Init( UViewport* InViewport )
 	if( !GPVRArena[PVR_LIST_TR_POLY].Data || !GPVRArena[PVR_LIST_PT_POLY].Data )
 		appErrorf( "PVR command buffer allocation failed (%u bytes)", Budget );
 	debugf( NAME_Log, "PVR command buffers: PT=%u TR=%u bytes", PTBytes, TRBytes );
+	debugf( NAME_Log, "PVR options: tristrips=%i distancefog=%i fogdefault=%i volumetricfog=%i"
+		" shiny=%i volumetriclighting=%i coronas=%i filtering=%i",
+		(INT)UseTriStrips, (INT)DistanceFog, FogDistanceDefault, (INT)VolumetricFog,
+		(INT)ShinySurfaces, (INT)VolumetricLighting, (INT)Coronas, (INT)!NoFiltering );
 
 	Compose = NULL;
 	ComposeSize = 0;
@@ -1275,10 +1281,19 @@ void UPVRRenderDevice::UpdateFog( FSceneNode* Frame )
 		return;
 
 	AZoneInfo* Zone = Viewport->Actor->Region.Zone;
-	if( !Zone || !Zone->bFogZone || Zone->FogDistance <= 0.f || Frame->Proj.Z <= 0.f )
+	if( !Zone || Frame->Proj.Z <= 0.f )
 		return;
 
-	const FLOAT Far = Zone->FogDistance / Frame->Proj.Z;
+	// Nothing in this engine reads AZoneInfo::FogDistance, so level authors
+	// had no reason to set it and most zones leave it at zero. Fall back to
+	// the configured distance for any zone flagged as foggy.
+	FLOAT Distance = Zone->FogDistance;
+	if( Distance <= 0.f && Zone->bFogZone )
+		Distance = (FLOAT)FogDistanceDefault;
+	if( Distance <= 0.f )
+		return;
+
+	const FLOAT Far = Distance / Frame->Proj.Z;
 	pvr_fog_table_color( 1.f,
 		Zone->FogColor.R / 255.f,
 		Zone->FogColor.G / 255.f,
