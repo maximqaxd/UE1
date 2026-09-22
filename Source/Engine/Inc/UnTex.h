@@ -434,6 +434,9 @@ class ENGINE_API UTexture : public UBitmap
 
 	// UTexture functions.
 	void Update( DOUBLE Time );
+#if defined(PLATFORM_DREAMCAST)
+	void EnsureProceduralData();
+#endif
 	void BuildRemapIndex( UBOOL Masked );
 	void CreateMips( UBOOL FullMips, UBOOL Downsample );
 	void CreateColorRange();

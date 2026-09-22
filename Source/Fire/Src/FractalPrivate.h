@@ -360,6 +360,7 @@ class DLL_EXPORT UWaterTexture : public UFractalTexture
 	void TouchTexture(INT UPos, INT VPos, FLOAT Magnitude);
 
 	// UWaterTexture interface.
+	void EnsureWaterFields();
 	void CalculateWater();
 	void WaterRedrawDrops();
 	private:

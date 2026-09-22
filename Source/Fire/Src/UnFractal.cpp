@@ -4135,6 +4135,12 @@ void UFireTexture::TouchTexture(INT UPos, INT VPos, FLOAT Magnitude)
 {
 	guard(UFireTexture::TouchTexture);
 
+#if defined(PLATFORM_DREAMCAST)
+	if( Format == TEXF_EXT_DCTEX )
+		return;
+	EnsureProceduralData();
+#endif
+
     DWORD SparkDest = (DWORD)(UPos + (VPos << UBits) );
     GetMip(0)->DataArray(SparkDest) = (BYTE) Magnitude;
 
@@ -4242,6 +4248,14 @@ void UFireTexture::Serialize( FArchive& Ar )
 	Super::Serialize( Ar );
 	Ar << Sparks;
 
+#if defined(PLATFORM_DREAMCAST)
+	if( Ar.IsLoading() && Format == TEXF_EXT_DCTEX )
+	{
+		Sparks.Empty();
+		return;
+	}
+#endif
+
 	// Expand the compacted array again. Sparks.Num() should always be equal to SparksLimit !
 	if (Sparks.Num() < SparksLimit)
 		Sparks.Add( SparksLimit - Sparks.Num() );
@@ -4310,14 +4324,25 @@ void UWaterTexture::PostLoad()
 	// Call base class.
 	UFractalTexture::PostLoad();
 
-	if (SourceFields == NULL)
+#if !defined(PLATFORM_DREAMCAST)
+	EnsureWaterFields();
+#endif
+
+	unguard;
+}
+
+void UWaterTexture::EnsureWaterFields()
+{
+	guard(UWaterTexture::EnsureWaterFields);
+
+	if( SourceFields == NULL )
 	{
 		// Allocate the two wave height fields.
-		SourceFields = new BYTE[ USize * VSize / 2 ]; 
+		SourceFields = new BYTE[USize * VSize / 2];
 		// initialize water to average height.
-		for( INT  i=0; i< USize * VSize / 2; i++ )
+		for( INT i=0; i<USize * VSize / 2; i++ )
 			SourceFields[i] = 128;
-	};
+	}
 
 	unguard;
 }
@@ -4328,6 +4353,12 @@ void UWaterTexture::TouchTexture(INT UPos, INT VPos, FLOAT Magnitude)
 {
 	guard(UWaterTexture::TouchTexture);
 
+#if defined(PLATFORM_DREAMCAST)
+	if( Format == TEXF_EXT_DCTEX )
+		return;
+#endif
+
+	EnsureWaterFields();
 	BYTE* WaveFieldA = SourceFields;
     BYTE* WaveFieldB = SourceFields + USize;
 
@@ -4368,8 +4399,11 @@ void UWaterTexture::Clear( DWORD ClearFlags )
 
 	// Clear fields.
 	if( ClearFlags & TCLEAR_Bitmap )
+	{
+		EnsureWaterFields();
 		for( INT  i=0; i< USize * VSize / 2; i++ )
 			SourceFields[i] = 128;
+	}
 
 	// Clear drops.
 	if( ClearFlags & TCLEAR_Temporal )
@@ -4549,6 +4583,7 @@ void UWaveTexture::ConstantTimeTick()
 
 	if ((USize>=8) && (VSize>=8)) // safe sizes ?
 	{
+		EnsureWaterFields();
 		WaterRedrawDrops();
 		CalculateWater(); 
 	}
@@ -4627,6 +4662,10 @@ void UWetTexture::PostLoad()
 
 	// Call base class.
 	UWaterTexture::PostLoad();
+#if defined(PLATFORM_DREAMCAST)
+	if( Format == TEXF_EXT_DCTEX )
+		return;
+#endif
 
 	// Update palette if new source texture selected;
 	// If through mipmap cutting our old source isn't available, 
@@ -4707,6 +4746,7 @@ void UWetTexture::ConstantTimeTick()
 
 	if ((SourceTexture) && ((USize>=8) && (VSize>=8))) // safe sizes ?
 	{
+		EnsureWaterFields();
 		//Update the water.
 		WaterRedrawDrops();
 		CalculateWater();  

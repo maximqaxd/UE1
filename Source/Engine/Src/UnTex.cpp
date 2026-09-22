@@ -59,6 +59,20 @@ void UTexture::Update( DOUBLE CurrentTime )
 {
 	guard(UTexture::Update);
 
+#if defined(PLATFORM_DREAMCAST)
+	// Cooked procedural subclasses may contain a static DT snapshot. They no
+	// longer need their CPU simulation, but retain their class so object and
+	// script references remain compatible with the retail packages.
+	if( Format == TEXF_EXT_DCTEX
+	&& GetClass() != UTexture::StaticClass
+	&& !IsA(UFont::StaticClass) )
+	{
+		LastUpdateTime = CurrentTime;
+		return;
+	}
+	EnsureProceduralData();
+#endif
+
 	if( CurrentTime != LastUpdateTime )
 	{
 		if( TextureFlags & TF_Realtime )
@@ -69,6 +83,25 @@ void UTexture::Update( DOUBLE CurrentTime )
 
 	unguard;
 }
+
+#if defined(PLATFORM_DREAMCAST)
+void UTexture::EnsureProceduralData()
+{
+	guard(UTexture::EnsureProceduralData);
+
+	if( (TextureFlags & TF_Parametric)
+	&& Format == TEXF_P8
+	&& Mips.Num()
+	&& !Mips(0).DataArray.Num() )
+	{
+		Mips(0).DataArray.SetNum( Mips(0).USize * Mips(0).VSize );
+		appMemset( &Mips(0).DataArray(0), 0, Mips(0).DataArray.Num() );
+		Mips(0).DataPtr = &Mips(0).DataArray(0);
+	}
+
+	unguardobj;
+}
+#endif
 
 //
 // Lock a texture for rendering.
@@ -308,12 +341,21 @@ void UTexture::Serialize( FArchive& Ar )
 	}
 #endif
 	UObject::Serialize( Ar );
-	if( (Ar.IsSaving() || Ar.IsLoading()) && (TextureFlags & TF_Parametric) )
+	if( (Ar.IsSaving() || Ar.IsLoading()) && (TextureFlags & TF_Parametric)
+#if defined(PLATFORM_DREAMCAST)
+	&& Format != TEXF_EXT_DCTEX
+#endif
+	)
 		for( INT i=0; i<Mips.Num(); i++ )
 			Mips(i).DataArray.Empty();
 	Ar << Mips;
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
-	if( Ar.IsLoading() && !(TextureFlags & TF_Parametric)
+	if( Ar.IsLoading()
+#if defined(PLATFORM_DREAMCAST)
+		&& (!(TextureFlags & TF_Parametric) || Format == TEXF_EXT_DCTEX)
+#else
+		&& !(TextureFlags & TF_Parametric)
+#endif
 #if defined(DC_RESOURCE_COOKER) && !defined(PLATFORM_DREAMCAST)
 		&& appDCStreamDeferredMips()
 #endif
@@ -339,9 +381,16 @@ void UTexture::Serialize( FArchive& Ar )
 		File->Seek( Resume );
 	}
 #endif
-	if( (Ar.IsSaving() || Ar.IsLoading()) && (TextureFlags & TF_Parametric) )
+	if( (Ar.IsSaving() || Ar.IsLoading()) && (TextureFlags & TF_Parametric)
+#if defined(PLATFORM_DREAMCAST)
+	&& !Ar.IsLoading()
+#endif
+	)
 		for( INT i=0; i<Mips.Num(); i++ )
-			Mips(i).DataArray.AddZeroed( Mips(i).USize * Mips(i).VSize );
+		{
+			Mips(i).DataArray.SetNum( Mips(i).USize * Mips(i).VSize );
+			appMemset( &Mips(i).DataArray(0), 0, Mips(i).DataArray.Num() );
+		}
 	if( Ar.Ver() <= 38 )//oldver
 	{
 		UClamp = USize;
@@ -464,7 +513,8 @@ void UTexture::PostLoad()
 	UObject::PostLoad();
 
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
-	if( appDCStreamDeferredMips() && !(TextureFlags & TF_Parametric) )
+	if( appDCStreamDeferredMips()
+	&& (!(TextureFlags & TF_Parametric) || Format == TEXF_EXT_DCTEX) )
 	{
 		// UTDC 0x8c127360 invokes texture upload here, which reads lazy mips.
 		// Resolve our disc slices at the same lifecycle point. Unlike retail's
