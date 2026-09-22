@@ -9,6 +9,9 @@
 #include "CorePrivate.h"
 
 #include <math.h>
+#if defined(PLATFORM_DREAMCAST)
+#include <sh4zam/shz_sh4zam.h>
+#endif
 #include <float.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -320,6 +323,51 @@ CORE_API void* appRealloc( void* Ptr, INT NewSize, const char* Tag )
 	Math functions.
 -----------------------------------------------------------------------------*/
 
+#if defined(PLATFORM_DREAMCAST)
+// -m4-single-only already makes DOUBLE 32 bits, so the win here is not
+// precision but reaching the SH-4's own instructions -- FSQRT, FSRRA and
+// especially FSCA -- instead of calling into libm and its range reduction.
+CORE_API DOUBLE appExp( DOUBLE Value )
+{
+	return shz_expf(Value);
+}
+CORE_API DOUBLE appLoge( DOUBLE Value )
+{
+	return shz_logf(Value);
+}
+CORE_API DOUBLE appFmod( DOUBLE Y, DOUBLE X )
+{
+	return shz_fmodf(Y,X);
+}
+CORE_API DOUBLE appSin( DOUBLE Value )
+{
+	return shz_sinf(Value);
+}
+CORE_API DOUBLE appCos( DOUBLE Value )
+{
+	return shz_cosf(Value);
+}
+CORE_API DOUBLE appTan( DOUBLE Value )
+{
+	return shz_tanf(Value);
+}
+CORE_API DOUBLE appAtan( DOUBLE Value )
+{
+	return shz_atanf(Value);
+}
+CORE_API DOUBLE appAtan2( DOUBLE Y, FLOAT X )
+{
+	return shz_atan2f(Y,X);
+}
+CORE_API DOUBLE appSqrt( DOUBLE Value )
+{
+	return shz_sqrtf(Value);
+}
+CORE_API DOUBLE appPow( DOUBLE A, DOUBLE B )
+{
+	return shz_powf(A,B);
+}
+#else
 CORE_API DOUBLE appExp( DOUBLE Value )
 {
 	return exp(Value);
@@ -360,6 +408,7 @@ CORE_API DOUBLE appPow( DOUBLE A, DOUBLE B )
 {
 	return pow(A,B);
 }
+#endif
 CORE_API UBOOL appIsNan( DOUBLE A )
 {
 	return _isnan(A)==1;
@@ -372,6 +421,20 @@ CORE_API FLOAT appFrand()
 {
 	return rand() / (FLOAT)RAND_MAX;
 }
+#if defined(PLATFORM_DREAMCAST)
+CORE_API INT appFloor( FLOAT Value )
+{
+	return (INT)shz_floorf(Value);
+}
+CORE_API INT appCeil( FLOAT Value )
+{
+	return (INT)shz_ceilf(Value);
+}
+CORE_API INT appRound( FLOAT Value )
+{
+	return (INT)shz_floorf(Value + 0.5f);
+}
+#else
 CORE_API INT appFloor( FLOAT Value )
 {
 	return (INT)floorf(Value);
@@ -384,6 +447,7 @@ CORE_API INT appRound( FLOAT Value )
 {
 	return (INT)floorf(Value + 0.5f);
 }
+#endif
 
 /*-----------------------------------------------------------------------------
 	File functions.
