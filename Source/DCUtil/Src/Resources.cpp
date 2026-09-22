@@ -45,6 +45,13 @@ static void ReadResource( const char* Path, TArray<BYTE>& Data )
 
 static UBOOL TextureNeedsMipmaps( UTexture* Texture, UPackage* Package )
 {
+	// Font glyph atlases are always sampled in screen space. Their character
+	// metrics remain in UFont; only the immutable bitmap is cooked to DT.
+	if( Texture->IsA(UFont::StaticClass) )
+	{
+		return 0;
+	}
+
 	if( Texture->Mips.Num() <= 1 )
 	{
 		return 0;
@@ -159,7 +166,9 @@ void FDCUtil::ProcessResources( const char* PackagePath, const char* ResourceDir
 
 	for( TObjectIterator<UTexture> It; It; ++It )
 	{
-		if( !It->IsIn( Package ) || It->GetClass() != UTexture::StaticClass
+		const UBOOL ConvertibleClass = It->GetClass() == UTexture::StaticClass
+			|| It->IsA(UFont::StaticClass);
+		if( !It->IsIn( Package ) || !ConvertibleClass
 			|| It->Format != TEXF_P8 || !It->Palette || !It->Mips.Num()
 			|| FTextureConverter::IsBlacklisted( *It )
 			|| (It->TextureFlags & (TF_Realtime | TF_RealtimePalette | TF_Parametric)) )

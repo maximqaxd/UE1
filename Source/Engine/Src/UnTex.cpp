@@ -317,11 +317,13 @@ void UTexture::Serialize( FArchive& Ar )
 #if defined(DC_RESOURCE_COOKER) && !defined(PLATFORM_DREAMCAST)
 		&& appDCStreamDeferredMips()
 #endif
-		&& (Format == TEXF_P8 || GetClass() != UTexture::StaticClass
+		&& (Format == TEXF_P8
+			|| (GetClass() != UTexture::StaticClass && !IsA(UFont::StaticClass))
 			|| (TextureFlags & (TF_Realtime | TF_RealtimePalette))) )
 	{
 		// Procedural subclasses can access their pixels before renderer upload.
-		// Only immutable textures may rely exclusively on lazy package reads.
+		// Immutable textures and cooked font atlases may rely exclusively on
+		// lazy package reads; UFont keeps its glyph metrics outside the bitmap.
 		FArchiveFileLoad* File = (FArchiveFileLoad*)&Ar;
 		INT Resume = File->Tell();
 		for( INT i = 0; i < Mips.Num(); ++i )
