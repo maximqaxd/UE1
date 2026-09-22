@@ -89,6 +89,10 @@ struct ENGINE_API FSceneNode
 	void ComputeRenderCoords( FVector& Location, FRotator& Rotation );
 };
 
+#if defined(PLATFORM_DREAMCAST)
+#include <sh4zam/shz_sh4zam.h>
+#endif
+
 /*------------------------------------------------------------------------------------
 	Transformations.
 ------------------------------------------------------------------------------------*/
@@ -113,10 +117,20 @@ struct FTransform : public FOutVector
 	FLOAT RZ;
 	void Project( const FSceneNode* Frame )
 	{
+#if defined(PLATFORM_DREAMCAST)
+		// FSRRA replaces a non-pipelined FDIV, and shz_floorf is an inline
+		// FTRC sequence rather than a call into floorf(). The reciprocal is
+		// accurate to about 21 bits, which is a fraction of a pixel here.
+		RZ      = Frame->Proj.Z * shz_invf_fsrra( Point.Z );
+		ScreenX = Point.X * RZ + Frame->FX15;
+		ScreenY = Point.Y * RZ + Frame->FY15;
+		IntY    = (INT)shz_floorf( ScreenY );
+#else
 		RZ      = Frame->Proj.Z / Point.Z;
 		ScreenX = Point.X * RZ + Frame->FX15;
 		ScreenY = Point.Y * RZ + Frame->FY15;
 		IntY    = appFloor( ScreenY );
+#endif
 	}
 	void ComputeOutcode( const FSceneNode* Frame )
 	{

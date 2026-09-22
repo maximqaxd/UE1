@@ -714,11 +714,57 @@ UBOOL URender::Exec(const char *Cmd,FOutputDevice *Out)
 	Pipe.
 --------------------------------------------------------------------------*/
 
+#if defined(PLATFORM_DREAMCAST)
+//
+// FVector::TransformPointBy is three dot products against an FCoords after
+// subtracting its origin. Expressed as a 4x4 that is a single FTRV, so the
+// matrix is loaded once per Bsp node and every vertex of that node reuses it.
+//
+// Row i is (Axis_i, -Origin.Axis_i), which is what makes M*(V,1) reproduce
+// (V - Origin) dotted with each axis.
+//
+// XMTRX is a single global bank. Nothing else touches it during OccludeBsp,
+// but reloading per node rather than per frame keeps that assumption local.
+//
+static void DCLoadPipeCoords( const FCoords& C )
+{
+	shz_vec4_t R0, R1, R2, R3;
+	R0.x = C.XAxis.X; R0.y = C.XAxis.Y; R0.z = C.XAxis.Z; R0.w = -(C.Origin | C.XAxis);
+	R1.x = C.YAxis.X; R1.y = C.YAxis.Y; R1.z = C.YAxis.Z; R1.w = -(C.Origin | C.YAxis);
+	R2.x = C.ZAxis.X; R2.y = C.ZAxis.Y; R2.z = C.ZAxis.Z; R2.w = -(C.Origin | C.ZAxis);
+	R3.x = 0.f;       R3.y = 0.f;       R3.z = 0.f;       R3.w = 1.f;
+	shz_xmtrx_load_rows_4x4( &R0, &R1, &R2, &R3 );
+}
+#endif
+
 //
 // Basic transform, outcode, project.
 //
 static void Pipe( FTransform& Result, const FSceneNode* Frame, const FVector& InVector )
 {
+#if defined(PLATFORM_DREAMCAST)
+	// Requires DCLoadPipeCoords( Frame->Coords ) to have run for this node.
+	shz_vec3_t In;
+	In.x = InVector.X; In.y = InVector.Y; In.z = InVector.Z;
+	const shz_vec3_t Out = shz_xmtrx_transform_point3( In );
+	Result.Point.X = Out.x;
+	Result.Point.Y = Out.y;
+	Result.Point.Z = Out.z;
+
+	const FLOAT ClipXM = Frame->PrjXM * Result.Point.Z + Result.Point.X;
+	const FLOAT ClipXP = Frame->PrjXP * Result.Point.Z - Result.Point.X;
+	const FLOAT ClipYM = Frame->PrjYM * Result.Point.Z + Result.Point.Y;
+	const FLOAT ClipYP = Frame->PrjYP * Result.Point.Z - Result.Point.Y;
+
+	// Same outcode as the table version below, without the four table loads.
+	Result.Flags = (BYTE)
+	(	((ClipXM < 0.0f) << 2)   // FVF_OutXMin
+	|	((ClipXP < 0.0f) << 3)   // FVF_OutXMax
+	|	((ClipYM < 0.0f) << 4)   // FVF_OutYMin
+	|	((ClipYP < 0.0f) << 5) );// FVF_OutYMax
+	if( !Result.Flags )
+		Result.Project( Frame );
+#else
 	static FLOAT Half=0.5;
 	static FLOAT ClipXM, ClipXP, ClipYM, ClipYP;
 	static const BYTE OutXMinTab [2] = { 0, FVF_OutXMin };
@@ -742,6 +788,7 @@ static void Pipe( FTransform& Result, const FSceneNode* Frame, const FVector& In
 		Result.ScreenY = Result.Point.Y * Result.RZ + Frame->FY15;
 		Result.IntY    = appFloor( Result.ScreenY );
 	}
+#endif
 }
 
 //
@@ -786,6 +833,9 @@ INT URender::ClipBspSurf( INT iNode, FTransform**& Result )
 	FVert*	  VertPool	= &GVerts[Node->iVertPool];
 	BYTE      Outcode   = FVF_OutReject;
 	BYTE      AllCodes  = 0;
+#if defined(PLATFORM_DREAMCAST)
+	DCLoadPipeCoords( GFrame->Coords );
+#endif
 	for( INT i=0; i<NumPts; i++ )
 	{
 		INT pPoint = VertPool[i].pVertex;
@@ -1487,6 +1537,9 @@ void Traverse( FSceneNode* Frame, INT iNode )
 	for( INT iPlane=iNode; iPlane!=INDEX_NONE; iPlane=Plane->iPlane )
 	{
 		Plane = _Nodes+iPlane;
+#if defined(PLATFORM_DREAMCAST)
+		DCLoadPipeCoords( Frame->Coords );
+#endif
 		for( INT i=0; i<Plane->NumVertices; i++ )
 		{
 			INT pPoint = _Verts[Plane->iVertPool+i].pVertex;
