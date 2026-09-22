@@ -347,7 +347,7 @@ UPVRRenderDevice::UPVRRenderDevice()
 {
 	NoFiltering = false;
 	UseTriStrips = true;
-	DistanceFog = true;
+	DistanceFog = false;
 	VolumetricFog = false;
 	FogDistanceDefault = 0;
 	CommandBufferKB = 256;
@@ -721,10 +721,17 @@ void UPVRRenderDevice::EmitHeader( pvr_list_t List, DWORD PolyFlags, const FTexS
 			Cxt.blend.src = PVR_BLEND_ONE;
 			Cxt.blend.dst = PVR_BLEND_ONE;
 		}
+		else if( PolyFlags & PF_Highlighted )
+		{
+			// GL_ONE / GL_ONE_MINUS_SRC_ALPHA.
+			Cxt.blend.src = PVR_BLEND_ONE;
+			Cxt.blend.dst = PVR_BLEND_INVSRCALPHA;
+		}
 		else
 		{
-			// PF_Highlighted: GL_ONE / GL_ONE_MINUS_SRC_ALPHA.
-			Cxt.blend.src = PVR_BLEND_ONE;
+			// A screen overlay carrying no blend flag of its own still has to
+			// honour its texture's alpha, which is what Unreal's HUD relies on.
+			Cxt.blend.src = PVR_BLEND_SRCALPHA;
 			Cxt.blend.dst = PVR_BLEND_INVSRCALPHA;
 		}
 	}
@@ -735,7 +742,9 @@ void UPVRRenderDevice::EmitHeader( pvr_list_t List, DWORD PolyFlags, const FTexS
 	}
 
 	Cxt.txr.alpha    = PVR_TXRALPHA_ENABLE;
-	Cxt.txr.env      = (List == PVR_LIST_TR_POLY) ? PVR_TXRENV_MODULATEALPHA : PVR_TXRENV_MODULATE;
+	// The opaque list discards alpha anyway; both other lists need the vertex
+	// alpha folded in as well as the texture's.
+	Cxt.txr.env      = (List == PVR_LIST_OP_POLY) ? PVR_TXRENV_MODULATE : PVR_TXRENV_MODULATEALPHA;
 
 	// Fog is applied per pixel before the blend unit, so it can only go on the
 	// pass that establishes base colour. Putting it on the translucent list
@@ -1077,9 +1086,16 @@ void UPVRRenderDevice::DrawTile( FSceneNode* Frame, FTextureInfo& Texture, FLOAT
 	CaptureTexState( Tex );
 
 	// Masked art -- fonts and status bar icons -- is punch-through, which is
-	// far cheaper than blending it. Only genuinely blended tiles reach TR.
+	// far cheaper than blending it.
+	//
+	// Everything else stays translucent. Punch-through only reproduces one-bit
+	// alpha: it turns a partially transparent texel fully opaque, which is how
+	// a HUD panel ends up as a black box over the world. Unreal's canvas draws
+	// plenty of tiles carrying no blend flag at all and still expects their
+	// texture alpha to be honoured.
 	const UBOOL Blended = ( PolyFlags & (PF_Translucent|PF_Modulated|PF_Highlighted) ) != 0;
-	const pvr_list_t List = Blended ? PVR_LIST_TR_POLY : PVR_LIST_PT_POLY;
+	const UBOOL Masked  = ( PolyFlags & PF_Masked ) != 0;
+	const pvr_list_t List = ( Masked && !Blended ) ? PVR_LIST_PT_POLY : PVR_LIST_TR_POLY;
 
 	// One header plus a four-vertex strip.
 	if( !PVRBeginDraw( List, 32 + 4 * 32 ) )
