@@ -43,6 +43,26 @@ static void ReadResource( const char* Path, TArray<BYTE>& Data )
 	appFclose( File );
 }
 
+static UBOOL TextureNeedsMipmaps( UTexture* Texture, UPackage* Package )
+{
+	if( Texture->Mips.Num() <= 1 )
+	{
+		return 0;
+	}
+
+	// MenuGr is imported into Unreal.MenuGfx. Icons contains the HUD and
+	// crosshair atlas. These are drawn in screen space and must stay base-only
+	// even when a retail package happens to carry a generated mip chain.
+	const char* Group = Texture->GetParent() ? Texture->GetParent()->GetName() : "";
+	if( !appStricmp(Package->GetName(), "MenuGr")
+		|| !appStricmp(Group, "MenuGfx")
+		|| !appStricmp(Group, "Icons") )
+	{
+		return 0;
+	}
+	return 1;
+}
+
 static void PatchDreamcastPlayerFallback( UPackage* Package )
 {
 	// The retail file is UnrealI.u, while its script classes use the logical
@@ -169,6 +189,20 @@ void FDCUtil::ProcessResources( const char* PackagePath, const char* ResourceDir
 		else
 		{
 			FTextureConverter::ExportDCTexture( *It, Path );
+
+			// Preserve the source package's authoring decision and screen-space
+			// interface groups. A sidecar lets the external encoder distinguish
+			// base-only textures without relying on individual object names.
+			ResourceFile( Path, ARRAY_COUNT(Path), ResourceDir, *It, "png.nomip" );
+			if( !TextureNeedsMipmaps(*It, Package) )
+			{
+				TArray<BYTE> Marker;
+				WriteResource( Path, Marker );
+			}
+			else
+			{
+				appUnlink( Path );
+			}
 		}
 		++Textures;
 	}
