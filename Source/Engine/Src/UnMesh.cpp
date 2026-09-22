@@ -10,6 +10,36 @@
 #include "UnRender.h"
 #include "Amd3d.h"
 
+#if defined(PLATFORM_DREAMCAST)
+//
+// (V - MeshOrigin).TransformPointBy(Coords) is three dot products after two
+// subtractions. Both origins are constant for the whole mesh, so they fold
+// into the translation column of a single 4x4 and each vertex becomes one
+// FTRV. Row i is (Axis_i, -(MeshOrigin + Coords.Origin).Axis_i).
+//
+// XMTRX is a single global bank; it is loaded here and consumed immediately by
+// the vertex loop below, with nothing in between that touches it.
+//
+static void DCLoadMeshCoords( const FCoords& Coords, const FVector& MeshOrigin )
+{
+	const FVector Base = MeshOrigin + Coords.Origin;
+	shz_vec4_t R0, R1, R2, R3;
+	R0.x = Coords.XAxis.X; R0.y = Coords.XAxis.Y; R0.z = Coords.XAxis.Z; R0.w = -(Base | Coords.XAxis);
+	R1.x = Coords.YAxis.X; R1.y = Coords.YAxis.Y; R1.z = Coords.YAxis.Z; R1.w = -(Base | Coords.YAxis);
+	R2.x = Coords.ZAxis.X; R2.y = Coords.ZAxis.Y; R2.z = Coords.ZAxis.Z; R2.w = -(Base | Coords.ZAxis);
+	R3.x = 0.f;            R3.y = 0.f;            R3.z = 0.f;            R3.w = 1.f;
+	shz_xmtrx_load_rows_4x4( &R0, &R1, &R2, &R3 );
+}
+
+static inline FVector DCTransformMeshVert( const FVector& V )
+{
+	shz_vec3_t In;
+	In.x = V.X; In.y = V.Y; In.z = V.Z;
+	const shz_vec3_t Out = shz_xmtrx_transform_point3( In );
+	return FVector( Out.x, Out.y, Out.z );
+}
+#endif
+
 /*-----------------------------------------------------------------------------
 	UMesh object implementation.
 -----------------------------------------------------------------------------*/
@@ -220,6 +250,11 @@ void UMesh::GetFrame
 		FMeshVert* MeshVertex1 = &Verts( iFrameOffset1 );
 		FMeshVert* MeshVertex2 = &Verts( iFrameOffset2 );
 #endif
+#if defined(PLATFORM_DREAMCAST)
+		// Loaded here, not earlier: the cursors above are constructed first
+		// and XMTRX shares the back FP bank with 8-byte moves.
+		DCLoadMeshCoords( Coords, Origin );
+#endif
 		for( INT i=0; i<FrameVerts; i++ )
 		{
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
@@ -230,7 +265,11 @@ void UMesh::GetFrame
 			FVector V2( MeshVertex2[i].X, MeshVertex2[i].Y, MeshVertex2[i].Z );
 #endif
 			CachedVerts[i] = V1 + (V2-V1)*Alpha;
+#if defined(PLATFORM_DREAMCAST)
+			*ResultVerts = DCTransformMeshVert( CachedVerts[i] );
+#else
 			*ResultVerts = (CachedVerts[i] - Origin).TransformPointBy(Coords);
+#endif
 			*(BYTE**)&ResultVerts += Size;
 		}
 	}
@@ -253,6 +292,9 @@ void UMesh::GetFrame
 #else
 		FMeshVert* MeshVertex = &Verts( iFrameOffset );
 #endif
+#if defined(PLATFORM_DREAMCAST)
+		DCLoadMeshCoords( Coords, Origin );
+#endif
 		for( INT i=0; i<FrameVerts; i++ )
 		{
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
@@ -261,7 +303,11 @@ void UMesh::GetFrame
 			FVector V2( MeshVertex[i].X, MeshVertex[i].Y, MeshVertex[i].Z );
 #endif
 			CachedVerts[i] += (V2 - CachedVerts[i]) * Alpha;
+#if defined(PLATFORM_DREAMCAST)
+			*ResultVerts = DCTransformMeshVert( CachedVerts[i] );
+#else
 			*ResultVerts = (CachedVerts[i] - Origin).TransformPointBy(Coords);
+#endif
 			*(BYTE**)&ResultVerts += Size;
 		}
 
