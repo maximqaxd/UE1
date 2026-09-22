@@ -534,6 +534,50 @@ FPlane FLightManager::Light( FTransSample& Vert, DWORD PolyFlags )
 		// Lit.
 		STAT(GStat.MeshVertLightCount += LastLight-FirstLight);
 		FLOAT PointSquared(Vert.Point.SizeSquared());
+#if defined(PLATFORM_DREAMCAST)
+		// 1/PointSquared does not depend on the light, so it leaves the loop.
+		const FLOAT RPointSquared = ( PointSquared > 0.f ) ? shz_invf_fsrra( PointSquared ) : 0.f;
+		for( FLightInfo* Light=FirstLight; Light<LastLight; Light++ )
+		{
+			if( Light->Opt != ALO_NotLight )
+			{
+				// Diffuse lighting.
+				const FVector LightVector = Light->Location - Vert.Point;
+				const FLOAT LightSquared  = shz_dot8f( LightVector.X, LightVector.Y, LightVector.Z, 0.f,
+				                                       LightVector.X, LightVector.Y, LightVector.Z, 0.f );
+				if( LightSquared <= 0.f )
+					continue;
+
+				// One FSRRA yields 1/|L|, which removes both the square root
+				// and the division that followed it: the normalised dot is
+				// dot * RLightSize, and |L| itself is LightSquared * RLightSize.
+				const FLOAT RLightSize = shz_inv_sqrtf_fsrra( LightSquared );
+				const FLOAT LightSize  = LightSquared * RLightSize;
+				const FLOAT NDotL      = shz_dot8f( LightVector.X, LightVector.Y, LightVector.Z, 0.f,
+				                                    Vert.Normal.X, Vert.Normal.Y, Vert.Normal.Z, 0.f );
+				FLOAT G = Square( 1.0f + NDotL * RLightSize ) - 1.5f;
+				if( G < 0.0f )
+					G = 0.0f;
+
+				// Specular lighting. MirrorByPlane expanded so the plane dot
+				// and the mirrored dot are both FIPR.
+				const FLOAT PlaneDot = shz_dot8f( Light->Location.X, Light->Location.Y, Light->Location.Z, -1.f,
+				                                  Vert.Normal.X, Vert.Normal.Y, Vert.Normal.Z, Vert.Normal.W );
+				const FVector Mirrored = Light->Location - Vert.Normal * (2.0f * PlaneDot);
+				const FLOAT Specular = shz_dot8f( Mirrored.X, Mirrored.Y, Mirrored.Z, 0.f,
+				                                  Vert.Point.X, Vert.Point.Y, Vert.Point.Z, 0.f ) - PointSquared;
+				if( Specular > 0.0f )
+					G += 6.0f * Square(Specular) * ( RLightSize * RLightSize ) * RPointSquared;
+
+				// Radial falloff.
+				G *= 1.0f - LightSize * Light->RRadius;
+
+				// Update result color.
+				if( G > 0.0f )
+					Color += Light->FloatColor * G;
+			}
+		}
+#else
 		for( FLightInfo* Light=FirstLight; Light<LastLight; Light++ )
 		{
 			if( Light->Opt != ALO_NotLight )
@@ -559,6 +603,7 @@ FPlane FLightManager::Light( FTransSample& Vert, DWORD PolyFlags )
 					Color += Light->FloatColor * G;
 			}
 		}
+#endif
 	}
 	else Color = FPlane(0.5,0.5,0.5,0);
 
