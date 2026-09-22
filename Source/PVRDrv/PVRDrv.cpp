@@ -1377,13 +1377,18 @@ void* UPVRRenderDevice::ConvertTextureMipI8( const FMipmap* Mip, const FColor* P
 {
 	// 8-bit indexed. We have to fix the alpha component since it's mostly garbage.
 	DWORD i;
-	_WORD* Dst = (_WORD*)Compose;
 	const BYTE* Src = (const BYTE*)Mip->DataPtr;
 	const DWORD SrcCount = Mip->USize * Mip->VSize;
 	INT USize = Mip->USize;
 	INT VSize = Mip->VSize;
 
-	EnsureComposeSize( SrcCount * 2 );
+	// Horizontal expansion writes the first image; VerticalUpscale appends
+	// its output after that image. Acquire the pointer only after allocation.
+	const DWORD ConvertedPixels = Max(MinTexSize, USize) * VSize;
+	const DWORD UpscaledPixels = VSize < MinTexSize
+		? Max(MinTexSize, USize) * MinTexSize : 0;
+	EnsureComposeSize( (ConvertedPixels + UpscaledPixels) * sizeof(_WORD) );
+	_WORD* Dst = (_WORD*)Compose;
 
 	// convert palette; if texture is masked, make first entry transparent
 	_WORD DstPal[NUM_PAL_COLORS];
@@ -1433,11 +1438,14 @@ void* UPVRRenderDevice::ConvertTextureMipBGRA7777( const FMipmap* Mip )
 	DWORD i;
 	INT USize = Mip->USize;
 	INT VSize = Mip->VSize;
-	_WORD* Dst = (_WORD*)Compose;
 	const FColor* Src = (const FColor*)Mip->DataPtr;
 	const DWORD Count = USize * VSize;
 
-	EnsureComposeSize( Count * 2 );
+	const DWORD ConvertedPixels = Max(MinTexSize, USize) * VSize;
+	const DWORD UpscaledPixels = VSize < MinTexSize
+		? Max(MinTexSize, USize) * MinTexSize : 0;
+	EnsureComposeSize( (ConvertedPixels + UpscaledPixels) * sizeof(_WORD) );
+	_WORD* Dst = (_WORD*)Compose;
 
 	// convert and upscale texture horizontally to width = 8 if needed
 	const INT UTimes = MinTexSize / USize;
