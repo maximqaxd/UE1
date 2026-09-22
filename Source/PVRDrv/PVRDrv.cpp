@@ -1085,27 +1085,26 @@ void UPVRRenderDevice::DrawTile( FSceneNode* Frame, FTextureInfo& Texture, FLOAT
 	FTexState Tex;
 	CaptureTexState( Tex );
 
-	// Masked art -- fonts and status bar icons -- is punch-through, which is
-	// far cheaper than blending it.
+	// Every tile goes to the translucent list, and it has to.
 	//
-	// Everything else stays translucent. Punch-through only reproduces one-bit
-	// alpha: it turns a partially transparent texel fully opaque, which is how
-	// a HUD panel ends up as a black box over the world. Unreal's canvas draws
-	// plenty of tiles carrying no blend flag at all and still expects their
-	// texture alpha to be honoured.
-	const UBOOL Blended = ( PolyFlags & (PF_Translucent|PF_Modulated|PF_Highlighted) ) != 0;
-	const UBOOL Masked  = ( PolyFlags & PF_Masked ) != 0;
-	const pvr_list_t List = ( Masked && !Blended ) ? PVR_LIST_PT_POLY : PVR_LIST_TR_POLY;
+	// The hardware renders punch-through before translucent no matter what
+	// order the lists were submitted in, so splitting the HUD across the two
+	// destroys its painter ordering: a panel routed to TR lands on top of the
+	// text routed to PT, whatever order Unreal drew them in. Punch-through is
+	// also one-bit alpha only, so a partially transparent tile comes out
+	// opaque there. Keeping the HUD in one list preserves both.
+	//
+	// Masked world geometry still uses punch-through -- it is depth tested, so
+	// the depth buffer resolves it rather than submission order.
+	const pvr_list_t List = PVR_LIST_TR_POLY;
 
 	// One header plus a four-vertex strip.
 	if( !PVRBeginDraw( List, 32 + 4 * 32 ) )
 		return;
 
-	// Screen-space overlay depth. Each tile steps slightly nearer than the
-	// last, so the punch-through pass -- which resolves by depth rather than
-	// submission order -- reproduces Unreal's painter ordering.
-	const FLOAT TileZ = OverlayZUI + UIZCursor;
-	UIZCursor += UIZStep;
+	// Screen-space overlay depth. Ordering between tiles comes from submission
+	// order, so every tile can share one depth in front of the world.
+	const FLOAT TileZ = OverlayZUI;
 
 	EmitHeader( List, PolyFlags, &Tex, /*NoDepth=*/1 );
 
@@ -1159,7 +1158,7 @@ void UPVRRenderDevice::EndFlash( )
 	pvr_sprite_cxt_col( &Cxt, List );
 	Cxt.gen.culling      = PVR_CULLING_NONE;
 	Cxt.gen.fog_type     = PVR_FOG_DISABLE;
-	Cxt.depth.comparison = PVR_DEPTHCMP_GEQUAL;
+	Cxt.depth.comparison = PVR_DEPTHCMP_ALWAYS;
 	Cxt.depth.write      = PVR_DEPTHWRITE_DISABLE;
 	Cxt.blend.src        = PVR_BLEND_ONE;
 	Cxt.blend.dst        = PVR_BLEND_INVSRCALPHA;
