@@ -266,6 +266,16 @@ else()
   add_compile_options(-Wno-write-strings)
 endif()
 
+# The SH-4 is strictly in-order with long FP latencies, so -Os (selected above
+# via LOW_MEMORY) costs real frames in the per-vertex code. Keep the size
+# setting globally and raise optimisation only on the renderer, the engine and
+# the PVR driver.
+function(dc_optimize_hot_target target)
+  if(TARGET_IS_DREAMCAST AND TARGET ${target})
+    target_compile_options(${target} PRIVATE -O2 -fno-math-errno)
+  endif()
+endfunction()
+
 # Dependencies
 
 if(USE_SDL)
@@ -403,6 +413,11 @@ if(BUILD_DCUTIL)
   list(APPEND INSTALL_TARGETS DCUtil)
   add_subdirectory(DCUtil)
 endif()
+
+# Raise optimisation on the per-vertex hot path (see dc_optimize_hot_target).
+dc_optimize_hot_target(Render)
+dc_optimize_hot_target(Engine)
+dc_optimize_hot_target(PVRDrv)
 
 # assemble all modules and pdbs in one dir
 
