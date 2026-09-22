@@ -52,6 +52,13 @@ static UBOOL IsScreenSpaceDreamcastProcedural( UTexture* Texture )
 		|| !appStricmp(Path, "MenuGr.MenuBarrier");
 }
 
+static UBOOL IsDreamcastStarfield( UTexture* Texture )
+{
+	const char* Path = Texture->GetPathName();
+	return !appStricmp(Path, "GenFluid.Sky.NghSky3")
+		|| !appStricmp(Path, "GenFluid.Sky.Ntskyt");
+}
+
 enum { DCProceduralFrames = 8 };
 
 static UBOOL IsAnimatedDreamcastProcedural( UTexture* Texture )
@@ -97,6 +104,13 @@ static void BakeDreamcastProcedural( UTexture* Texture )
 
 static UBOOL TextureNeedsMipmaps( UTexture* Texture, UPackage* Package )
 {
+	// Sparse one-pixel stars are a worst case for both 2x2 VQ blocks and mip
+	// averaging. Preserve the authored base image exactly for the sky dome.
+	if( IsDreamcastStarfield(Texture) )
+	{
+		return 0;
+	}
+
 	if( IsScreenSpaceDreamcastProcedural(Texture) )
 	{
 		return 0;
@@ -365,6 +379,17 @@ void FDCUtil::ProcessResources( const char* PackagePath, const char* ResourceDir
 			// base-only textures without relying on individual object names.
 			ResourceFile( Path, ARRAY_COUNT(Path), ResourceDir, *It, "png.nomip" );
 			if( !TextureNeedsMipmaps(*It, Package) )
+			{
+				TArray<BYTE> Marker;
+				WriteResource( Path, Marker );
+			}
+			else
+			{
+				appUnlink( Path );
+			}
+
+			ResourceFile( Path, ARRAY_COUNT(Path), ResourceDir, *It, "png.novq" );
+			if( IsDreamcastStarfield(*It) )
 			{
 				TArray<BYTE> Marker;
 				WriteResource( Path, Marker );
