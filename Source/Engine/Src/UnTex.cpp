@@ -351,11 +351,7 @@ void UTexture::Serialize( FArchive& Ar )
 	Ar << Mips;
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
 	if( Ar.IsLoading()
-#if defined(PLATFORM_DREAMCAST)
-		&& (!(TextureFlags & TF_Parametric) || Format == TEXF_EXT_DCTEX)
-#else
-		&& !(TextureFlags & TF_Parametric)
-#endif
+	&& (!(TextureFlags & TF_Parametric) || Format == TEXF_EXT_DCTEX)
 #if defined(DC_RESOURCE_COOKER) && !defined(PLATFORM_DREAMCAST)
 		&& appDCStreamDeferredMips()
 #endif
@@ -384,6 +380,8 @@ void UTexture::Serialize( FArchive& Ar )
 	if( (Ar.IsSaving() || Ar.IsLoading()) && (TextureFlags & TF_Parametric)
 #if defined(PLATFORM_DREAMCAST)
 	&& !Ar.IsLoading()
+#elif defined(DC_RESOURCE_COOKER)
+	&& !(Ar.IsLoading() && Format == TEXF_EXT_DCTEX)
 #endif
 	)
 		for( INT i=0; i<Mips.Num(); i++ )
