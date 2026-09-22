@@ -292,10 +292,18 @@ public:
 	FDCMeshTriangleCursor( const UMesh& InMesh );
 	UBOOL Next( FMeshTri& Triangle );
 
+	// Where the triangle most recently returned by Next() came from, so a
+	// renderer that can consume strips directly is able to stitch consecutive
+	// triangles back together instead of re-expanding them.
+	INT LastRun() const { return LastRunIndex; }
+	INT LastVertex() const { return LastRunVertex; }
+
 private:
 	const UMesh& Mesh;
 	INT RunIndex;
 	INT RunVertex;
+	INT LastRunIndex;
+	INT LastRunVertex;
 };
 #endif
 

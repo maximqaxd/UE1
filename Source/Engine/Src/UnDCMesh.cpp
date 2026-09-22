@@ -522,7 +522,7 @@ FMeshTri* UMesh::GetDCTriangles( INT& Count )
 }
 
 FDCMeshTriangleCursor::FDCMeshTriangleCursor( const UMesh& InMesh )
-	: Mesh(InMesh), RunIndex(0), RunVertex(2)
+	: Mesh(InMesh), RunIndex(0), RunVertex(2), LastRunIndex(INDEX_NONE), LastRunVertex(INDEX_NONE)
 {}
 
 UBOOL FDCMeshTriangleCursor::Next( FMeshTri& Triangle )
@@ -538,6 +538,8 @@ UBOOL FDCMeshTriangleCursor::Next( FMeshTri& Triangle )
 	}
 
 	const FDCMeshRun& Run = Mesh.DCRuns(RunIndex);
+	LastRunIndex = RunIndex;
+	LastRunVertex = RunVertex;
 	const FDCMeshMaterial& Material = Mesh.DCMaterials(Run.Material);
 	Triangle.PolyFlags = Material.Flags;
 	Triangle.TextureIndex = Material.Texture;

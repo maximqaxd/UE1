@@ -265,6 +265,75 @@ void RenderSubsurface
 }
 
 /*------------------------------------------------------------------------------
+	Cooked triangle strips.
+------------------------------------------------------------------------------*/
+
+#if defined(PLATFORM_DREAMCAST)
+//
+// Hand one contiguous span of a cooked strip run to the render device as a
+// strip.  Returns 0 when the span cannot be stripped -- a vertex sits outside
+// the frustum and needs clipping, or one mesh vertex would have to carry two
+// different UVs within the same strip -- in which case the caller falls back
+// to submitting the span's triangles individually.
+//
+static UBOOL EmitMeshStrip
+(
+	FSceneNode*			Frame,
+	UMesh*				Mesh,
+	FTransTexture*		Samples,
+	FSpanBuffer*		SpanBuffer,
+	FTextureInfo&		Info,
+	DWORD				PolyFlags,
+	const FDCMeshRun&	Run,
+	INT					FirstSlot,
+	INT					LastSlot,
+	FTransTexture**		Pts,
+	DWORD*				Stamp,
+	DWORD				StripId
+)
+{
+	guardSlow(EmitMeshStrip);
+
+	INT Num = 0;
+	for( INT Slot=FirstSlot; Slot<=LastSlot; Slot++ )
+	{
+		const INT   Index = Run.First + Slot;
+		const INT   iVert = Mesh->DCIndices(Index);
+		const DWORD UV    = Mesh->DCUVs(Index);
+		FTransTexture& V  = Samples[iVert];
+
+		// Anything with an outcode still needs RenderSubsurface's clipper.
+		if( V.Flags )
+			return 0;
+
+		if( (Stamp[iVert] >> 16) == StripId )
+		{
+			// Already placed in this strip; it can only be reused if the
+			// cooker gave it the same texture coordinates.
+			if( (Stamp[iVert] & 0xFFFF) != UV )
+				return 0;
+		}
+		else
+		{
+			Stamp[iVert] = (StripId << 16) | UV;
+			V.U = (UV & 255) * UScale;
+			V.V = (UV >> 8)  * VScale;
+		}
+
+		if( PolyFlags & PF_Unlit )
+			V.Light = GUnlitColor;
+
+		Pts[Num++] = &V;
+	}
+
+	Frame->Viewport->RenDev->DrawGouraudTriStrip( Frame, Info, Pts, Num, PolyFlags, SpanBuffer );
+	return 1;
+
+	unguardSlow;
+}
+#endif
+
+/*------------------------------------------------------------------------------
 	High level mesh rendering.
 ------------------------------------------------------------------------------*/
 
@@ -275,6 +344,10 @@ struct FMeshTriSort
 {
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
 	FMeshTri Tri;
+	// Which cooked strip this triangle came from, so the draw loop can stitch
+	// consecutive triangles back into a strip for the render device.
+	INT StripRun;
+	INT StripVert;
 #else
 	FMeshTri* Tri;
 #endif
@@ -504,6 +577,8 @@ void URender::DrawMesh
 					// This is visible.
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
 					TriTop->Tri = *Tri;
+					TriTop->StripRun  = Mesh->DCRuns.Num() ? DCTriangleCursor.LastRun()    : INDEX_NONE;
+					TriTop->StripVert = Mesh->DCRuns.Num() ? DCTriangleCursor.LastVertex() : INDEX_NONE;
 #else
 					TriTop->Tri = Tri;
 #endif
@@ -617,6 +692,38 @@ void URender::DrawMesh
 		// Draw the triangles.
 		guardSlow(DrawVisible);
 		STAT(GStat.MeshPolyCount+=VisibleTriangles);
+
+#if defined(PLATFORM_DREAMCAST)
+		// Meshes are strip-cooked offline. When the render device can take a
+		// strip directly, stitch runs of consecutive visible triangles back
+		// together: N vertices for N-2 triangles instead of 3*(N-2).
+		// Mirrored scene nodes are excluded because they invert winding, which
+		// a strip cannot express by swapping two corners.
+		UBOOL UseStrips = Frame->Viewport->RenDev->SupportsTriStrips
+			&& Mesh->DCRuns.Num()
+			&& !Frame->Viewport->RenDev->SpanBased
+			&& Frame->Mirror != -1;
+		FTransTexture** StripPts = NULL;
+		DWORD* StripStamp = NULL;
+		DWORD StripId = 0;
+		if( UseStrips )
+		{
+			INT MaxRun = 0;
+			for( INT r=0; r<Mesh->DCRuns.Num(); r++ )
+				MaxRun = Max<INT>( MaxRun, Mesh->DCRuns(r).Count );
+			if( MaxRun >= 3 && Mesh->FrameVerts > 0 )
+			{
+				StripPts   = New<FTransTexture*>( GMem, MaxRun );
+				StripStamp = New<DWORD>( GMem, Mesh->FrameVerts );
+				appMemset( StripStamp, 0, Mesh->FrameVerts * sizeof(DWORD) );
+			}
+			else
+			{
+				UseStrips = 0;
+			}
+		}
+#endif
+
 		for( INT i=0; i<VisibleTriangles; i++ )
 		{
 			// Set up the triangle.
@@ -625,6 +732,45 @@ void URender::DrawMesh
 #else
 			FMeshTri& Tri = *TriPool[i].Tri;
 #endif
+
+#if defined(PLATFORM_DREAMCAST)
+			if( UseStrips && !(Tri.PolyFlags & PF_Invisible) && TriPool[i].StripRun != INDEX_NONE )
+			{
+				const DWORD StripFlags = Tri.PolyFlags | ExtraFlags;
+				// Curved-surface subdivision and environment mapping both need
+				// RenderSubsurface's per-vertex work, so they stay off the
+				// strip path.
+				if( (StripFlags & PF_Flat) && !(StripFlags & PF_Environment) )
+				{
+					const INT Run = TriPool[i].StripRun;
+					INT End = i;
+					while( End+1 < VisibleTriangles
+						&& TriPool[End+1].StripRun == Run
+						&& TriPool[End+1].StripVert == TriPool[End].StripVert + 1
+						&& !(TriPool[End+1].Tri.PolyFlags & PF_Invisible)
+						&& TriPool[End+1].Tri.PolyFlags == Tri.PolyFlags
+						&& TriPool[End+1].Tri.TextureIndex == Tri.TextureIndex )
+						End++;
+
+					if( End > i )
+					{
+						INT Index = Tri.TextureIndex;
+						FTextureInfo& StripInfo = Textures[Index] ? TextureInfo[Index] : EnvironmentInfo;
+						UScale = StripInfo.UScale * StripInfo.USize / 256.0;
+						VScale = StripInfo.VScale * StripInfo.VSize / 256.0;
+						if( EmitMeshStrip( Frame, Mesh, Samples, SpanBuffer, StripInfo, StripFlags,
+								Mesh->DCRuns(Run), TriPool[i].StripVert - 2, TriPool[End].StripVert,
+								StripPts, StripStamp, ++StripId ) )
+						{
+							STAT(GStat.MeshSubCount += End - i + 1);
+							i = End;
+							continue;
+						}
+					}
+				}
+			}
+#endif
+
 			if( !(Tri.PolyFlags & PF_Invisible) )
 			{
 				// Get texture.
