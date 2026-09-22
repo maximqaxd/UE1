@@ -141,16 +141,23 @@ static void StreamRead(int nStream, void* buf, uint32_t size) {
 	}
 }
 
+// Stream uploads deliberately avoid the _sq variants. spu_memload_sq takes the
+// global store-queue mutex, which UPVRRenderDevice::Lock holds from
+// pvr_list_begin until Unlock, i.e. for a whole frame. The audio worker runs
+// these while holding channel_mtx, so using _sq here lets the worker block on
+// the renderer's lock with channel_mtx held while the main thread waits on
+// channel_mtx, deadlocking the frame. spu_memload goes over G2 instead and
+// takes no such lock; 4K every ~370ms costs far less than a lost frame.
 void AudioEngine_LoadFirstChunk(int nStream) {
 	 uint32_t read_size = streams[nStream].stereo ? STREAM_STAGING_READ_SIZE_STEREO : STREAM_STAGING_READ_SIZE_MONO;
 	 StreamRead(nStream, streams[nStream].buffer, read_size);
 	if (streams[nStream].stereo) {
 		snd_adpcm_split((uint32_t*)streams[nStream].buffer, (uint32_t*)sfx_buffer, (uint32_t*)sfx_buffer + STREAM_STAGING_READ_SIZE_MONO, STREAM_STAGING_READ_SIZE_STEREO);
-		spu_memload_sq(streams[nStream].aica_buffers[0], (uint32_t*)sfx_buffer, STREAM_STAGING_READ_SIZE_STEREO/2);
-		spu_memload_sq(streams[nStream].aica_buffers[1], (uint32_t*)sfx_buffer + STREAM_STAGING_READ_SIZE_MONO, STREAM_STAGING_READ_SIZE_STEREO/2);
-	}		
+		spu_memload(streams[nStream].aica_buffers[0], (uint32_t*)sfx_buffer, STREAM_STAGING_READ_SIZE_STEREO/2);
+		spu_memload(streams[nStream].aica_buffers[1], (uint32_t*)sfx_buffer + STREAM_STAGING_READ_SIZE_MONO, STREAM_STAGING_READ_SIZE_STEREO/2);
+	}
 	else {
-		spu_memload_sq(streams[nStream].aica_buffers[0], streams[nStream].buffer, STREAM_CHANNEL_BUFFER_SIZE/2);
+		spu_memload(streams[nStream].aica_buffers[0], streams[nStream].buffer, STREAM_CHANNEL_BUFFER_SIZE/2);
 	}
 
 	if (streams[nStream].total_samples > STREAM_CHANNEL_SAMPLE_COUNT/2) {
@@ -302,16 +309,15 @@ bool AudioEngine_Initialise(void)
 						if (channel_pos >= STREAM_CHANNEL_SAMPLE_COUNT/2 && !streams[i].next_is_upper_half) {
 							streams[i].next_is_upper_half = true;
 							if (can_refill) { // could we need a refill?
-								verbosef("Filling channel %d with lower half\n", i);
 								// fill lower half
 								if (streams[i].stereo) {
 									snd_adpcm_split((uint32_t*)streams[i].buffer, (uint32_t*)sfx_buffer, (uint32_t*)sfx_buffer + STREAM_STAGING_READ_SIZE_MONO, STREAM_STAGING_READ_SIZE_STEREO);
-									spu_memload_sq(streams[i].aica_buffers[0], (uint32_t*)sfx_buffer, STREAM_STAGING_READ_SIZE_STEREO/2);
-									spu_memload_sq(streams[i].aica_buffers[1], (uint32_t*)sfx_buffer + STREAM_STAGING_READ_SIZE_MONO, STREAM_STAGING_READ_SIZE_STEREO/2);
-								}		
+									spu_memload(streams[i].aica_buffers[0], (uint32_t*)sfx_buffer, STREAM_STAGING_READ_SIZE_STEREO/2);
+									spu_memload(streams[i].aica_buffers[1], (uint32_t*)sfx_buffer + STREAM_STAGING_READ_SIZE_MONO, STREAM_STAGING_READ_SIZE_STEREO/2);
+								}
 								else {
-									spu_memload_sq(streams[i].aica_buffers[0], streams[i].buffer, STREAM_CHANNEL_BUFFER_SIZE/2);
-								}								
+									spu_memload(streams[i].aica_buffers[0], streams[i].buffer, STREAM_CHANNEL_BUFFER_SIZE/2);
+								}
 								// queue next read to staging if any
 								if (can_fetch) {
 									do_read = streams[i].stereo ? STREAM_STAGING_READ_SIZE_STEREO : STREAM_STAGING_READ_SIZE_MONO;
@@ -322,15 +328,14 @@ bool AudioEngine_Initialise(void)
 						} else if (channel_pos < STREAM_CHANNEL_SAMPLE_COUNT/2 && streams[i].next_is_upper_half) {
 							streams[i].next_is_upper_half = false;
 							if (can_refill) { // could we need a refill?
-								verbosef("Filling channel %d with upper half\n", i);
 								if (streams[i].stereo) {
 									snd_adpcm_split((uint32_t*)streams[i].buffer, (uint32_t*)sfx_buffer, (uint32_t*)sfx_buffer + STREAM_STAGING_READ_SIZE_MONO, STREAM_STAGING_READ_SIZE_STEREO);
-									spu_memload_sq(streams[i].aica_buffers[0] + STREAM_CHANNEL_BUFFER_SIZE/2, (uint32_t*)sfx_buffer, STREAM_STAGING_READ_SIZE_STEREO/2);
-									spu_memload_sq(streams[i].aica_buffers[1] + STREAM_CHANNEL_BUFFER_SIZE/2, (uint32_t*)sfx_buffer + STREAM_STAGING_READ_SIZE_MONO, STREAM_STAGING_READ_SIZE_STEREO/2);
-								}		
+									spu_memload(streams[i].aica_buffers[0] + STREAM_CHANNEL_BUFFER_SIZE/2, (uint32_t*)sfx_buffer, STREAM_STAGING_READ_SIZE_STEREO/2);
+									spu_memload(streams[i].aica_buffers[1] + STREAM_CHANNEL_BUFFER_SIZE/2, (uint32_t*)sfx_buffer + STREAM_STAGING_READ_SIZE_MONO, STREAM_STAGING_READ_SIZE_STEREO/2);
+								}
 								else {
-									spu_memload_sq(streams[i].aica_buffers[0] + STREAM_CHANNEL_BUFFER_SIZE/2, streams[i].buffer, STREAM_CHANNEL_BUFFER_SIZE/2);
-								}									
+									spu_memload(streams[i].aica_buffers[0] + STREAM_CHANNEL_BUFFER_SIZE/2, streams[i].buffer, STREAM_CHANNEL_BUFFER_SIZE/2);
+								}
 								// queue next read to staging, if any
 								if (can_fetch) {
 									do_read = streams[i].stereo ? STREAM_STAGING_READ_SIZE_STEREO : STREAM_STAGING_READ_SIZE_MONO;
@@ -360,7 +365,13 @@ bool AudioEngine_Initialise(void)
 							 } else {
 								fs_seek(streams[i].fd, streams[i].file_data_offset + streams[i].loop_offset, SEEK_SET);
 							 }
-								streams[i].played_samples = 0;
+								// played_samples counts from the start of the data
+								// chunk, so a loop that restarts partway in must
+								// resume the count there. Resetting it to zero
+								// makes the end test overrun the file by the length
+								// of the skipped intro on every repeat.
+								streams[i].played_samples =
+									streams[i].loop_offset * (streams[i].stereo ? 1 : 2);
 								AudioEngine_LoadFirstChunk(i);
 								streams[i].next_is_upper_half = true;
 								streams[i].first_refill = true;
@@ -381,11 +392,6 @@ bool AudioEngine_Initialise(void)
 					}
 					
 					if (do_read) {
-						 if(streams[i].is_memory) {
-							 debugf("Queueing stream read: %d (memory), buffer: %p, size: %d, offset: %d\n", i, streams[i].buffer, do_read, streams[i].mem_offset);
-						 } else {
-						debugf("Queueing stream read: %d, file: %d, buffer: %p, size: %d, tell: %d\n", i, streams[i].fd, streams[i].buffer, do_read, fs_tell(streams[i].fd));
-						 }
 						 StreamRead(i, streams[i].buffer, do_read);
 					}
 				}
@@ -568,7 +574,8 @@ bool AudioEngine_ParseWaveHeader(file_t fd, WavHeader * hdr) {
 	for(int i = 0; i < MAX_WAVE_HEADER_SIZE - (sizeof(WaveChunkHeader)); i++) {
 		if(header_buffer[i] == 'd' && header_buffer[i + 1] == 'a' && header_buffer[i + 2] == 't' && header_buffer[i + 3] == 'a') {
 			memcpy(&hdr->chunkHeader, &header_buffer[i], sizeof(WaveChunkHeader));
-			fs_seek(fd, i, SEEK_SET);
+			// Leave the handle on the payload, not on the chunk id and length.
+			fs_seek(fd, i + sizeof(WaveChunkHeader), SEEK_SET);
 			++valid_header;
 			break;
 		}
@@ -580,10 +587,19 @@ bool AudioEngine_ParseWaveHeader(file_t fd, WavHeader * hdr) {
 int AudioEngine_Load(const char * fname, uint32_t seek_bytes_aligned)
 {
 	file_t f = fs_open(fname, O_RDONLY);
-	assert(f >= 0 );
+	if( f < 0 ) {
+		// Callers such as the music subsystem probe for optional cooked tracks,
+		// so a missing or malformed file is reported rather than fatal.
+		debugf("AudioEngine_Load: cannot open %s\n", fname);
+		return -1;
+	}
 	WavHeader hdr;
     bool validHeader = AudioEngine_ParseWaveHeader(f, &hdr);
-	assert(validHeader > 0);
+	if( !validHeader ) {
+		debugf("AudioEngine_Load: %s is not a supported wave\n", fname);
+		fs_close(f);
+		return -1;
+	}
 
 	debugf("AudioEngine_Load: %s, %i\n",fname, hdr.chunkHeader.size);
 
@@ -635,14 +651,17 @@ int AudioEngine_Load(const char * fname, uint32_t seek_bytes_aligned)
 		debugf("Preload Streamed File: %s: stream: %d, freq: %d, chans: %d, byte size: %d, played samples: %d, total samples: %d, blockAlign: %d\n", 
             fname, nStream, hdr.fmtHeader.sampleRate, hdr.fmtHeader.numChannels, hdr.chunkHeader.size, streams[nStream].played_samples, streams[nStream].total_samples, hdr.fmtHeader.blockAlign);
 
+		// The parser leaves the handle on the payload. Record that before any
+		// seek: looping rewinds to file_data_offset, so it must stay the start
+		// of the data chunk rather than wherever playback happened to begin.
+		streams[nStream].file_data_offset = fs_tell(f);
+
 		// How to avoid the lock?
 		if (seek_bytes_aligned) {
 			streams[nStream].played_samples = seek_bytes_aligned * (streams[nStream].stereo ? 1 : 2);
 			debugf("Seeking aligned to: %d, played_samples: %d\n", seek_bytes_aligned, streams[nStream].played_samples);
-			fs_seek(streams[nStream].fd, 2048 + seek_bytes_aligned, SEEK_SET);
+			fs_seek(streams[nStream].fd, streams[nStream].file_data_offset + seek_bytes_aligned, SEEK_SET);
 		}
-
-		streams[nStream].file_data_offset = fs_tell(f);
 
 		// Stage to memory
 		AudioEngine_LoadFirstChunk(nStream);

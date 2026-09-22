@@ -24,6 +24,24 @@
 #define DISTANCE_SCALE 0.023255814f
 #define ROLLOFF_FACTOR 1.1f
 
+// Cooked music sidecar written by Source/DCUtil/cook_music.py. The module is
+// rendered on the host and streamed from disc, so nothing but the order table
+// and loop point has to reach the runtime.
+#define DCM_MAGIC 0x314D4344	// 'DCM1'
+#define DCM_FLAG_LOOP 1
+#define DCM_MAX_SECTIONS 256
+
+struct FDCMusicTrack
+{
+	INT           StreamId;
+	DWORD         Rate;
+	DWORD         Samples;
+	DWORD         Flags;
+	DWORD         LoopByte;
+	TArray<DWORD> Sections;
+	char          Path[256];
+};
+
 class DLL_EXPORT UAICAAudioSubsystem : public UAudioSubsystem
 {
 	DECLARE_CLASS_WITHOUT_CONSTRUCT(UAICAAudioSubsystem, UAudioSubsystem, CLASS_Config)
@@ -90,6 +108,7 @@ private:
 	void StopMusic();
 	void UpdateMusicBuffers();
 	void ClearMusicBuffers();
+	BYTE MusicVolumeByte() const;
 
 	inline FLOAT GetVoicePriority( const FVector& Location, FLOAT Volume, FLOAT Radius )
 	{

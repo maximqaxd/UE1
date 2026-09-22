@@ -144,11 +144,103 @@ void UAICAAudioSubsystem::SetViewport( UViewport* InViewport )
 	unguard;
 }
 
+//
+// Cooked music lives beside the packages as <Name>.dcw plus a <Name>.dcm
+// sidecar. AudioEngine_Load calls fs_open directly rather than going through
+// the engine file manager, and KOS will not resolve ".." for it, so the
+// directory is derived from appBaseDir as an absolute path.
+//
+static UBOOL DCMusicDir( char* Out, INT Capacity )
+{
+	const char* Base = appBaseDir();
+	if( !Base || !Base[0] )
+		return 0;
+
+	// appBaseDir ends in a separator. Drop it and the System component.
+	INT Length = appStrlen( Base );
+	while( Length > 0 && (Base[Length-1] == '/' || Base[Length-1] == '\\') )
+		--Length;
+	while( Length > 0 && Base[Length-1] != '/' && Base[Length-1] != '\\' )
+		--Length;
+	if( Length <= 0 || Length + 7 >= Capacity )
+		return 0;
+
+	appSprintf( Out, "%.*sMusic/", Length, Base );
+	return 1;
+}
+
+static UBOOL ReadMusicSidecar( const char* Path, FDCMusicTrack* Track )
+{
+	FILE* File = appFopen( Path, "rb" );
+	if( !File )
+		return 0;
+
+	DWORD Header[6];
+	UBOOL Ok = appFread( Header, 1, sizeof(Header), File ) == sizeof(Header)
+		&& Header[0] == DCM_MAGIC;
+	if( Ok )
+	{
+		Track->Rate     = Header[1];
+		Track->Samples  = Header[2];
+		Track->Flags    = Header[3];
+		Track->LoopByte = Header[4];
+
+		const INT Count = (INT)Header[5];
+		if( Count < 0 || Count > DCM_MAX_SECTIONS )
+		{
+			Ok = 0;
+		}
+		else if( Count )
+		{
+			const INT Bytes = Count * sizeof(DWORD);
+			Track->Sections.SetNum( Count );
+			Ok = appFread( &Track->Sections(0), 1, Bytes, File ) == Bytes;
+		}
+	}
+	appFclose( File );
+
+	return Ok && Track->Rate && Track->Samples;
+}
+
+BYTE UAICAAudioSubsystem::MusicVolumeByte() const
+{
+	return (BYTE)Clamp( appRound( 255.f * (MusicVolume / 255.f) * (MasterVolume / 255.f) ), 0, 255 );
+}
+
 void UAICAAudioSubsystem::RegisterMusic( UMusic* Music )
 {
 	guard(UAICAAudioSubsystem::RegisterMusic)
 
-	return;
+	if( !Initialized || !Music || Music->Handle )
+		return;
+
+	// UMusic::Data is stripped on this platform, so the module never reaches the
+	// runtime. The cooked stream is located by object name instead.
+	char Directory[256];
+	if( !DCMusicDir( Directory, ARRAY_COUNT(Directory) ) )
+	{
+		debugf( NAME_Warning, "Cannot resolve the cooked music directory" );
+		return;
+	}
+
+	FDCMusicTrack* Track = new FDCMusicTrack;
+	Track->StreamId = INVALID_STREAM_ID;
+	Track->Rate = Track->Samples = Track->Flags = Track->LoopByte = 0;
+	appSprintf( Track->Path, "%s%s.dcw", Directory, Music->GetName() );
+
+	char Sidecar[256];
+	appSprintf( Sidecar, "%s%s.dcm", Directory, Music->GetName() );
+	if( !ReadMusicSidecar( Sidecar, Track ) || appFSize( Track->Path ) <= 0 )
+	{
+		// A missing track is not fatal: Update skips music without a handle.
+		debugf( NAME_Warning, "No cooked music stream for %s", Music->GetName() );
+		delete Track;
+		return;
+	}
+
+	Music->Handle = Track;
+	debugf( NAME_Log, "Registered music %s: %u Hz, %u samples, %i sections",
+		Music->GetName(), Track->Rate, Track->Samples, Track->Sections.Num() );
 
 	unguard;
 }
@@ -157,8 +249,26 @@ void UAICAAudioSubsystem::UnregisterMusic( UMusic* Music )
 {
 	guard(UAICAAudioSubsystem::UnregisterMusic)
 
-	if( !Music->Handle )
+	if( !Music || !Music->Handle )
 		return;
+
+	FDCMusicTrack* Track = (FDCMusicTrack*)Music->Handle;
+	if( Track->StreamId != INVALID_STREAM_ID )
+	{
+		AudioEngine_Stop( Track->StreamId );
+		AudioEngine_Unload( Track->StreamId );
+	}
+
+	// The parameter shadows the current-song member; clear it if they match so
+	// Update does not keep polling a freed track.
+	if( this->Music == Music )
+	{
+		this->Music = NULL;
+		MusicIsPlaying = false;
+	}
+
+	Music->Handle = NULL;
+	delete Track;
 
 	unguard;
 }
@@ -673,8 +783,38 @@ void UAICAAudioSubsystem::PlayMusic()
 {
 	guard(UAICAAudioSubsystem::PlayMusic)
 
-	if( !Music || !Music->Handle )
+	if( !Music || !Music->Handle || MusicIsPlaying )
 		return;
+
+	FDCMusicTrack* Track = (FDCMusicTrack*)Music->Handle;
+
+	// SongSection indexes the module order list. The cooker records where each
+	// order begins in the rendered stream; without that table the only honest
+	// response is to start from the top rather than seek to a wrong offset.
+	DWORD Offset = 0;
+	if( MusicSection && MusicSection != 255 )
+	{
+		if( MusicSection < Track->Sections.Num() )
+			Offset = Track->Sections( MusicSection );
+		else
+			debugf( NAME_Log, "Music %s has no offset for section %d, starting at zero",
+				Music->GetName(), MusicSection );
+	}
+
+	Track->StreamId = AudioEngine_Load( Track->Path, Offset );
+	if( Track->StreamId < 0 )
+	{
+		debugf( NAME_Warning, "Could not open music stream %s", Track->Path );
+		Track->StreamId = INVALID_STREAM_ID;
+		return;
+	}
+
+	// A mono stream plays on one channel and averages the pair into a centre pan.
+	AudioEngine_Play( Track->StreamId, MusicVolumeByte(),
+		AICA_PAN_LEFT, AICA_PAN_RIGHT,
+		(Track->Flags & DCM_FLAG_LOOP) != 0, Track->LoopByte );
+
+	MusicIsPlaying = true;
 
 	unguard;
 }
@@ -686,6 +826,14 @@ void UAICAAudioSubsystem::StopMusic()
 	if( !MusicIsPlaying || !Music || !Music->Handle )
 		return;
 
+	FDCMusicTrack* Track = (FDCMusicTrack*)Music->Handle;
+	if( Track->StreamId != INVALID_STREAM_ID )
+	{
+		AudioEngine_Stop( Track->StreamId );
+		AudioEngine_Unload( Track->StreamId );
+		Track->StreamId = INVALID_STREAM_ID;
+	}
+	MusicIsPlaying = false;
 
 	unguard;
 }
@@ -694,9 +842,24 @@ void UAICAAudioSubsystem::UpdateMusicBuffers()
 {
 	guard(UAICAAudioSubsystem::UpdateMusicBuffers)
 
-	if( !Music || !Music->Handle )
+	if( !Music || !Music->Handle || !MusicIsPlaying )
 		return;
 
+	FDCMusicTrack* Track = (FDCMusicTrack*)Music->Handle;
+	if( Track->StreamId == INVALID_STREAM_ID )
+		return;
+
+	// The worker thread refills and retires the stream by itself. All this has
+	// to notice is a non-looping track that has reached its end.
+	// TODO: MusicVolume changes and MTRAN_Fade transitions are not applied to a
+	// stream that is already playing; the volume is only sampled at PlayMusic.
+	stream_info* Info = AudioEngine_getStreamInfo( Track->StreamId );
+	if( Info && !Info->playing )
+	{
+		AudioEngine_Unload( Track->StreamId );
+		Track->StreamId = INVALID_STREAM_ID;
+		MusicIsPlaying = false;
+	}
 
 	unguard;
 }
