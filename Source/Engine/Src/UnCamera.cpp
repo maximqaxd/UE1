@@ -27,6 +27,33 @@ void URenderDevice::InternalClassInitializer( UClass* Class )
 	unguard;
 }
 
+//
+// Default strip handling: walk the strip and hand each triangle to
+// DrawGouraudPolygon, flipping the first two vertices on odd triangles so the
+// winding the caller encoded is preserved.
+//
+void URenderDevice::DrawGouraudTriStrip( FSceneNode* Frame, FTextureInfo& Info, FTransTexture** Pts, INT NumPts, DWORD PolyFlags, FSpanBuffer* Span )
+{
+	guard(URenderDevice::DrawGouraudTriStrip);
+	for( INT i=2; i<NumPts; i++ )
+	{
+		FTransTexture* Tri[3];
+		if( i & 1 )
+		{
+			Tri[0] = Pts[i-1];
+			Tri[1] = Pts[i-2];
+		}
+		else
+		{
+			Tri[0] = Pts[i-2];
+			Tri[1] = Pts[i-1];
+		}
+		Tri[2] = Pts[i];
+		DrawGouraudPolygon( Frame, Info, Tri, 3, PolyFlags, Span );
+	}
+	unguard;
+}
+
 /*-----------------------------------------------------------------------------
 	UViewport object implementation.
 -----------------------------------------------------------------------------*/

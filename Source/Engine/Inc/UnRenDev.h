@@ -38,6 +38,11 @@ class ENGINE_API URenderDevice : public USubsystem
 	UBOOL		HighDetailActors;
 	UBOOL		NoVolumetricBlend;
 
+	// Set by drivers that can consume a triangle strip directly. Meshes are
+	// already strip-cooked offline (UMesh::DCRuns); when this is false the
+	// renderer expands them back into individual triangles.
+	UBOOL		SupportsTriStrips;
+
 	// Constructors.
 	static void InternalClassInitializer( UClass* Class );
 
@@ -50,6 +55,13 @@ class ENGINE_API URenderDevice : public USubsystem
 	virtual void Unlock( UBOOL Blit )=0;
 	virtual void DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& Surface, FSurfaceFacet& Facet )=0;
 	virtual void DrawGouraudPolygon( FSceneNode* Frame, FTextureInfo& Info, FTransTexture** Pts, int NumPts, DWORD PolyFlags, FSpanBuffer* Span )=0;
+
+	// Draw NumPts vertices as one triangle strip. Pts[0..2] form the first
+	// triangle in the order given; each further vertex closes one more
+	// triangle with alternating winding, as in OpenGL's GL_TRIANGLE_STRIP.
+	// The default implementation fans the strip out into DrawGouraudPolygon
+	// calls, so drivers only override it if SupportsTriStrips is set.
+	virtual void DrawGouraudTriStrip( FSceneNode* Frame, FTextureInfo& Info, FTransTexture** Pts, INT NumPts, DWORD PolyFlags, FSpanBuffer* Span );
 	virtual void DrawTile( FSceneNode* Frame, FTextureInfo& Info, FLOAT X, FLOAT Y, FLOAT XL, FLOAT YL, FLOAT U, FLOAT V, FLOAT UL, FLOAT VL, class FSpanBuffer* Span, FLOAT Z, FPlane Color, FPlane Fog, DWORD PolyFlags )=0;
 	virtual void Draw2DLine( FSceneNode* Frame, FPlane Color, DWORD LineFlags, FVector P1, FVector P2 )=0;
 	virtual void Draw2DPoint( FSceneNode* Frame, FPlane Color, DWORD LineFlags, FLOAT X1, FLOAT Y1, FLOAT X2, FLOAT Y2 )=0;
