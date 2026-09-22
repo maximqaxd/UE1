@@ -169,8 +169,116 @@ void ULevel::Serialize( FArchive& Ar )
 	if( Ar.Ver() >= 61 )//oldver
 		Ar << TravelNames << TravelItems;
 
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	if( Ar.IsLoading() )
+		LoadDCLightmaps();
+#endif
+
 	unguard;
 }
+
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+
+enum { DCLightmapMagic = 0x314d4c44 };
+
+static INT CDECL CompareDCLightmaps( const void* A, const void* B )
+{
+	const FDCLightmapEntry& Left = *(const FDCLightmapEntry*)A;
+	const FDCLightmapEntry& Right = *(const FDCLightmapEntry*)B;
+	if( Left.LightMap != Right.LightMap )
+		return Left.LightMap < Right.LightMap ? -1 : 1;
+	if( Left.Zone != Right.Zone )
+		return Left.Zone < Right.Zone ? -1 : 1;
+	return 0;
+}
+
+void ULevel::LoadDCLightmaps()
+{
+	guard(ULevel::LoadDCLightmaps);
+
+	DCLightmaps.Empty();
+	DCLightmapData = FDCStreamSlice();
+
+#if defined(DC_RESOURCE_COOKER)
+	if( ParseParam(appCmdLine(), "BAKEDCLIGHTMAPS") )
+		return;
+#endif
+
+	char Filename[256];
+	snprintf( Filename, sizeof(Filename), "../Maps/%s.dlm", GetParent()->GetName() );
+	if( !appDCStreamActive() && appFSize(Filename) <= 0 )
+		return;
+
+	DWORD Header[4];
+	if( !appDCReadDependencyFile(Filename, 0, Header, sizeof(Header))
+		|| Header[0] != DCLightmapMagic || Header[1] != 3
+		|| Header[2] > 65536 || Header[3] > 16 * 1024 * 1024 )
+	{
+		appErrorf( "Invalid DC lightmap header: %s", Filename );
+	}
+
+	const INT Count = Header[2];
+	const INT DirectorySize = Count * sizeof(FDCLightmapEntry);
+	DCLightmaps.SetNum( Count );
+	if( Count && !appDCReadDependencyFile(
+		Filename, sizeof(Header), &DCLightmaps(0), DirectorySize) )
+	{
+		appErrorf( "Invalid DC lightmap directory: %s", Filename );
+	}
+
+	for( INT i = 0; i < Count; ++i )
+	{
+		const FDCLightmapEntry& Entry = DCLightmaps(i);
+		if( Entry.Zone >= 64 || Entry.Codec > 1
+			|| Entry.USize < 8 || Entry.VSize < 8
+			|| Entry.Offset > Header[3]
+			|| !Entry.PackedSize || Entry.PackedSize > Header[3] - Entry.Offset
+			|| (!Entry.Codec && Entry.PackedSize != (DWORD)Entry.Size()) )
+		{
+			appErrorf( "Invalid DC lightmap entry %i: %s", i, Filename );
+		}
+	}
+	if( Count > 1 )
+	{
+		appQsort( &DCLightmaps(0), Count, sizeof(FDCLightmapEntry), CompareDCLightmaps );
+	}
+
+	if( Header[3] && !appDCCaptureDependencyFile(
+		Filename, sizeof(Header) + DirectorySize, Header[3], DCLightmapData) )
+	{
+		appErrorf( "Invalid DC lightmap payload: %s", Filename );
+	}
+
+	debugf( "DCLIGHTMAP loaded map=%s entries=%i streamed=%u",
+		GetParent()->GetName(), Count, Header[3] );
+	unguard;
+}
+
+const FDCLightmapEntry* ULevel::FindDCLightmap( INT LightMap, INT Zone ) const
+{
+	INT Low = 0;
+	INT High = DCLightmaps.Num();
+	while( Low < High )
+	{
+		const INT Middle = Low + (High - Low) / 2;
+		const FDCLightmapEntry& Entry = DCLightmaps(Middle);
+		if( Entry.LightMap < LightMap
+			|| (Entry.LightMap == LightMap && Entry.Zone < Zone) )
+		{
+			Low = Middle + 1;
+		}
+		else
+		{
+			High = Middle;
+		}
+	}
+	return Low < DCLightmaps.Num()
+		&& DCLightmaps(Low).LightMap == LightMap
+		&& DCLightmaps(Low).Zone == Zone
+		? &DCLightmaps(Low) : NULL;
+}
+
+#endif
 void ULevel::Export( FOutputDevice& Out, const char* FileType, int Indent )
 {
 	guard(ULevel::Export);

@@ -24,6 +24,8 @@ private:
 };
 
 CORE_API void appDCStreamCapture( const char* Filename, INT Offset, INT Length, FDCStreamSlice& Slice );
+CORE_API UBOOL appDCReadDependencyFile( const char* Filename, INT Offset, void* Data, INT Length );
+CORE_API UBOOL appDCCaptureDependencyFile( const char* Filename, INT Offset, INT Length, FDCStreamSlice& Slice );
 // Checked dependency-order replay. This is not the indexed DCD1 reader.
 CORE_API void appDCStreamOpen( const char* Path );
 CORE_API void appDCStreamFinish();

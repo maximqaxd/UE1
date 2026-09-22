@@ -19,5 +19,8 @@ target_include_directories(${PROJECT_NAME}
 )
 
 target_link_libraries(${PROJECT_NAME} Render Engine Core)
+if(TARGET ZLIB::ZLIB)
+  target_link_libraries(${PROJECT_NAME} ZLIB::ZLIB)
+endif()
 
 target_compile_definitions(${PROJECT_NAME} PRIVATE GLDCDRV_EXPORTS UPACKAGE_NAME=${PROJECT_NAME})

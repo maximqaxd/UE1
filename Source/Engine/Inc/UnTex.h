@@ -15,6 +15,10 @@
 
 enum{NUM_PAL_COLORS=256};	// Number of colors in a standard palette.
 
+#if defined(PLATFORM_DREAMCAST)
+ENGINE_API void appDCDumpProceduralTextureProfile( INT Frames );
+#endif
+
 /*-----------------------------------------------------------------------------
 	UPalette.
 -----------------------------------------------------------------------------*/
@@ -190,11 +194,18 @@ struct ENGINE_API FMipmap
 	// Dreamcast: lazy streaming support (do not keep texture bytes in RAM)
 	INT             DCDataOffset;   // Byte offset in package file to mip data start
 	INT             DCDataSize;     // Size in bytes of mip data
+	const FDCStreamSlice* DCExternalStream;
+	INT             DCExternalOffset;
+	INT             DCExternalSize;
+	INT             DCExternalPackedSize;
+	BYTE            DCExternalCodec;
 #endif
 	FMipmap()
 	: DataPtr(NULL), USize(0), VSize(0), UBits(0), VBits(0)
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
-	, DCDataOffset(0), DCDataSize(0)
+	, DCDataOffset(0), DCDataSize(0), DCExternalStream(NULL)
+	, DCExternalOffset(0), DCExternalSize(0), DCExternalPackedSize(0)
+	, DCExternalCodec(0)
 #endif
 	{}
 	FMipmap( BYTE InUBits, BYTE InVBits )
@@ -205,7 +216,9 @@ struct ENGINE_API FMipmap
 	,	UBits		(InUBits)
 	,	VBits		(InVBits)
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
-	, DCDataOffset(0), DCDataSize(0)
+	, DCDataOffset(0), DCDataSize(0), DCExternalStream(NULL)
+	, DCExternalOffset(0), DCExternalSize(0), DCExternalPackedSize(0)
+	, DCExternalCodec(0)
 #endif
 	{
 		DataArray.Add( USize * VSize );
@@ -467,6 +480,7 @@ enum ETextureFormat
 	TEXF_EXT_RGB565_VQ     = 132, // [Dreamcast] VQ-compressed pre-twiddled RGB565
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
 	TEXF_EXT_DCTEX         = 133, // Complete versioned DT header and hardware mip chain.
+	TEXF_EXT_DCANIM        = 134, // Array of complete DT frames for cooked procedural animation.
 #endif
 	
 	TEXF_EXT_MAX

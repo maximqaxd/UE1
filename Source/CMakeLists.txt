@@ -38,6 +38,16 @@ option(DC_RESOURCE_COOKER "Enable Dreamcast resource codecs in host cooker build
 if(DC_RESOURCE_COOKER)
   add_compile_definitions(DC_RESOURCE_COOKER)
 endif()
+if(PLATFORM_DREAMCAST OR DC_RESOURCE_COOKER)
+  if(PLATFORM_DREAMCAST)
+    get_filename_component(DREAMCAST_TOOLCHAIN_ROOT "${KOS_BASE}" DIRECTORY)
+    set(ZLIB_INCLUDE_DIR
+      "${DREAMCAST_TOOLCHAIN_ROOT}/kos-ports/zlib/inst/include" CACHE PATH "" FORCE)
+    set(ZLIB_LIBRARY
+      "${DREAMCAST_TOOLCHAIN_ROOT}/kos-ports/zlib/inst/lib/libz.a" CACHE FILEPATH "" FORCE)
+  endif()
+  find_package(ZLIB REQUIRED)
+endif()
 option(BUILD_STATIC "Link everything into a single binary" OFF)
 
 option(DREAMCAST_USE_FATFS "Try to load data from SD or IDE" OFF)
@@ -49,7 +59,7 @@ set(DREAMCAST_GAME_DATA "${CMAKE_SOURCE_DIR}/../gamedata" CACHE PATH "Path to Un
 set(DREAMCAST_IP_BIN "${CMAKE_SOURCE_DIR}/../gamedata/IP.BIN" CACHE FILEPATH "Path to IP.BIN for Dreamcast disc")
 set(DREAMCAST_CDI_OUTPUT "${CMAKE_SOURCE_DIR}/../unreal.cdi" CACHE FILEPATH "Output CDI image path")
 set(DREAMCAST_IP_TXT "${CMAKE_SOURCE_DIR}/ip.txt" CACHE FILEPATH "Path to ip.txt template for makeip")
-set(DREAMCAST_ELF_FILE "${CMAKE_BINARY_DIR}/${CMAKE_BUILD_TYPE}/Unreal.elf" CACHE FILEPATH "Path to Unreal ELF used for mkdcdisc")
+set(DREAMCAST_ELF_FILE "${CMAKE_BINARY_DIR}/Unreal/Unreal.elf" CACHE FILEPATH "Path to Unreal ELF used for mkdcdisc")
 
 if(PLATFORM_DREAMCAST)
   set(BUILD_STATIC ON)

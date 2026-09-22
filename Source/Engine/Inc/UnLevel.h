@@ -120,6 +120,22 @@ enum ELevelTick : int
 	LEVELTICK_All			= 2,	// Update all.
 };
 
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+struct FDCLightmapEntry
+{
+	_WORD LightMap;
+	BYTE Zone;
+	BYTE Codec;
+	_WORD USize;
+	_WORD VSize;
+	DWORD Offset;
+	DWORD PackedSize;
+
+	INT Size() const { return USize * VSize * (INT)sizeof(_WORD); }
+};
+static_assert( sizeof(FDCLightmapEntry) == 16, "Unexpected DC lightmap directory layout" );
+#endif
+
 //
 // The level object.  Contains the level's actor list, Bsp information, and brush list.
 //
@@ -139,6 +155,10 @@ class ENGINE_API ULevel : public ULevelBase
 	FLOAT                   TimeSeconds;
 	TArray<FString>			TravelNames;
 	TArray<FString>			TravelItems;
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	TArray<FDCLightmapEntry> DCLightmaps;
+	FDCStreamSlice          DCLightmapData;
+#endif
 
 	// Only valid in memory.
 	FCollisionHashBase* Hash;
@@ -197,6 +217,10 @@ class ENGINE_API ULevel : public ULevelBase
 	virtual void InitStats();
 	virtual void GetStats( char* Result );
 	virtual void DetailChange( UBOOL NewDetail );
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	void LoadDCLightmaps();
+	const FDCLightmapEntry* FindDCLightmap( INT LightMap, INT Zone ) const;
+#endif
 
 	// FNetworkNotify interface.
 	EAcceptConnection NotifyAcceptingConnection();

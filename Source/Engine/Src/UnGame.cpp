@@ -419,7 +419,8 @@ void UGameEngine::Init()
 		UBOOL OpenRuntimeWindow = 1;
 #if defined(DC_RESOURCE_COOKER)
 		OpenRuntimeWindow = !ParseParam(appCmdLine(),"COOKSESSION")
-			&& !ParseParam(appCmdLine(),"VERIFYSESSION");
+			&& !ParseParam(appCmdLine(),"VERIFYSESSION")
+			&& !ParseParam(appCmdLine(),"BAKEDCLIGHTMAPS");
 		if( !OpenRuntimeWindow )
 			debugf( "DCSESSION host_window_skipped" );
 #endif

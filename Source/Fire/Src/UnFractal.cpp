@@ -4136,7 +4136,7 @@ void UFireTexture::TouchTexture(INT UPos, INT VPos, FLOAT Magnitude)
 	guard(UFireTexture::TouchTexture);
 
 #if defined(PLATFORM_DREAMCAST)
-	if( Format == TEXF_EXT_DCTEX )
+	if( Format == TEXF_EXT_DCTEX || Format == TEXF_EXT_DCANIM )
 		return;
 	EnsureProceduralData();
 #endif
@@ -4249,7 +4249,8 @@ void UFireTexture::Serialize( FArchive& Ar )
 	Ar << Sparks;
 
 #if defined(PLATFORM_DREAMCAST)
-	if( Ar.IsLoading() && Format == TEXF_EXT_DCTEX )
+	if( Ar.IsLoading()
+	&& (Format == TEXF_EXT_DCTEX || Format == TEXF_EXT_DCANIM) )
 	{
 		Sparks.Empty();
 		return;
@@ -4354,7 +4355,7 @@ void UWaterTexture::TouchTexture(INT UPos, INT VPos, FLOAT Magnitude)
 	guard(UWaterTexture::TouchTexture);
 
 #if defined(PLATFORM_DREAMCAST)
-	if( Format == TEXF_EXT_DCTEX )
+	if( Format == TEXF_EXT_DCTEX || Format == TEXF_EXT_DCANIM )
 		return;
 #endif
 
@@ -4663,7 +4664,7 @@ void UWetTexture::PostLoad()
 	// Call base class.
 	UWaterTexture::PostLoad();
 #if defined(PLATFORM_DREAMCAST)
-	if( Format == TEXF_EXT_DCTEX )
+	if( Format == TEXF_EXT_DCTEX || Format == TEXF_EXT_DCANIM )
 		return;
 #endif
 

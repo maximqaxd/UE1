@@ -69,6 +69,33 @@ class DLL_EXPORT UPVRRenderDevice : public URenderDevice
 	DWORD VRAMUsed;
 	DWORD TextureFrame;
 
+	struct FTextureCPUProfile
+	{
+		DWORD PaletteCalls;
+		DWORD PaletteCycles;
+		DWORD P8TwiddleCalls;
+		DWORD P8TwiddlePixels;
+		DWORD P8TwiddleCycles;
+		DWORD P8ConvertCalls;
+		DWORD P8ConvertPixels;
+		DWORD P8ConvertCycles;
+		DWORD PaletteBankFallbacks;
+		DWORD GenericP8Conversions;
+		DWORD MinSizeExpansions;
+		DWORD MinSizeSourcePixels;
+		DWORD MinSizeOutputPixels;
+		DWORD LightmapCalls;
+		DWORD LightmapPixels;
+		DWORD LightmapCycles;
+		DWORD DynamicLightmapCalls;
+		DWORD DynamicLightmapPixels;
+		DWORD StaticLightmapCalls;
+		DWORD StaticLightmapPixels;
+		DWORD StaticLightmapCold;
+		DWORD StaticLightmapReload;
+		DWORD StaticLightmapRetype;
+	} TextureCPUProfile;
+
 	struct FCachedSceneNode
 	{
 		FLOAT FovAngle;
@@ -116,6 +143,7 @@ class DLL_EXPORT UPVRRenderDevice : public URenderDevice
 	void* ConvertTextureMipI8( const FMipmap* Mip, const FColor* Palette );
 	void* ConvertTextureMipBGRA7777( const FMipmap* Mip );
 	void* VerticalUpscale( const INT USize, const INT VSize, const INT VTimes );
+	void PrintTextureCPUProfile( INT Frames );
 	void PrintMemStats() const;
 
 public:

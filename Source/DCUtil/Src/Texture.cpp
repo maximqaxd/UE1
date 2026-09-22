@@ -142,12 +142,6 @@ void FTextureConverter::Convert()
 	if( DstFormat == Texture->Format )
 		return;
 
-	// Do not convert format if texture is blacklisted
-	if( IsBlacklisted( Texture ) )
-	{
-		return;
-	}
-
 	// Convert and scale if needed
 	for( INT i = 0; i < Texture->Mips.Num(); ++i )
 	{

@@ -43,17 +43,52 @@ static void ReadResource( const char* Path, TArray<BYTE>& Data )
 	appFclose( File );
 }
 
-static UBOOL IsFrozenDreamcastProcedural( UTexture* Texture )
+static UBOOL IsScreenSpaceDreamcastProcedural( UTexture* Texture )
 {
 	const char* Path = Texture->GetPathName();
 	return !appStricmp(Path, "UnrealI.MenuGfx.menu2")
-		|| !appStricmp(Path, "UnrealI.MenuGfx.MenuBarrier");
+		|| !appStricmp(Path, "UnrealI.MenuGfx.MenuBarrier")
+		|| !appStricmp(Path, "MenuGr.menu2")
+		|| !appStricmp(Path, "MenuGr.MenuBarrier");
+}
+
+enum { DCProceduralFrames = 8 };
+
+static UBOOL IsAnimatedDreamcastProcedural( UTexture* Texture )
+{
+	return Texture->Format == TEXF_P8
+		&& Texture->Palette
+		&& Texture->Mips.Num()
+		&& (Texture->TextureFlags & TF_Parametric)
+		&& Texture->GetClass() != UTexture::StaticClass
+		&& !Texture->IsA(UFont::StaticClass);
+}
+
+static void NullCookedProceduralInputs( UTexture* Texture )
+{
+	for( TFieldIterator<UProperty> It(Texture->GetClass()); It; ++It )
+	{
+		UObjectProperty* Property = Cast<UObjectProperty>( *It );
+		if( !Property )
+		{
+			continue;
+		}
+		if( appStricmp(Property->GetName(), "SourceTexture")
+		&& appStricmp(Property->GetName(), "GlassTexture") )
+		{
+			continue;
+		}
+		if( Property->Offset + (INT)sizeof(UObject*) <= Texture->GetClass()->GetPropertiesSize() )
+		{
+			*(UObject**)((BYTE*)Texture + Property->Offset) = NULL;
+		}
+	}
 }
 
 static void BakeDreamcastProcedural( UTexture* Texture )
 {
-	// Give menu effects a representative frame before converting them to an
-	// immutable VQ texture. Gameplay/world procedurals remain live PAL8.
+	// Advance past the mostly empty initial state before sampling a compact,
+	// looping Dreamcast animation.
 	for( INT Frame=0; Frame<32; ++Frame )
 	{
 		Texture->Tick( 1.f / 30.f );
@@ -62,7 +97,7 @@ static void BakeDreamcastProcedural( UTexture* Texture )
 
 static UBOOL TextureNeedsMipmaps( UTexture* Texture, UPackage* Package )
 {
-	if( IsFrozenDreamcastProcedural(Texture) )
+	if( IsScreenSpaceDreamcastProcedural(Texture) )
 	{
 		return 0;
 	}
@@ -74,11 +109,6 @@ static UBOOL TextureNeedsMipmaps( UTexture* Texture, UPackage* Package )
 		return 0;
 	}
 
-	if( Texture->Mips.Num() <= 1 )
-	{
-		return 0;
-	}
-
 	// MenuGr is imported into Unreal.MenuGfx. Icons contains the HUD and
 	// crosshair atlas. These are drawn in screen space and must stay base-only
 	// even when a retail package happens to carry a generated mip chain.
@@ -86,6 +116,20 @@ static UBOOL TextureNeedsMipmaps( UTexture* Texture, UPackage* Package )
 	if( !appStricmp(Package->GetName(), "MenuGr")
 		|| !appStricmp(Group, "MenuGfx")
 		|| !appStricmp(Group, "Icons") )
+	{
+		return 0;
+	}
+
+	// Procedural world textures normally contain only their writable base mip.
+	// The Dreamcast encoder can still build the complete hardware mip chain
+	// from each cooked animation frame. Leaving these base-only causes severe
+	// aliasing on receding water, fire and smoke surfaces.
+	if( IsAnimatedDreamcastProcedural(Texture) )
+	{
+		return 1;
+	}
+
+	if( Texture->Mips.Num() <= 1 )
 	{
 		return 0;
 	}
@@ -188,16 +232,108 @@ void FDCUtil::ProcessResources( const char* PackagePath, const char* ResourceDir
 
 	for( TObjectIterator<UTexture> It; It; ++It )
 	{
-		const UBOOL FrozenProcedural = IsFrozenDreamcastProcedural( *It );
+		const UBOOL AnimatedProcedural = IsAnimatedDreamcastProcedural( *It );
 		const UBOOL ConvertibleClass = It->GetClass() == UTexture::StaticClass
 			|| It->IsA(UFont::StaticClass)
-			|| FrozenProcedural;
-		if( !It->IsIn( Package ) || !ConvertibleClass
-			|| It->Format != TEXF_P8 || !It->Palette || !It->Mips.Num()
-			|| FTextureConverter::IsBlacklisted( *It )
-			|| (!FrozenProcedural
+			|| AnimatedProcedural;
+		if( !It->IsIn(Package) )
+		{
+			continue;
+		}
+		if( !ConvertibleClass || It->Format != TEXF_P8 || !It->Palette || !It->Mips.Num()
+			|| (!AnimatedProcedural
 				&& (It->TextureFlags & (TF_Realtime | TF_RealtimePalette | TF_Parametric))) )
 		{
+			continue;
+		}
+
+		if( AnimatedProcedural )
+		{
+			if( Import )
+			{
+				const INT USize = It->USize;
+				const INT VSize = It->VSize;
+				const BYTE UBits = It->UBits;
+				const BYTE VBits = It->VBits;
+				It->Mips.Empty();
+				for( INT Frame = 0; Frame < DCProceduralFrames; ++Frame )
+				{
+					char Extension[32];
+					snprintf( Extension, sizeof(Extension), "frame%02d.dt", Frame );
+					ResourceFile( Path, ARRAY_COUNT(Path), ResourceDir, *It, Extension );
+					FMipmap& Mip = *new(It->Mips) FMipmap;
+					ReadResource( Path, Mip.DataArray );
+					if( Mip.DataArray.Num() < 32 || appMemcmp(&Mip.DataArray(0), "DcTx", 4) )
+					{
+						appErrorf( "Invalid animated DT frame %s", Path );
+					}
+					Mip.DataPtr = &Mip.DataArray(0);
+					Mip.USize = USize;
+					Mip.VSize = VSize;
+					Mip.UBits = UBits;
+					Mip.VBits = VBits;
+				}
+				UBOOL AllFramesIdentical = 1;
+				for( INT Frame = 1; Frame < It->Mips.Num(); ++Frame )
+				{
+					AllFramesIdentical = It->Mips(Frame).DataArray.Num()
+						== It->Mips(0).DataArray.Num()
+						&& !appMemcmp(
+							&It->Mips(Frame).DataArray(0),
+							&It->Mips(0).DataArray(0),
+							It->Mips(0).DataArray.Num() );
+					if( !AllFramesIdentical )
+					{
+						break;
+					}
+				}
+				if( AllFramesIdentical )
+				{
+					It->Mips.Remove( 1, It->Mips.Num() - 1 );
+					It->Format = TEXF_EXT_DCTEX;
+				}
+				else
+				{
+					It->Format = TEXF_EXT_DCANIM;
+				}
+				It->Palette = NULL;
+				It->PrimeCount = 0;
+				It->PrimeCurrent = 0;
+				It->MinFrameRate = 8.f;
+				It->MaxFrameRate = 8.f;
+				It->TextureFlags &= ~(TF_Parametric | TF_RealtimeChanged | TF_RealtimePalette | TF_Realtime);
+				if( !AllFramesIdentical )
+				{
+					It->TextureFlags |= TF_Realtime;
+				}
+				NullCookedProceduralInputs( *It );
+			}
+			else
+			{
+				BakeDreamcastProcedural( *It );
+				for( INT Frame = 0; Frame < DCProceduralFrames; ++Frame )
+				{
+					It->Tick( 1.f / 8.f );
+					char Extension[32];
+					snprintf( Extension, sizeof(Extension), "frame%02d.png", Frame );
+					ResourceFile( Path, ARRAY_COUNT(Path), ResourceDir, *It, Extension );
+					FTextureConverter::ExportDCTexture( *It, Path );
+					char MarkerExtension[40];
+					snprintf( MarkerExtension, sizeof(MarkerExtension),
+						"frame%02d.png.nomip", Frame );
+					ResourceFile( Path, ARRAY_COUNT(Path), ResourceDir, *It, MarkerExtension );
+					if( !TextureNeedsMipmaps(*It, Package) )
+					{
+						TArray<BYTE> Marker;
+						WriteResource( Path, Marker );
+					}
+					else
+					{
+						appUnlink( Path );
+					}
+				}
+			}
+			++Textures;
 			continue;
 		}
 
@@ -219,18 +355,9 @@ void FDCUtil::ProcessResources( const char* PackagePath, const char* ResourceDir
 			It->Mips(0).DataArray = Data;
 			It->Mips(0).DataPtr = &It->Mips(0).DataArray(0);
 			It->Format = TEXF_EXT_DCTEX;
-			if( FrozenProcedural )
-			{
-				It->TextureFlags &= ~(TF_Parametric | TF_Realtime
-					| TF_RealtimeChanged | TF_RealtimePalette);
-			}
 		}
 		else
 		{
-			if( FrozenProcedural )
-			{
-				BakeDreamcastProcedural( *It );
-			}
 			FTextureConverter::ExportDCTexture( *It, Path );
 
 			// Preserve the source package's authoring decision and screen-space

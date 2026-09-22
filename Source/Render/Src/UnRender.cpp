@@ -7,6 +7,9 @@
 =============================================================================*/
 
 #include "RenderPrivate.h"
+#if defined(DC_RESOURCE_COOKER)
+#include <zlib.h>
+#endif
 
 /*-----------------------------------------------------------------------------
 	Globals.
@@ -524,6 +527,142 @@ UBOOL URender::Exec(const char *Cmd,FOutputDevice *Out)
 {
 	guard(URender::Exec);
 #if defined(DC_RESOURCE_COOKER)
+	char DCLightmapPath[1024];
+	if( Parse(Cmd, "DCCOOKLIGHTMAPS=", DCLightmapPath, ARRAY_COUNT(DCLightmapPath)) )
+	{
+		UViewport* Viewport = NULL;
+		for( TObjectIterator<UViewport> It; It; ++It )
+		{
+			if( It->Actor && It->Actor->XLevel )
+			{
+				Viewport = *It;
+				break;
+			}
+		}
+		if( !Viewport )
+			appErrorf( "DCCOOKLIGHTMAPS requires a loaded local level" );
+		ULevel* Level = Viewport->Actor->XLevel;
+		if( !Level->Model )
+			appErrorf( "DCCOOKLIGHTMAPS requires a BSP model" );
+
+		FSceneNode Frame;
+		appMemset( &Frame, 0, sizeof(Frame) );
+		Frame.Viewport = Viewport;
+		Frame.Level = Level;
+		Frame.Coords = GMath.UnitCoords;
+		Frame.Uncoords = GMath.UnitCoords;
+
+		TArray<FDCLightmapEntry> Entries;
+		TArray<BYTE> Payload;
+		UModel* Model = Level->Model;
+		for( INT iNode = 0; iNode < Model->Nodes->Num(); ++iNode )
+		{
+			const FBspNode& Node = Model->Nodes->Element(iNode);
+			if( Node.iSurf < 0 || Node.iSurf >= Model->Surfs->Num() )
+				continue;
+			const FBspSurf& Surf = Model->Surfs->Element(Node.iSurf);
+			if( Surf.iLightMap < 0 || Surf.iLightMap >= Model->LightMap.Num() )
+				continue;
+
+			for( INT Side = 0; Side < 2; ++Side )
+			{
+				const INT Zone = Node.iZone[Side];
+				UBOOL Exists = 0;
+				for( INT i = 0; i < Entries.Num(); ++i )
+				{
+					if( Entries(i).LightMap == Surf.iLightMap && Entries(i).Zone == Zone )
+					{
+						Exists = 1;
+						break;
+					}
+				}
+				if( Exists )
+					continue;
+
+				FBspDrawList Draw;
+				appMemset( &Draw, 0, sizeof(Draw) );
+				Draw.iNode = iNode;
+				Draw.iSurf = Node.iSurf;
+				Draw.iZone = Zone;
+				Draw.PolyFlags = Surf.PolyFlags;
+				Draw.Zone = Level->GetZoneActor(Zone);
+
+				FCoords MapCoords(
+					Model->Points->Element(Surf.pBase),
+					Model->Vectors->Element(Surf.vTextureU),
+					Model->Vectors->Element(Surf.vTextureV),
+					Model->Vectors->Element(Surf.vNormal) );
+				FTextureInfo* LightMap = NULL;
+				FTextureInfo* FogMap = NULL;
+				GLightManager->SetupForSurf(
+					&Frame, MapCoords, &Draw, LightMap, FogMap, NULL, 0 );
+				if( !LightMap || !LightMap->Mips[0] || !LightMap->Mips[0]->DataPtr )
+				{
+					GLightManager->FinishSurf();
+					continue;
+				}
+
+				FDCLightmapEntry Entry;
+				appMemset( &Entry, 0, sizeof(Entry) );
+				if( Surf.iLightMap > 65535 || Zone < 0 || Zone >= 64 )
+					appErrorf( "DC lightmap directory key exceeds compact format" );
+				Entry.LightMap = (_WORD)Surf.iLightMap;
+				Entry.Zone = (BYTE)Zone;
+				const INT SourceUSize = LightMap->Mips[0]->USize;
+				const INT SourceVSize = LightMap->Mips[0]->VSize;
+				const INT USize = Max( 8, SourceUSize );
+				const INT VSize = Max( 8, SourceVSize );
+				if( USize > 65535 || VSize > 65535 )
+					appErrorf( "DC lightmap dimensions exceed compact format" );
+				Entry.USize = (_WORD)USize;
+				Entry.VSize = (_WORD)VSize;
+				TArray<BYTE> Raw;
+				Raw.SetNum( Entry.Size() );
+				_WORD* Dest = (_WORD*)&Raw(0);
+				const FColor* Src = (const FColor*)LightMap->Mips[0]->DataPtr;
+				for( INT V = 0; V < Entry.VSize; ++V )
+				{
+					const INT SourceV = V * SourceVSize / Entry.VSize;
+					for( INT U = 0; U < Entry.USize; ++U )
+					{
+						const INT SourceU = U * SourceUSize / Entry.USize;
+						Dest[V * Entry.USize + U]
+							= Src[SourceV * SourceUSize + SourceU].BGRA7777ToRGB565();
+					}
+				}
+
+				uLongf CompressedSize = compressBound( Raw.Num() );
+				TArray<BYTE> Compressed;
+				Compressed.SetNum( CompressedSize );
+				if( compress2(&Compressed(0), &CompressedSize, &Raw(0), Raw.Num(), Z_BEST_SPEED) != Z_OK )
+					appErrorf( "Failed to compress DC lightmap" );
+
+				Entry.Offset = Payload.Num();
+				Entry.Codec = CompressedSize < (uLongf)Raw.Num() ? 1 : 0;
+				Entry.PackedSize = Entry.Codec ? CompressedSize : Raw.Num();
+				const BYTE* Stored = Entry.Codec ? &Compressed(0) : &Raw(0);
+				const INT Start = Payload.Add( Entry.PackedSize );
+				appMemcpy( &Payload(Start), Stored, Entry.PackedSize );
+				Entries.AddItem( Entry );
+				GLightManager->FinishSurf();
+			}
+		}
+
+		FILE* File = appFopen( DCLightmapPath, "wb" );
+		if( !File )
+			appErrorf( "Cannot create DC lightmap file: %s", DCLightmapPath );
+		DWORD Header[4] = { 0x314d4c44, 3, (DWORD)Entries.Num(), (DWORD)Payload.Num() };
+		if( appFwrite(Header, 1, sizeof(Header), File) != sizeof(Header)
+			|| (Entries.Num() && appFwrite(&Entries(0), sizeof(FDCLightmapEntry), Entries.Num(), File) != Entries.Num())
+			|| (Payload.Num() && appFwrite(&Payload(0), 1, Payload.Num(), File) != Payload.Num()) )
+		{
+			appErrorf( "Cannot write DC lightmap file: %s", DCLightmapPath );
+		}
+		appFclose( File );
+		debugf( "DCLIGHTMAP cooked map=%s entries=%i bytes=%i",
+			Level->GetParent()->GetName(), Entries.Num(), Payload.Num() );
+		return 1;
+	}
 	if( ParseCommand(&Cmd, "DCCACHECHECK") )
 	{
 		EnsureDCModelCaches();

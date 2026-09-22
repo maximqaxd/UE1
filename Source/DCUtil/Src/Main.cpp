@@ -459,6 +459,9 @@ void FDCUtil::InitEngine()
 #if defined(DC_RESOURCE_COOKER)
 	UBOOL CookSession = ParseParam( appCmdLine(), "COOKSESSION" );
 	UBOOL VerifySession = ParseParam( appCmdLine(), "VERIFYSESSION" );
+	char BakedLightmapPath[2048] = { 0 };
+	UBOOL BakeLightmaps = Parse(
+		appCmdLine(), "BAKEDCLIGHTMAPS=", BakedLightmapPath, ARRAY_COUNT(BakedLightmapPath) );
 	FDatCookSession Session;
 	char SessionPath[2048] = { 0 };
 	if( CookSession && VerifySession )
@@ -494,7 +497,7 @@ void FDCUtil::InitEngine()
 	// Create the requested engine.
 	UClass* EngineClass;
 #if defined(DC_RESOURCE_COOKER)
-	if( CookSession || VerifySession )
+	if( CookSession || VerifySession || BakeLightmaps )
 		EngineClass = GObj.LoadClass( UGameEngine::StaticClass, NULL, "ini:Engine.Engine.GameEngine", NULL, LOAD_NoFail | LOAD_KeepImports, NULL );
 	else
 #endif
@@ -503,6 +506,13 @@ void FDCUtil::InitEngine()
 	// Init engine.
 	Engine = ConstructClassObject<UEngine>( EngineClass );
 	Engine->Init();
+	if( BakeLightmaps )
+	{
+		char Command[2304];
+		snprintf( Command, sizeof(Command), "DCCOOKLIGHTMAPS=%s", BakedLightmapPath );
+		if( !Engine->Render || !Engine->Render->Exec(Command, GSystem) )
+			appErrorf( "Static lightmap cooker unavailable" );
+	}
 
 #if defined(DC_RESOURCE_COOKER)
 	if( CookSession || VerifySession )
@@ -1363,7 +1373,8 @@ int main( int argc, const char** argv )
 	GIsServer = true;
 	GIsClient = true;
 	GIsEditor = !ParseParam(appCmdLine(),"COOKSESSION")
-		&& !ParseParam(appCmdLine(),"VERIFYSESSION");
+		&& !ParseParam(appCmdLine(),"VERIFYSESSION")
+		&& !ParseParam(appCmdLine(),"BAKEDCLIGHTMAPS");
 
 	appChdir( appBaseDir() );
 
@@ -1405,7 +1416,8 @@ int main( int argc, const char** argv )
 			|| Parse( appCmdLine(), "COOKDAT=", ResourceArg, ARRAY_COUNT(ResourceArg) )
 			|| Parse( appCmdLine(), "VERIFYDAT=", ResourceArg, ARRAY_COUNT(ResourceArg) )
 			|| ParseParam( appCmdLine(), "COOKSESSION" )
-			|| ParseParam( appCmdLine(), "VERIFYSESSION" ) )
+			|| ParseParam( appCmdLine(), "VERIFYSESSION" )
+			|| Parse( appCmdLine(), "BAKEDCLIGHTMAPS=", ResourceArg, ARRAY_COUNT(ResourceArg) ) )
 		{
 			fflush( NULL );
 			_Exit( 0 );

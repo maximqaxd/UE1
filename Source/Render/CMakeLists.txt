@@ -27,5 +27,8 @@ target_include_directories(${PROJECT_NAME}
 )
 
 target_link_libraries(${PROJECT_NAME} Engine Core)
+if(TARGET ZLIB::ZLIB)
+  target_link_libraries(${PROJECT_NAME} ZLIB::ZLIB)
+endif()
 
 target_compile_definitions(${PROJECT_NAME} PRIVATE RENDER_EXPORTS UPACKAGE_NAME=${PROJECT_NAME})

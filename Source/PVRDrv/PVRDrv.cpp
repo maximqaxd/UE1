@@ -2,6 +2,9 @@
 #include <malloc.h>
 
 #include "PVRDrvPrivate.h"
+#if defined(PLATFORM_DREAMCAST)
+#include <zlib.h>
+#endif
 
 #define dcache_pref_block(a)	__builtin_prefetch(a)
 
@@ -353,6 +356,7 @@ UPVRRenderDevice::UPVRRenderDevice()
 	VRAMUsed = 0;
 	TextureFrame = 0;
 	appMemset( PaletteBanks, 0, sizeof(PaletteBanks) );
+	appMemset( &TextureCPUProfile, 0, sizeof(TextureCPUProfile) );
 }
 
 UBOOL UPVRRenderDevice::Init( UViewport* InViewport )
@@ -542,6 +546,13 @@ void UPVRRenderDevice::Unlock( UBOOL Blit )
 			(DWORD)Heap.uordblks, CallbackBytes, GPVROpaqueDirectBytes, QueueBytes,
 			CallbackPeak, ComposeSize, Pal8Count, Pal8VRAM, GPVROpaqueDirectCount,
 			GPVRPTCallbacks.Num(), GPVRTRCallbacks.Num());
+	}
+	if( TextureFrame % 300 == 0 )
+	{
+		PrintTextureCPUProfile( 300 );
+#if defined(PLATFORM_DREAMCAST)
+		appDCDumpProceduralTextureProfile( 300 );
+#endif
 	}
 
 	// The opaque list has been populated directly since Lock().
@@ -1237,7 +1248,11 @@ void UPVRRenderDevice::SetTexture( FTextureInfo& Info, DWORD PolyFlags, FLOAT Pa
 		}
 	}
 
-	const QWORD LookupID = NewCacheID & ~0xFFULL;
+	// The low byte is the cache namespace (static lightmap, dynamic lightmap,
+	// texture, fog, ...), not a replaceable texture type. Collapsing it made a
+	// static lightmap and its dynamic variant evict/re-upload one another every
+	// time a surface changed namespace.
+	const QWORD LookupID = NewCacheID;
 	const BYTE NewType = NewCacheID & 0xFF;
 	FTexBind* Bind = BindMap.Find( LookupID );
 	const UBOOL NewTexture = !Bind;
@@ -1263,8 +1278,27 @@ void UPVRRenderDevice::SetTexture( FTextureInfo& Info, DWORD PolyFlags, FLOAT Pa
 	Tex.CurrentBind = Bind;
 	Bind->LastUsedFrame = TextureFrame;
 
-	if( NewTexture || !Bind->Tex || RealtimeChanged || PaletteChanged || !BindPaletteValid || Bind->LastType != NewType )
+	if( NewTexture || !Bind->Tex || RealtimeChanged || PaletteChanged || !BindPaletteValid )
 	{
+		if( Info.Format == TEXF_BGRA8_LM && Info.Mips[0] )
+		{
+			const DWORD Pixels = Info.Mips[0]->USize * Info.Mips[0]->VSize;
+			if( RealtimeChanged )
+			{
+				TextureCPUProfile.DynamicLightmapCalls++;
+				TextureCPUProfile.DynamicLightmapPixels += Pixels;
+			}
+			else
+			{
+				TextureCPUProfile.StaticLightmapCalls++;
+				TextureCPUProfile.StaticLightmapPixels += Pixels;
+				if( NewTexture )
+					TextureCPUProfile.StaticLightmapCold++;
+				else if( !Bind->Tex )
+					TextureCPUProfile.StaticLightmapReload++;
+			}
+		}
+
 		// New texture or it has changed, upload it to VRAM.
 		Bind->LastType = NewType;
 		Info.TextureFlags &= ~TF_RealtimeChanged;
@@ -1312,6 +1346,7 @@ void UPVRRenderDevice::UploadPalette( INT Bank, const FTextureInfo& Info, UBOOL 
 		return;
 	}
 
+	const DWORD StartCycles = appCycles();
 	const DWORD Base = Bank * NUM_PAL_COLORS;
 	for( INT Index = 0; Index < NUM_PAL_COLORS; ++Index )
 	{
@@ -1323,6 +1358,8 @@ void UPVRRenderDevice::UploadPalette( INT Bank, const FTextureInfo& Info, UBOOL 
 		pvr_set_pal_entry( Base + Index, Color );
 	}
 	State.LastUploadFrame = TextureFrame;
+	TextureCPUProfile.PaletteCalls++;
+	TextureCPUProfile.PaletteCycles += appCycles() - StartCycles;
 }
 
 void UPVRRenderDevice::EnsureComposeSize( const DWORD NewSize )
@@ -1350,12 +1387,16 @@ void* UPVRRenderDevice::TwiddleTextureMipP8( const FMipmap* Mip )
 	// KOS' extended loader performs the required PAL8 twiddle with ordinary
 	// CPU stores. Target cached system RAM first, then use pvr_txr_load() for
 	// one sequential Store Queue transfer instead of scattered VRAM writes.
+	const DWORD StartCycles = appCycles();
 	pvr_txr_load_ex(
 		Mip->DataPtr,
 		(pvr_ptr_t)Compose,
 		Mip->USize,
 		Mip->VSize,
 		PVR_TXRLOAD_8BPP );
+	TextureCPUProfile.P8TwiddleCalls++;
+	TextureCPUProfile.P8TwiddlePixels += SizeBytes;
+	TextureCPUProfile.P8TwiddleCycles += appCycles() - StartCycles;
 
 	return Compose;
 }
@@ -1401,6 +1442,7 @@ void* UPVRRenderDevice::ConvertTextureMipI8( const FMipmap* Mip, const FColor* P
 	DWORD i;
 	const BYTE* Src = (const BYTE*)Mip->DataPtr;
 	const DWORD SrcCount = Mip->USize * Mip->VSize;
+	const DWORD StartCycles = appCycles();
 	INT USize = Mip->USize;
 	INT VSize = Mip->VSize;
 
@@ -1448,10 +1490,22 @@ void* UPVRRenderDevice::ConvertTextureMipI8( const FMipmap* Mip, const FColor* P
 
 	// upscale texture vertically to height = 8 if needed
 	const INT VTimes = MinTexSize / VSize;
+	void* Result = Compose;
 	if( VTimes > 1 )
-		return VerticalUpscale( USize, VSize, VTimes );
+		Result = VerticalUpscale( USize, VSize, VTimes );
 
-	return Compose;
+	TextureCPUProfile.P8ConvertCalls++;
+	TextureCPUProfile.P8ConvertPixels += SrcCount;
+	TextureCPUProfile.P8ConvertCycles += appCycles() - StartCycles;
+	if( Mip->USize < MinTexSize || Mip->VSize < MinTexSize )
+	{
+		TextureCPUProfile.MinSizeExpansions++;
+		TextureCPUProfile.MinSizeSourcePixels += SrcCount;
+		TextureCPUProfile.MinSizeOutputPixels += Max(MinTexSize, Mip->USize)
+			* Max(MinTexSize, Mip->VSize);
+	}
+
+	return Result;
 }
 
 void* UPVRRenderDevice::ConvertTextureMipBGRA7777( const FMipmap* Mip )
@@ -1462,6 +1516,7 @@ void* UPVRRenderDevice::ConvertTextureMipBGRA7777( const FMipmap* Mip )
 	INT VSize = Mip->VSize;
 	const FColor* Src = (const FColor*)Mip->DataPtr;
 	const DWORD Count = USize * VSize;
+	const DWORD StartCycles = appCycles();
 
 	const DWORD ConvertedPixels = Max(MinTexSize, USize) * VSize;
 	const DWORD UpscaledPixels = VSize < MinTexSize
@@ -1499,10 +1554,22 @@ void* UPVRRenderDevice::ConvertTextureMipBGRA7777( const FMipmap* Mip )
 
 	// upscale texture vertically to height = 8 if needed
 	const INT VTimes = MinTexSize / VSize;
+	void* Result = Compose;
 	if( VTimes > 1 )
-		return VerticalUpscale( USize, VSize, VTimes );
+		Result = VerticalUpscale( USize, VSize, VTimes );
 
-	return Compose;
+	TextureCPUProfile.LightmapCalls++;
+	TextureCPUProfile.LightmapPixels += Count;
+	TextureCPUProfile.LightmapCycles += appCycles() - StartCycles;
+	if( Mip->USize < MinTexSize || Mip->VSize < MinTexSize )
+	{
+		TextureCPUProfile.MinSizeExpansions++;
+		TextureCPUProfile.MinSizeSourcePixels += Count;
+		TextureCPUProfile.MinSizeOutputPixels += Max(MinTexSize, Mip->USize)
+			* Max(MinTexSize, Mip->VSize);
+	}
+
+	return Result;
 }
 
 pvr_ptr_t UPVRRenderDevice::AllocateTexture( INT Size )
@@ -1617,23 +1684,82 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, UBOOL NewTexture, UBOO
 			appErrorf( "Unsupported or invalid DT texture header" );
 		}
 
-		if( Bind->Tex )
+		const INT PayloadSize = Size - HeaderSize;
+		if( Bind->Tex && Bind->SizeBytes != PayloadSize )
 		{
 			pvr_mem_free( Bind->Tex );
 			VRAMUsed -= Bind->SizeBytes;
+			Bind->Tex = NULL;
+			Bind->SizeBytes = 0;
 		}
-		Bind->SizeBytes = Size - HeaderSize;
-		Bind->Tex = AllocateTexture( Bind->SizeBytes );
+		if( !Bind->Tex )
+		{
+			Bind->SizeBytes = PayloadSize;
+			Bind->Tex = AllocateTexture( Bind->SizeBytes );
+			VRAMUsed += Bind->SizeBytes;
+		}
 		if( !Bind->Tex )
 		{
 			appErrorf( "DT VRAM allocation failed: %i bytes", Bind->SizeBytes );
 		}
 		pvr_txr_load( Data + HeaderSize, Bind->Tex, Bind->SizeBytes );
-		VRAMUsed += Bind->SizeBytes;
 		Bind->DCFormat = Mode & 0x7e000000;
 		Bind->DCWidth = Width;
 		Bind->DCHeight = Height;
 		Bind->DCMipMapped = (Mode & 0x80000000) != 0;
+		Bind->PaletteBank = INDEX_NONE;
+		Bind->PaletteMasked = 0;
+	}
+	else if( Info.Format == TEXF_RGB565 && Mip0->DCExternalStream )
+	{
+		const INT SizeBytes = Mip0->DCExternalSize;
+		if( SizeBytes != Mip0->USize * Mip0->VSize * 2 )
+		{
+			appErrorf( "Invalid cooked lightmap size: %i", SizeBytes );
+		}
+		BYTE* Pixels = (BYTE*)appMalloc( SizeBytes, "DCLightmapUpload" );
+		if( Mip0->DCExternalCodec == 0 )
+		{
+			if( Mip0->DCExternalPackedSize != SizeBytes )
+				appErrorf( "Invalid raw cooked lightmap size" );
+			Mip0->DCExternalStream->ReadRange(
+				Mip0->DCExternalOffset, Pixels, SizeBytes );
+		}
+		else if( Mip0->DCExternalCodec == 1 )
+		{
+			const INT PackedSize = Mip0->DCExternalPackedSize;
+			BYTE* Packed = (BYTE*)appMalloc( PackedSize, "DCLightmapPacked" );
+			Mip0->DCExternalStream->ReadRange(
+				Mip0->DCExternalOffset, Packed, PackedSize );
+			uLongf OutputSize = SizeBytes;
+			const INT Result = uncompress( Pixels, &OutputSize, Packed, PackedSize );
+			appFree( Packed );
+			if( Result != Z_OK || OutputSize != (uLongf)SizeBytes )
+				appErrorf( "Invalid compressed cooked lightmap" );
+		}
+		else
+		{
+			appErrorf( "Unsupported cooked lightmap codec" );
+		}
+		if( Bind->Tex && Bind->SizeBytes != SizeBytes )
+		{
+			pvr_mem_free( Bind->Tex );
+			VRAMUsed -= Bind->SizeBytes;
+			Bind->Tex = NULL;
+			Bind->SizeBytes = 0;
+		}
+		if( !Bind->Tex )
+		{
+			Bind->Tex = AllocateTexture( SizeBytes );
+			Bind->SizeBytes = SizeBytes;
+			VRAMUsed += SizeBytes;
+		}
+		pvr_txr_load( Pixels, Bind->Tex, SizeBytes );
+		appFree( Pixels );
+		Bind->DCFormat = PVR_TXRFMT_RGB565 | PVR_TXRFMT_NONTWIDDLED;
+		Bind->DCWidth = Mip0->USize;
+		Bind->DCHeight = Mip0->VSize;
+		Bind->DCMipMapped = 0;
 		Bind->PaletteBank = INDEX_NONE;
 		Bind->PaletteMasked = 0;
 	}
@@ -1719,6 +1845,7 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, UBOOL NewTexture, UBOO
 		{
 			// All four hardware PAL8 banks are referenced by this scene. Preserve
 			// correctness by expanding this texture through the 16-bit fallback.
+			TextureCPUProfile.PaletteBankFallbacks++;
 			void* Lin = ConvertTextureMipI8( Mip0, Info.Palette );
 			const INT USize = Max( MinTexSize, Mip0->USize );
 			const INT VSize = Max( MinTexSize, Mip0->VSize );
@@ -1743,6 +1870,7 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, UBOOL NewTexture, UBOO
 	else if( Info.Palette )
 	{
 		// Convert to ARGB1555 (Compose) then twiddle/copy: placeholder copies linear; twiddle to be added.
+		TextureCPUProfile.GenericP8Conversions++;
 		void* Lin = ConvertTextureMipI8( Mip0, Info.Palette );
 		const INT USize = Max( MinTexSize, Mip0->USize );
 		const INT VSize = Max( MinTexSize, Mip0->VSize );
@@ -1819,6 +1947,44 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, UBOOL NewTexture, UBOO
 	}
 
 	unguard;
+}
+
+void UPVRRenderDevice::PrintTextureCPUProfile( INT Frames )
+{
+	const DOUBLE ToMilliseconds = GSecondsPerCycle * 1000.0;
+	const DOUBLE TotalMilliseconds =
+		(TextureCPUProfile.PaletteCycles
+		+ TextureCPUProfile.P8TwiddleCycles
+		+ TextureCPUProfile.P8ConvertCycles
+		+ TextureCPUProfile.LightmapCycles) * ToMilliseconds;
+	debugf(
+		"DCTEXCPU frames=%d frame_ms=%.3f "
+		"palette=%u/%.3fms twiddle=%u/%u/%.3fms "
+		"p8_expand=%u/%u/%.3fms bank_fallback=%u generic_p8=%u "
+		"min8=%u/%u/%u lightmap=%u/%u/%.3fms dynamic=%u/%u "
+		"static=%u/%u/%u/%u/%u",
+		Frames, Frames ? TotalMilliseconds / Frames : 0.0,
+		TextureCPUProfile.PaletteCalls,
+		TextureCPUProfile.PaletteCycles * ToMilliseconds,
+		TextureCPUProfile.P8TwiddleCalls, TextureCPUProfile.P8TwiddlePixels,
+		TextureCPUProfile.P8TwiddleCycles * ToMilliseconds,
+		TextureCPUProfile.P8ConvertCalls, TextureCPUProfile.P8ConvertPixels,
+		TextureCPUProfile.P8ConvertCycles * ToMilliseconds,
+		TextureCPUProfile.PaletteBankFallbacks,
+		TextureCPUProfile.GenericP8Conversions,
+		TextureCPUProfile.MinSizeExpansions,
+		TextureCPUProfile.MinSizeSourcePixels,
+		TextureCPUProfile.MinSizeOutputPixels,
+		TextureCPUProfile.LightmapCalls, TextureCPUProfile.LightmapPixels,
+		TextureCPUProfile.LightmapCycles * ToMilliseconds,
+		TextureCPUProfile.DynamicLightmapCalls,
+		TextureCPUProfile.DynamicLightmapPixels,
+		TextureCPUProfile.StaticLightmapCalls,
+		TextureCPUProfile.StaticLightmapPixels,
+		TextureCPUProfile.StaticLightmapCold,
+		TextureCPUProfile.StaticLightmapReload,
+		TextureCPUProfile.StaticLightmapRetype );
+	appMemset( &TextureCPUProfile, 0, sizeof(TextureCPUProfile) );
 }
 
 void UPVRRenderDevice::PrintMemStats() const

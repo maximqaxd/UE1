@@ -1,5 +1,7 @@
 #include "CorePrivate.h"
+#include "UnLinker.h"
 #include "UnDCStream.h"
+#include "UnDCLoading.h"
 #include <string.h>
 
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
@@ -239,17 +241,41 @@ INT appDCStreamFileSize( const char* Filename )
 UBOOL appDCStreamResolve( const char* Name, char* Out )
 {
 	const char* Base = DCStreamBaseName( Name );
+	for( INT i = 0; i < DCStreamFiles.Num(); ++i )
+	{
+		if( !appStricmp( Base, DCStreamFiles(i).Name ) )
+		{
+			appStrcpy( Out, DCStreamFiles(i).Name );
+			return true;
+		}
+	}
+
 	INT Match = INDEX_NONE;
 	for( INT i = 0; i < DCStreamFiles.Num(); ++i )
 	{
 		char Stem[64];
 		appStrcpy( Stem, DCStreamFiles(i).Name );
 		char* Extension = appStrchr( Stem, '.' );
-		if( Extension )
+		if( !Extension )
 		{
-			*Extension = 0;
+			continue;
 		}
-		if( !appStricmp( Base, DCStreamFiles(i).Name ) || !appStricmp( Base, Stem ) )
+
+		const char* PackageExtension = Extension + 1;
+		if
+		(
+			appStricmp( PackageExtension, "u"   ) &&
+			appStricmp( PackageExtension, "unr" ) &&
+			appStricmp( PackageExtension, "utx" ) &&
+			appStricmp( PackageExtension, "uax" ) &&
+			appStricmp( PackageExtension, "umx" )
+		)
+		{
+			continue;
+		}
+
+		*Extension = 0;
+		if( !appStricmp( Base, Stem ) )
 		{
 			if( Match != INDEX_NONE )
 			{
@@ -268,6 +294,9 @@ UBOOL appDCStreamResolve( const char* Name, char* Out )
 
 void appDCStreamClose()
 {
+#if defined(PLATFORM_DREAMCAST)
+	appDCLoadingEnd();
+#endif
 	if( DCStream )
 	{
 		appFclose( DCStream );
@@ -400,6 +429,11 @@ void appDCStreamOpen( const char* Path )
 	appStrcpy( DCStreamBacking->Path, Path );
 	debugf( "DCSTREAM open files=%d records=%u directory=%u compact_exports=1 strict=1",
 		DCStreamFiles.Num(), DCStreamRecordCount, Header[5] );
+#if defined(PLATFORM_DREAMCAST)
+	// The stream is a recorded replay of this exact load, so consumed records
+	// over total is a genuinely linear measure rather than an estimate.
+	appDCLoadingBegin();
+#endif
 }
 
 static void DCStreamPrepareRecord( const char* Filename, INT Offset )
@@ -415,6 +449,10 @@ static void DCStreamPrepareRecord( const char* Filename, INT Offset )
 	}
 	DCStreamPosition += 12;
 	++DCStreamRecords;
+#if defined(PLATFORM_DREAMCAST)
+	if( DCStreamRecordCount )
+		appDCLoadingProgress( (FLOAT)DCStreamRecords / (FLOAT)DCStreamRecordCount );
+#endif
 	DWORD Source = DCStreamCurrent[0];
 	DWORD Start = DCStreamCurrent[1];
 	DWORD Count = DCStreamCurrent[2];
@@ -438,7 +476,17 @@ void appDCStreamCapture( const char* Filename, INT Offset, INT Length, FDCStream
 	if( File == INDEX_NONE || DCStreamCurrent[0] != (DWORD)File
 		|| DCStreamCurrent[1] != (DWORD)Offset || (DWORD)Length > DCStreamRemaining )
 	{
-		appErrorf( "Noncontiguous or out-of-order DAT resource: %s offset=%d size=%d", Filename, Offset, Length );
+		const char* Actual = DCStreamCurrent[0] < (DWORD)DCStreamFiles.Num()
+			? DCStreamFiles(DCStreamCurrent[0]).Name : "<invalid>";
+		appErrorf(
+			"Dependency stream divergence record=%u expected=%s@%u+%u actual=%s@%d+%d",
+			DCStreamRecords,
+			Actual,
+			DCStreamCurrent[1],
+			DCStreamRemaining,
+			Filename,
+			Offset,
+			Length );
 	}
 	FDCStreamSlice NewSlice;
 	NewSlice.Store = DCStreamBacking;
@@ -446,6 +494,59 @@ void appDCStreamCapture( const char* Filename, INT Offset, INT Length, FDCStream
 	NewSlice.Physical = DCStreamPosition;
 	NewSlice.Length = Length;
 	Slice = NewSlice;
+}
+
+UBOOL appDCReadDependencyFile( const char* Filename, INT Offset, void* Data, INT Length )
+{
+	if( !Filename || Offset < 0 || !Data || Length <= 0 )
+	{
+		return 0;
+	}
+	if( appDCStreamActive() )
+	{
+		appDCStreamRead( Filename, Offset, Data, Length );
+		return 1;
+	}
+
+	FArchiveFileLoad File( Filename );
+	if( Offset > File.Eof || Length > File.Eof - Offset )
+	{
+		return 0;
+	}
+	File.Seek( Offset );
+	File.Serialize( Data, Length );
+	return 1;
+}
+
+UBOOL appDCCaptureDependencyFile( const char* Filename, INT Offset, INT Length, FDCStreamSlice& Slice )
+{
+	if( !Filename || Offset < 0 || Length <= 0 )
+	{
+		return 0;
+	}
+	if( appDCStreamActive() )
+	{
+		appDCStreamCapture( Filename, Offset, Length, Slice );
+		BYTE Scratch[2048];
+		for( INT Position = 0; Position < Length; )
+		{
+			INT Count = Min( Length - Position, (INT)sizeof(Scratch) );
+			appDCStreamRead( Filename, Offset + Position, Scratch, Count );
+			Position += Count;
+		}
+		return 1;
+	}
+
+	FArchiveFileLoad File( Filename );
+	if( Offset > File.Eof || Length > File.Eof - Offset )
+	{
+		return 0;
+	}
+	File.Seek( Offset );
+	BYTE* Scratch = (BYTE*)appMalloc( Length, "DCDeferredDependency" );
+	File.Serialize( Scratch, Length );
+	appFree( Scratch );
+	return 1;
 }
 
 void appDCStreamRead( const char* Filename, INT Offset, void* Data, INT Length )

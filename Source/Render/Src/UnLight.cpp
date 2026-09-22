@@ -1825,6 +1825,38 @@ void FLightManager::SetupForSurf
 	LightMap.CacheID		= MakeCacheID( CID_StaticMap, iLightMap, ZoneID, Model );
 	unguard;
 
+#if defined(PLATFORM_DREAMCAST)
+	// Host-cooked static world lightmaps are already RGB565. Keep dynamic and
+	// moving lights on the original BGRA merge path so gameplay lighting stays
+	// exact, while static surfaces can be uploaded from DAT without SH-4 pixel
+	// conversion or permanent main-RAM residency.
+	if( !Mover && !DynamicLights && !MovingLights )
+	{
+		const FDCLightmapEntry* Cooked = Level->FindDCLightmap( iLightMap, ZoneID );
+		if( Cooked )
+		{
+			static FColor White(255,255,255,255);
+			LightMip.USize = Cooked->USize;
+			LightMip.VSize = Cooked->VSize;
+			LightMip.UBits = FLogTwo(Cooked->USize);
+			LightMip.VBits = FLogTwo(Cooked->VSize);
+			LightMip.DataPtr = NULL;
+			LightMip.DataArray.Empty();
+			LightMip.DCExternalStream = &Level->DCLightmapData;
+			LightMip.DCExternalOffset = Cooked->Offset;
+			LightMip.DCExternalSize = Cooked->Size();
+			LightMip.DCExternalPackedSize = Cooked->PackedSize;
+			LightMip.DCExternalCodec = Cooked->Codec;
+			LightMap.Format = TEXF_RGB565;
+			LightMap.MaxColor = &White;
+			STAT(GStat.Lightage += LightMap.UClamp * LightMap.VClamp);
+			STAT(GStat.LightMem += LightMap.UClamp * LightMap.VClamp * sizeof(_WORD));
+			STAT(uunclock(GStat.IllumTime));
+			return;
+		}
+	}
+#endif
+
 	// Handle static lighting.
 	DWORD* Stream = (DWORD*)GCache.Get(LightMap.CacheID,*TopItemToUnlock++);
 	struct FMoverStamp{ INT iLeaf; FVector Location; FRotator Rotation; };
@@ -1906,18 +1938,23 @@ void FLightManager::SetupForSurf
 		else
 		{
 			// Cache it.
+			DOUBLE DynamicLightTime = Frame->Viewport->CurrentTime;
+#if defined(PLATFORM_DREAMCAST)
+			// Dynamic illumination is expensive to merge and convert on SH-4.
+			// Reuse each cached result for a 1/15-second interval.
+			DynamicLightTime = appFloor((FLOAT)(DynamicLightTime * 15.0)) / 15.0;
+#endif
 			Stream = (DWORD*)GCache.Get( LightMap.CacheID, *TopItemToUnlock++ );
-			if( !Stream || *(DOUBLE*)Stream!=Frame->Viewport->CurrentTime )
+			if( !Stream || *(DOUBLE*)Stream != DynamicLightTime )
 			{
 				if( !Stream )
 					Stream = (DWORD*)GCache.Create( LightMap.CacheID, TopItemToUnlock[-1], (LightMap.USize*LightMap.VClamp + 3) * sizeof(DWORD), DEFAULT_ALIGNMENT, LightMap.USize*(LightMap.VSize-LightMap.VClamp) );
-				*(DOUBLE*)Stream = Frame->Viewport->CurrentTime;
+				*(DOUBLE*)Stream = DynamicLightTime;
 				Stream += 2;
 				LightMap.MaxColor = (FColor*)Stream++;
 			}
 			else
 			{
-				*(DOUBLE*)Stream = Frame->Viewport->CurrentTime;
 				Stream += 2;
 				LightMap.MaxColor = (FColor*)Stream++;
 				goto SkipDynamicLight;
