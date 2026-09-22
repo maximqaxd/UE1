@@ -26,9 +26,34 @@ static FVector      GUnlitColor;
 
 static void EnviroMap( FSceneNode* Frame, FTransTexture& P )
 {
+#if defined(PLATFORM_DREAMCAST)
+	// UnsafeNormal + MirrorByVector + TransformVectorBy is a square root,
+	// three divides and four dot products per vertex. FSRRA covers the first
+	// two and FIPR the rest; only the two coordinates actually used are
+	// transformed, so the third row of Uncoords is never touched.
+	const FLOAT SizeSq = shz_dot8f( P.Point.X, P.Point.Y, P.Point.Z, 0.f,
+	                                P.Point.X, P.Point.Y, P.Point.Z, 0.f );
+	const FLOAT Scale  = shz_inv_sqrtf_fsrra( SizeSq );
+	const FVector N( P.Point.X * Scale, P.Point.Y * Scale, P.Point.Z * Scale );
+
+	const FLOAT Dot = shz_dot8f( N.X, N.Y, N.Z, 0.f,
+	                             P.Normal.X, P.Normal.Y, P.Normal.Z, 0.f );
+	const FLOAT TwoDot = 2.0f * Dot;
+	const FVector M( N.X - P.Normal.X * TwoDot,
+	                 N.Y - P.Normal.Y * TwoDot,
+	                 N.Z - P.Normal.Z * TwoDot );
+
+	const FLOAT TX = shz_dot8f( M.X, M.Y, M.Z, 0.f,
+	                            Frame->Uncoords.XAxis.X, Frame->Uncoords.XAxis.Y, Frame->Uncoords.XAxis.Z, 0.f );
+	const FLOAT TY = shz_dot8f( M.X, M.Y, M.Z, 0.f,
+	                            Frame->Uncoords.YAxis.X, Frame->Uncoords.YAxis.Y, Frame->Uncoords.YAxis.Z, 0.f );
+	P.U = (TX+1.0f) * 0.5f * 256.0f * UScale;
+	P.V = (TY+1.0f) * 0.5f * 256.0f * VScale;
+#else
 	FVector T = P.Point.UnsafeNormal().MirrorByVector( P.Normal ).TransformVectorBy( Frame->Uncoords );
 	P.U = (T.X+1.0) * 0.5 * 256.0 * UScale;
 	P.V = (T.Y+1.0) * 0.5 * 256.0 * VScale;
+#endif
 }
 
 /*--------------------------------------------------------------------------
