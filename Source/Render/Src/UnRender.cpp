@@ -7,6 +7,7 @@
 =============================================================================*/
 
 #include "RenderPrivate.h"
+#include "UnDCFrameProfile.h"
 #if defined(DC_RESOURCE_COOKER)
 #include <zlib.h>
 #endif
@@ -506,6 +507,9 @@ void URender::PreRender( FSceneNode* Frame )
 void URender::PostRender( FSceneNode* Frame )
 {
 	guard(URender::PostRender);
+#if defined(PLATFORM_DREAMCAST)
+	DCFrameDraw(Frame->Viewport->Canvas);
+#endif
 
 	// Draw whatever stats were requested.
 	if( Frame->Viewport->Actor->RendMap==REN_Polys || Frame->Viewport->Actor->RendMap==REN_PolyCuts || Frame->Viewport->Actor->RendMap==REN_DynLight || Frame->Viewport->Actor->RendMap==REN_PlainTex )
@@ -728,6 +732,7 @@ UBOOL URender::Exec(const char *Cmd,FOutputDevice *Out)
 //
 static void DCLoadPipeCoords( const FCoords& C )
 {
+	DCFrameCount(DCFC_MatrixLoads);
 	shz_vec4_t R0, R1, R2, R3;
 	R0.x = C.XAxis.X; R0.y = C.XAxis.Y; R0.z = C.XAxis.Z; R0.w = -(C.Origin | C.XAxis);
 	R1.x = C.YAxis.X; R1.y = C.YAxis.Y; R1.z = C.YAxis.Z; R1.w = -(C.Origin | C.YAxis);
@@ -824,6 +829,9 @@ static inline INT Clip( FTransform** Dest, FTransform** Src, INT SrcNum )
 INT URender::ClipBspSurf( INT iNode, FTransform**& Result )
 {
 	guard(URender::ClipBspSurf);
+#if defined(PLATFORM_DREAMCAST)
+	DCFrameCount(DCFC_Polys);
+#endif
 	static FTransform* LocalPts[FBspNode::MAX_FINAL_VERTICES];
 
 	// Transform.
@@ -833,41 +841,49 @@ INT URender::ClipBspSurf( INT iNode, FTransform**& Result )
 	FVert*	  VertPool	= &GVerts[Node->iVertPool];
 	BYTE      Outcode   = FVF_OutReject;
 	BYTE      AllCodes  = 0;
-#if defined(PLATFORM_DREAMCAST)
-	DCLoadPipeCoords( GFrame->Coords );
-#endif
-	for( INT i=0; i<NumPts; i++ )
 	{
-		INT pPoint = VertPool[i].pVertex;
+		DC_FRAME_SCOPE(DCFS_Transform);
 #if defined(PLATFORM_DREAMCAST)
-		if( PointCacheStamps[pPoint] != PointCacheGeneration )
-		{
-			PointCacheStamps[pPoint] = PointCacheGeneration;
-			PointCache[pPoint] = new(VectorMem)FTransform;
-			Pipe( *PointCache[pPoint], GFrame, GPoints[pPoint] );
-			STAT(GStat.NumPoints++);
-		}
-		FTransform* Point = PointCache[pPoint];
-#else
-		FStampedPoint& S = PointCache[pPoint];
-		if( S.Stamp != Stamp )
-		{
-			S.Stamp = Stamp;
-			S.Point = new(VectorMem)FTransform;
-			Pipe( *S.Point, GFrame, GPoints[pPoint] );
-			STAT(GStat.NumPoints++);
-		}
-		FTransform* Point = S.Point;
+		DCLoadPipeCoords( GFrame->Coords );
 #endif
-		LocalPts[i] = Point;
-		BYTE Flags  = Point->Flags;
-		Outcode    &= Flags;
-		AllCodes   |= Flags;
+		for( INT i=0; i<NumPts; i++ )
+		{
+			INT pPoint = VertPool[i].pVertex;
+#if defined(PLATFORM_DREAMCAST)
+			if( PointCacheStamps[pPoint] != PointCacheGeneration )
+			{
+				PointCacheStamps[pPoint] = PointCacheGeneration;
+				PointCache[pPoint] = new(VectorMem)FTransform;
+				DCFrameCount(DCFC_Points);
+				Pipe( *PointCache[pPoint], GFrame, GPoints[pPoint] );
+				STAT(GStat.NumPoints++);
+			}
+			FTransform* Point = PointCache[pPoint];
+#else
+			FStampedPoint& S = PointCache[pPoint];
+			if( S.Stamp != Stamp )
+			{
+				S.Stamp = Stamp;
+				S.Point = new(VectorMem)FTransform;
+				Pipe( *S.Point, GFrame, GPoints[pPoint] );
+				STAT(GStat.NumPoints++);
+			}
+			FTransform* Point = S.Point;
+#endif
+			LocalPts[i] = Point;
+			BYTE Flags  = Point->Flags;
+			Outcode    &= Flags;
+			AllCodes   |= Flags;
+		}
 	}
 	if( Outcode )
+	{
+		DC_FRAME_COUNT(DCFC_ClipReject);
 		return 0;
+	}
 
 	// Clip.
+	DC_FRAME_SCOPE(DCFS_Clip);
 	STAT(GStat.NumClip++);
 	FTransform** Pts = LocalPts;
 	if( AllCodes )
@@ -879,7 +895,10 @@ INT URender::ClipBspSurf( INT iNode, FTransform**& Result )
 				Dot[i] = GFrame->PrjXM * Pts[i]->Point.Z + Pts[i]->Point.X;
 			NumPts = Clip( LocalPts, Pts, NumPts );
 			if( !NumPts )
+			{
+				DC_FRAME_COUNT(DCFC_ClipReject);
 				return 0;
+			}
 			Pts = LocalPts;
 		}
 		if( AllCodes & FVF_OutXMax )
@@ -889,7 +908,10 @@ INT URender::ClipBspSurf( INT iNode, FTransform**& Result )
 				Dot[i] = GFrame->PrjXP * Pts[i]->Point.Z - Pts[i]->Point.X;
 			NumPts = Clip( LocalPts, Pts, NumPts );
 			if( !NumPts )
+			{
+				DC_FRAME_COUNT(DCFC_ClipReject);
 				return 0;
+			}
 			Pts = LocalPts;
 		}
 		if( AllCodes & FVF_OutYMin )
@@ -899,7 +921,10 @@ INT URender::ClipBspSurf( INT iNode, FTransform**& Result )
 				Dot[i] = GFrame->PrjYM * Pts[i]->Point.Z + Pts[i]->Point.Y;
 			NumPts = Clip( LocalPts, Pts, NumPts );
 			if( !NumPts )
+			{
+				DC_FRAME_COUNT(DCFC_ClipReject);
 				return 0;
+			}
 			Pts = LocalPts;
 		}
 		if( AllCodes & FVF_OutYMax )
@@ -909,7 +934,10 @@ INT URender::ClipBspSurf( INT iNode, FTransform**& Result )
 				Dot[i] = GFrame->PrjYP * Pts[i]->Point.Z - Pts[i]->Point.Y;
 			NumPts = Clip( LocalPts, Pts, NumPts );
 			if( !NumPts )
+			{
+				DC_FRAME_COUNT(DCFC_ClipReject);
 				return 0;
+			}
 			Pts = LocalPts;
 		}
 	}
@@ -926,7 +954,10 @@ INT URender::ClipBspSurf( INT iNode, FTransform**& Result )
 			static FTransform* LocalPts[FBspNode::MAX_FINAL_VERTICES];
 			NumPts = Clip( LocalPts, Pts, NumPts );
 			if( !NumPts )
+			{
+				DC_FRAME_COUNT(DCFC_ClipReject);
 				return 0;
+			}
 			Pts = LocalPts;
 		}
 	}
@@ -1077,6 +1108,7 @@ INT RasterStartY, RasterEndY, RasterStartX, RasterEndX;
 static UBOOL SetupRaster( FTransform** Pts, INT NumPts, FSpanBuffer* Span, INT EndY )
 {
 	guard(SetupRaster);
+	DC_FRAME_SCOPE(DCFS_Raster);
 
 	// Compute integer coords.
 	RasterStartY = RasterEndY = Pts[0]->IntY;
@@ -1109,6 +1141,7 @@ static UBOOL SetupRaster( FTransform** Pts, INT NumPts, FSpanBuffer* Span, INT E
 	// Check bounds for visibility.
 	if( Span && !Span->BoxIsVisible( RasterStartX, RasterStartY, RasterEndX, RasterEndY ) )
 	{
+		DC_FRAME_COUNT(DCFC_RasterReject);
 		STAT(GStat.NumRasterBoxReject++);
 		return 0;
 	}
@@ -1604,6 +1637,7 @@ void URender::OccludeBsp( FSceneNode* Frame )
 	INT                 NumActiveZones;
 	BYTE                ActiveZones[64];
 	guard(URender::OccludeBsp);
+	DC_FRAME_SCOPE(DCFS_BSP);
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
 	if( Frame->Level->Model->Nodes->Max() > DynamicsCacheCapacity
 		|| Frame->Level->Model->Points->Max() > PointCacheCapacity )
@@ -1727,6 +1761,9 @@ void URender::OccludeBsp( FSceneNode* Frame )
 		// Pass 1: Process node for the first time and optionally recurse with front node.
 		if( Pass==PASS_Front )
 		{
+#if defined(PLATFORM_DREAMCAST)
+			DCFrameCount(DCFC_Nodes);
+#endif
 			// Zone mask rejection.
 			if( iViewZone && !(Node->ZoneMask & ActiveZoneMask))
 			{
@@ -1905,6 +1942,7 @@ void URender::OccludeBsp( FSceneNode* Frame )
 				DrawBin = 1 + ((PolyFlags & PF_NoOcclude)!=0);
 				if( !Visible )
 				{
+					DC_FRAME_COUNT(DCFC_SpanReject);
 					// Rejected, span buffer wasn't affected.
 					Node->NodeFlags |= NF_PolyOccluded;
 					TempDrawList->Span.Release();
@@ -2612,6 +2650,7 @@ void URender::DrawFrame( FSceneNode* Frame )
 void URender::DrawWorld( FSceneNode* Frame )
 {
 	guard(URender::DrawWorld);
+	DC_FRAME_SCOPE(DCFS_World);
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
 	// Resize only before traversal: PostDynamics holds pointers into the cache.
 	EnsureDCModelCaches();

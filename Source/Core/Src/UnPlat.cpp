@@ -763,6 +763,9 @@ CORE_API DOUBLE appSeconds()
 #endif
 }
 
+#if defined(PLATFORM_DREAMCAST)
+CORE_API UBOOL GDCLegacyTimers = 0;
+#endif
 CORE_API DWORD appCycles()
 {
 #ifdef PLATFORM_MSVC

@@ -11,7 +11,7 @@
 #define KOSDRV_API DLL_IMPORT
 #endif
 
-#define MAX_JOY_BTNS 16
+#define MAX_JOY_ACTIONS 21
 
 
 /*-----------------------------------------------------------------------------
@@ -60,13 +60,19 @@ class KOSDRV_API UKOSViewport : public UViewport
 private:
 	// Static variables.
 	static BYTE KeyMap[MAX_KBD_KEYS]; // DC keycode -> EInputKey map
-	static const BYTE JoyBtnMap[MAX_JOY_BTNS]; // DC joystick button bit -> EInputKey map
+	static const BYTE JoyActionMap[MAX_JOY_ACTIONS];
 
 	// Variables.
 	BYTE KeyState[MAX_KBD_KEYS]; // Current keys held
 	BYTE KeyStatePrev[MAX_KBD_KEYS]; // Previous keys held
-	DWORD JoyState;
-	DWORD JoyStatePrev;
+	DWORD JoyActionState;
+	UBOOL LeftTriggerDown;
+	UBOOL RightTriggerDown;
+	UBOOL MenuStartArmed;
+#if defined(PLATFORM_DREAMCAST)
+	DWORD ProfilePreviousButtons;
+	UBOOL ProfileChordActive;
+#endif
 	class UKOSClient* Client;
 	UBOOL Destroyed;
 	UBOOL QuitRequested;
@@ -77,6 +83,7 @@ private:
 
 	// UKOSViewport private methods.
 	UBOOL CauseInputEvent( INT iKey, EInputAction Action, FLOAT Delta=0.0 );
+	void SetJoyActionState( DWORD NewActionState );
 	static void InitKeyMap();
 };
 

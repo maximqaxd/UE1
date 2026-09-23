@@ -303,10 +303,82 @@ int FMovingBrushTracker::SurfIsDynamic( INT iSurf )
 	FMovingBrushTracker init & exit.
 ---------------------------------------------------------------------------------------*/
 
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
 //
-// Initialize or reinitialize everything, and allocate all working tables.  Must be 
-// followed by a call to UpdateAllBrushes to actually add moving brushes to the world 
-// Bsp.  This function assumes that the Bsp is clean when it is called, i.e. it has no 
+// Grow one model database to hold Extra more records, if it does not already.
+//
+static void DCGrowDb( UDatabase* Res, INT Extra, const char* Name )
+{
+	if( !Res )
+		return;
+	const INT Needed = Res->GetNum() + Extra;
+	if( Res->GetMax() >= Needed )
+		return;
+	const INT Record   = Res->GetClass()->ClassRecordSize;
+	const INT OldBytes = Res->GetMax() * Record;
+	Res->SetMax( Needed );
+	Res->Realloc();
+	debugf( "DCBSPGROW array=%s num=%i extra=%i old_bytes=%i new_bytes=%i",
+		Name, Res->GetNum(), Extra, OldBytes, Needed * Record );
+}
+
+//
+// Reserve the dynamic-BSP headroom in the level model's arrays.
+//
+// Timing is the whole point. UDatabase::Realloc is an appRealloc over the
+// entire array, not just the headroom, so growing Nodes by its mover budget
+// transiently holds the old and the new copy at once -- around 2.4MB on
+// Chizra. Done from the brush tracker that lands after the GameInfo wave and
+// after the linker release has cut the free space into ~84 separate holes,
+// and nothing is big enough. Done right after the map loads, the arrays are
+// still the newest thing on the heap, where the allocator can extend in place.
+//
+// Idempotent, and the tracker still calls it, so a level that reaches the
+// tracker without an early pass gets its headroom the old way.
+//
+ENGINE_API void DCReserveMoverBsp( ULevel* Level )
+{
+	guard(DCReserveMoverBsp);
+	if( !Level || !Level->Model || !Level->Model->Nodes )
+		return;
+
+	INT NumMovers = 0, NumMoverPolys = 0;
+	for( INT i = 0; i < Level->Num(); i++ )
+	{
+		AActor* Actor = Level->Actors(i);
+		if( Actor && Actor->IsMovingBrush() )
+		{
+			++NumMovers;
+			if( Actor->Brush && Actor->Brush->Polys )
+				NumMoverPolys += Actor->Brush->Polys->Num();
+		}
+	}
+	if( !NumMovers )
+		return;
+
+	INT Nodes = 0, Points = 0, Verts = 0;
+	const char* Map = Level->GetParent()->GetName();
+	if( !GetConfigInt(Map, "Nodes", Nodes, "DCMover.ini")
+		|| !GetConfigInt(Map, "Points", Points, "DCMover.ini")
+		|| !GetConfigInt(Map, "Verts", Verts, "DCMover.ini")
+		|| Nodes <= 0 || Points <= NumMoverPolys || Verts <= 0
+		|| Nodes > 1048576 || Points > 1048576 || Verts > 4194304 )
+		appErrorf( "Missing/invalid measured mover budget for %s", Map );
+
+	// SetupActorBrush allocates one surface and three vectors per mover poly.
+	DCGrowDb( Level->Model->Nodes,   Nodes,                "nodes"   );
+	DCGrowDb( Level->Model->Points,  Points,               "points"  );
+	DCGrowDb( Level->Model->Verts,   Verts,                "verts"   );
+	DCGrowDb( Level->Model->Surfs,   NumMoverPolys + 32,   "surfs"   );
+	DCGrowDb( Level->Model->Vectors, 3*NumMoverPolys + 96, "vectors" );
+	unguard;
+}
+#endif
+
+//
+// Initialize or reinitialize everything, and allocate all working tables.  Must be
+// followed by a call to UpdateAllBrushes to actually add moving brushes to the world
+// Bsp.  This function assumes that the Bsp is clean when it is called, i.e. it has no
 // references to dynamic Bsp nodes in it.
 //
 FMovingBrushTracker::FMovingBrushTracker( ULevel* ThisLevel )
@@ -352,17 +424,6 @@ FMovingBrushTracker::FMovingBrushTracker( ULevel* ThisLevel )
 #if defined(DC_RESOURCE_COOKER)
 	Probe = ParseParam(appCmdLine(), "DCPROBEMOVERS");
 #endif
-	INT Nodes = 0, Points = 0, Verts = 0;
-	if( NumMovers && !Probe )
-	{
-		const char* Map = Level->GetParent()->GetName();
-		if( !GetConfigInt(Map, "Nodes", Nodes, "DCMover.ini")
-			|| !GetConfigInt(Map, "Points", Points, "DCMover.ini")
-			|| !GetConfigInt(Map, "Verts", Verts, "DCMover.ini")
-			|| Nodes <= 0 || Points <= NumMoverPolys || Verts <= 0
-			|| Nodes > 1048576 || Points > 1048576 || Verts > 4194304 )
-			appErrorf( "Missing/invalid measured mover budget for %s", Map );
-	}
 	if( Probe && NumMovers )
 	{
 		ExpandDb(Level->Model->Nodes);
@@ -371,18 +432,10 @@ FMovingBrushTracker::FMovingBrushTracker( ULevel* ThisLevel )
 	}
 	else
 	{
-		Level->Model->Nodes->SetMax(Level->Model->Nodes->Num() + Nodes);
-		Level->Model->Points->SetMax(Level->Model->Points->Num() + Points);
-		Level->Model->Verts->SetMax(Level->Model->Verts->Num() + Verts);
-		Level->Model->Nodes->Realloc();
-		Level->Model->Points->Realloc();
-		Level->Model->Verts->Realloc();
+		// Normally already done just after the map loaded, and then this is a
+		// no-op; see DCReserveMoverBsp for why the timing matters.
+		DCReserveMoverBsp( Level );
 	}
-	// SetupActorBrush allocates one surface and three vectors per mover poly.
-	Level->Model->Surfs->SetMax(Level->Model->Surfs->Num() + (NumMovers ? NumMoverPolys + 32 : 0));
-	Level->Model->Vectors->SetMax(Level->Model->Vectors->Num() + (NumMovers ? 3 * NumMoverPolys + 96 : 0));
-	Level->Model->Surfs->Realloc();
-	Level->Model->Vectors->Realloc();
 	iTopNode = Level->Model->Nodes->Num();
 	iTopSurf = Level->Model->Surfs->Num();
 	iTopPoint = Level->Model->Points->Num();

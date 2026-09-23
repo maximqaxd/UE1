@@ -7,6 +7,7 @@
 =============================================================================*/
 
 #include "EnginePrivate.h"
+#include "UnDCFrameProfile.h"
 #include "UnRender.h"
 #include "UnNet.h"
 
@@ -20,6 +21,71 @@ IMPLEMENT_CLASS(UGameEngine);
 extern CORE_API void appDCSetLinkerTablesReleased( UBOOL Released );
 
 static UBOOL GDCGameLinkersReleased = 0;
+
+// Drop the editor's CSG source brushes.
+//
+// A shipped level's geometry is already baked into Level->Model, so a brush
+// that is not a mover is never consulted again: every runtime dereference of
+// Actor->Brush is either gated on IsMovingBrush() or null-checked, and
+// UnLevAct.cpp nulls the pointer itself when an actor is destroyed. Releasing
+// the reference lets the collector take the whole UModel with it.
+//
+// The model is not the expensive part -- its UBspNodes is. That object carries
+// Zones[64] and so costs 1592 bytes whether or not the brush has a single
+// zone, and Chizra ships 199 of them on top of its movers.
+//
+// IsMovingBrush() reads Brush, so mover-ness has to be decided before anything
+// is nulled; only non-movers are touched, and for those the predicate was
+// already false, so it stays stable across the pass.
+// With the model gone the ABrush itself is an inert shell -- its CSG is already
+// baked into the level BSP, and no runtime path reads a static brush: every
+// Level->Brush() caller is in Editor. So the actor slot goes too, which is
+// another 536 bytes each, 199 of them on Chizra.
+//
+// Actors(0) is the LevelInfo and Actors(1) the builder brush; the engine reaches
+// both by fixed index, so those two keep their slot and only lose the model.
+static void DCDiscardEditorBrushes( ULevel* Level )
+{
+	// Clearing the Actors slot alone frees nothing: every FBspSurf keeps an
+	// ABrush* back to the brush that generated it, that field is serialized
+	// (UnObj.h), so the collector follows it and all 199 survive. The field is
+	// write-only at runtime -- UnDynBsp sets it when a mover rebuilds, and the
+	// only readers are in Editor -- so the static-brush ones can go.
+	INT Unlinked = 0;
+	if( Level->Model && Level->Model->Surfs )
+	{
+		for( INT SurfIndex = 0; SurfIndex < Level->Model->Surfs->Num(); ++SurfIndex )
+		{
+			FBspSurf& Surf = Level->Model->Surfs->Element(SurfIndex);
+			if( Surf.Actor && !Surf.Actor->IsMovingBrush() )
+			{
+				Surf.Actor = NULL;
+				++Unlinked;
+			}
+		}
+	}
+
+	INT Dropped = 0, Removed = 0;
+	for( INT ActorIndex = 0; ActorIndex < Level->Num(); ++ActorIndex )
+	{
+		AActor* Actor = Level->Actors(ActorIndex);
+		if( !Actor || !Actor->Brush || Actor->IsMovingBrush() )
+			continue;
+		// Not a mover and Brush is set, so IsStaticBrush() holds here -- but it
+		// reads Brush, so the slot has to be dropped before the model is.
+		UBOOL Removable = ( ActorIndex > 1 );
+		Actor->Brush = NULL;
+		++Dropped;
+		if( Removable )
+		{
+			Level->Actors(ActorIndex) = NULL;
+			++Removed;
+		}
+	}
+	if( Dropped )
+		debugf( "DCBRUSH discarded map=%s editor_brushes=%i actors_removed=%i surfs_unlinked=%i",
+			Level->GetParent()->GetName(), Dropped, Removed, Unlinked );
+}
 
 static void DCDiscardNonMoverPolys( ULevel* Level )
 {
@@ -386,6 +452,15 @@ void UGameEngine::Init()
 	FURL URL( &DefaultURL, AutoURL, InitialTravel );
 	if( !URL.Valid )
 		appErrorf( LocalizeError("InvalidUrl"), AutoURL );
+#if defined(PLATFORM_DREAMCAST)
+	if( GDCSessionTravel )
+	{
+		LastURL = URL;
+		for( INT i = LastURL.Op.Num() - 1; i >= 0; --i )
+			if( appStricmp( *LastURL.Op(i), "restart" ) == 0 )
+				LastURL.Op.Remove( i );
+	}
+#endif
 	UBOOL Success = Browse(
 #if defined(PLATFORM_DREAMCAST)
 		GDCSessionTravel ? URL :
@@ -950,6 +1025,11 @@ ULevel* UGameEngine::LoadMap( const FURL& URL, UPendingLevel* Pending, char* Err
 	// Dynamic BSP needs source polygons only for moving brushes. The brush
 	// tracker discarded all other polygon databases later, after GameInfo had
 	// already caused a second export wave. Discard them before that peak.
+	//
+	// Release the editor brushes first: that orphans their models, so the
+	// poly sweep below and the collect that follows reclaim the models and
+	// their Zones-carrying UBspNodes as well, not just the polygons.
+	DCDiscardEditorBrushes( GLevel );
 	DCDiscardNonMoverPolys( GLevel );
 	GObj.CollectGarbage( GSystem, RF_Intrinsic );
 #endif
@@ -1014,6 +1094,9 @@ ULevel* UGameEngine::LoadMap( const FURL& URL, UPendingLevel* Pending, char* Err
 	}
 	if( GLevel->IsServer() && !Info->Game )
 	{
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+		DCProfileMemory( "gameinfo_pre" );
+#endif
 		// Get the GameInfo class.
 		UClass* GameClass=NULL;
 		if( !GameClassName[0] )
@@ -1028,6 +1111,9 @@ ULevel* UGameEngine::LoadMap( const FURL& URL, UPendingLevel* Pending, char* Err
 		debugf( NAME_Log, "Game class is '%s'", GameClass->GetName() );
 		Info->Game = (AGameInfo*)GLevel->SpawnActor( GameClass );
 		check(Info->Game!=NULL);
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+		DCProfileMemory( "gameinfo_post" );
+#endif
 	}
 	unguard;
 	// Listen for clients.
@@ -1162,6 +1248,12 @@ ULevel* UGameEngine::LoadMap( const FURL& URL, UPendingLevel* Pending, char* Err
 		It->Calls = It->Cycles=0;
 	GTicks=1;
 	unguard;
+#endif
+
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	if( ( GEntry || DCDirectSessionStartup() )
+		&& !Pending && !GLevel->NetDriver && appDCStreamActive() )
+		DCReleaseGameLinkers( "level_peak" );
 #endif
 
 	// Client init.
@@ -1372,6 +1464,9 @@ void UGameEngine::Tick( FLOAT DeltaSeconds )
 {
 	guard(UGameEngine::Tick);
 #if defined(PLATFORM_DREAMCAST)
+	DCFrameBegin();
+#endif
+#if defined(PLATFORM_DREAMCAST)
 	TickDCMemorySimulation();
 	if( GDCPlayProfilePending )
 	{
@@ -1409,6 +1504,7 @@ void UGameEngine::Tick( FLOAT DeltaSeconds )
 
 	// Update the level.
 	guard(TickLevel);
+	DC_FRAME_SCOPE(DCFS_Game);
 	GameCycles=0;
 	uclock(GameCycles);
 	if( GLevel )
@@ -1556,6 +1652,9 @@ void UGameEngine::Tick( FLOAT DeltaSeconds )
 	uunclock(LocalTickCycles);
 	TickCycles=LocalTickCycles;
 	GTicks++;
+#if defined(PLATFORM_DREAMCAST)
+	DCFrameEnd();
+#endif
 	unguard;
 }
 

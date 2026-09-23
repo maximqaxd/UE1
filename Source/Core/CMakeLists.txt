@@ -3,6 +3,7 @@ project(Core CXX)
 set(SRC_FILES
   "Src/UnCache.cpp"
   "Src/UnDCDat.cpp"
+  "Src/UnDCVRAM.cpp"
   "Src/UnDCStream.cpp"
   "Src/UnDCLoading.cpp"
   "Src/UnClass.cpp"

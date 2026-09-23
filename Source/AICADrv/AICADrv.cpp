@@ -386,6 +386,8 @@ void UAICAAudioSubsystem::RegisterSound( USound* Sound )
 	if( StreamId < 0 )
 	{
 		debugf( NAME_Warning, "Could not load sound %s into AudioEngine", Sound->GetName() );
+		if( !GIsEditor && total_samples <= 65534 )
+			Sound->Data.Empty();
 		return;
 	}
 

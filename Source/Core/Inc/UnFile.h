@@ -177,8 +177,14 @@ CORE_API void VARARGS appThrowf( const char* Fmt, ... );
 //
 // Normal timing.
 //
+#if defined(PLATFORM_DREAMCAST)
+extern CORE_API UBOOL GDCLegacyTimers;
+#define uclock(Timer)   {if(GDCLegacyTimers) Timer -= appCycles();}
+#define uunclock(Timer) {if(GDCLegacyTimers) Timer += appCycles();}
+#else
 #define uclock(Timer)   {Timer -= appCycles();}
 #define uunclock(Timer) {Timer += appCycles()-34;}
+#endif
 
 //
 // Performance critical timing.

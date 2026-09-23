@@ -1,11 +1,187 @@
 #include "EnginePrivate.h"
+#include "UnDCFrameProfile.h"
 
 #if defined(PLATFORM_DREAMCAST)
 #include <malloc.h>
+#include <arch/timer.h>
+
+// Inclusive stage timers: recursion counts once, nested stages overlap.
+ENGINE_API UBOOL GDCFrameProfileEnabled = 1;
+ENGINE_API UBOOL GDCFrameProfileDetailed = 1;
+ENGINE_API UBOOL GDCFrameProfileOverlay = 1;
+ENGINE_API INT GDCFrameProfilePage = 0;
+// Use the integer KOS timer directly; single-only floating point loses
+// microsecond precision when an absolute timestamp is converted to DOUBLE.
+static struct FDCFrameProfile
+{
+	UBOOL Active;
+	DWORD Begin, PreviousBegin, Interval;
+	DWORD Start[DCFS_Count], Depth[DCFS_Count], Time[DCFS_Count];
+	QWORD Sum[DCFS_Count], IntervalSum, WorkSum, BytesSum, HeadersSum;
+	DWORD Frames, Worst, Bytes, Headers;
+	FLOAT Display[DCFS_Count], FrameMS, WorkMS, WorstMS, UploadKB, HeaderCount;
+	DWORD GPUFrame, GPUVertexBytes;
+	FLOAT GPUMS;
+	DWORD Counts[DCFC_Count];
+	QWORD CountSum[DCFC_Count];
+	FLOAT CountDisplay[DCFC_Count];
+	DWORD TimerReads;
+	QWORD TimerReadsSum;
+	char Lines[27][128];
+} GDCFrame;
+
+ENGINE_API void DCFrameProfileReset()
+{
+	appMemset(&GDCFrame, 0, sizeof(GDCFrame));
+}
+
+ENGINE_API void DCFrameProfileReport( FOutputDevice* Out )
+{
+	Out->Logf("DCPROFILE detail=%d overlay=%d legacy=%d; completed 30-tick window",
+		GDCFrameProfileDetailed, GDCFrameProfileOverlay, GDCLegacyTimers);
+	for( INT i = 0; i < 27; ++i )
+		if( GDCFrame.Lines[i][0] ) Out->Log(GDCFrame.Lines[i]);
+}
+
+static UBOOL DCStageEnabled( INT Stage )
+{
+	return GDCFrameProfileDetailed || Stage == DCFS_Game || Stage == DCFS_World
+		|| Stage == DCFS_BSP || Stage == DCFS_Wait || Stage == DCFS_Submit
+		|| Stage == DCFS_Overlay;
+}
+
+ENGINE_API void DCFrameBegin()
+{
+	if( !GDCFrameProfileEnabled )
+	{
+		appMemset(&GDCFrame, 0, sizeof(GDCFrame));
+		return;
+	}
+	const DWORD Now = (DWORD)timer_us_gettime64();
+	GDCFrame.Interval = GDCFrame.PreviousBegin ? Now - GDCFrame.PreviousBegin : 0;
+	GDCFrame.PreviousBegin = Now;
+	GDCFrame.Begin = Now;
+	appMemset(GDCFrame.Time, 0, sizeof(GDCFrame.Time));
+	appMemset(GDCFrame.Depth, 0, sizeof(GDCFrame.Depth));
+	GDCFrame.Bytes = GDCFrame.Headers = 0;
+	GDCFrame.TimerReads = 0;
+	appMemset(GDCFrame.Counts, 0, sizeof(GDCFrame.Counts));
+	GDCFrame.Active = 1;
+}
+
+ENGINE_API void DCFrameEnter( INT Stage )
+{
+	if( GDCFrame.Active && DCStageEnabled(Stage) && GDCFrame.Depth[Stage]++ == 0 )
+	{
+		++GDCFrame.TimerReads;
+		GDCFrame.Start[Stage] = (DWORD)timer_us_gettime64();
+	}
+}
+
+ENGINE_API void DCFrameLeave( INT Stage )
+{
+	if( GDCFrame.Active && GDCFrame.Depth[Stage] && --GDCFrame.Depth[Stage] == 0 )
+	{
+		++GDCFrame.TimerReads;
+		GDCFrame.Time[Stage] += (DWORD)timer_us_gettime64() - GDCFrame.Start[Stage];
+	}
+}
+
+ENGINE_API void DCFrameUploadBytes( DWORD Bytes ) { if( GDCFrame.Active ) GDCFrame.Bytes += Bytes; }
+ENGINE_API void DCFrameHeader() { if( GDCFrame.Active ) ++GDCFrame.Headers; }
+ENGINE_API void DCFrameCount( INT Counter, DWORD Amount )
+{
+	if( GDCFrame.Active && GDCFrameProfileDetailed ) GDCFrame.Counts[Counter] += Amount;
+}
+
+ENGINE_API void DCFrameGPU( DWORD Frame, QWORD Nanoseconds, DWORD VertexBytes )
+{
+	if( Frame != GDCFrame.GPUFrame )
+	{
+		GDCFrame.GPUFrame = Frame;
+		GDCFrame.GPUMS = Nanoseconds / 1000000.f;
+		GDCFrame.GPUVertexBytes = VertexBytes;
+	}
+}
+
+ENGINE_API void DCFrameEnd()
+{
+	if( !GDCFrame.Active ) return;
+	GDCFrame.Active = 0;
+	const DWORD Work = (DWORD)timer_us_gettime64() - GDCFrame.Begin;
+	for( INT i = 0; i < DCFS_Count; ++i ) GDCFrame.Sum[i] += GDCFrame.Time[i];
+	GDCFrame.WorkSum += Work;
+	GDCFrame.IntervalSum += GDCFrame.Interval;
+	GDCFrame.Worst = Max(GDCFrame.Worst, GDCFrame.Interval);
+	GDCFrame.BytesSum += GDCFrame.Bytes;
+	GDCFrame.HeadersSum += GDCFrame.Headers;
+	GDCFrame.TimerReadsSum += GDCFrame.TimerReads;
+	for( INT i = 0; i < DCFC_Count; ++i ) GDCFrame.CountSum[i] += GDCFrame.Counts[i];
+	if( ++GDCFrame.Frames >= 30 )
+	{
+		const FLOAT Scale = 1.f / (1000.f * GDCFrame.Frames);
+		for( INT i = 0; i < DCFS_Count; ++i )
+		{
+			GDCFrame.Display[i] = GDCFrame.Sum[i] * Scale;
+			GDCFrame.Sum[i] = 0;
+		}
+		GDCFrame.FrameMS = GDCFrame.IntervalSum * Scale;
+		GDCFrame.WorkMS = GDCFrame.WorkSum * Scale;
+		GDCFrame.WorstMS = GDCFrame.Worst * 0.001f;
+		GDCFrame.UploadKB = GDCFrame.BytesSum / (1024.f * GDCFrame.Frames);
+		GDCFrame.HeaderCount = GDCFrame.HeadersSum / (FLOAT)GDCFrame.Frames;
+		for( INT i = 0; i < DCFC_Count; ++i )
+		{
+			GDCFrame.CountDisplay[i] = GDCFrame.CountSum[i] / (FLOAT)GDCFrame.Frames;
+			GDCFrame.CountSum[i] = 0;
+		}
+		const FLOAT* T = GDCFrame.Display;
+		const FLOAT* C = GDCFrame.CountDisplay;
+		appSprintf(GDCFrame.Lines[0], "DC %.1f FPS frame %.1f worst %.1f D%d", GDCFrame.FrameMS > 0 ? 1000.f/GDCFrame.FrameMS : 0.f, GDCFrame.FrameMS, GDCFrame.WorstMS, GDCFrameProfileDetailed);
+		appSprintf(GDCFrame.Lines[1], "tick %.1f game %.1f world %.1f wait %.1f", GDCFrame.WorkMS, T[DCFS_Game], T[DCFS_World], T[DCFS_Wait]);
+		appSprintf(GDCFrame.Lines[2], "BSP %.1f clip %.1f raster %.1f span %.1f", T[DCFS_BSP], T[DCFS_Clip], T[DCFS_Raster], T[DCFS_Span]);
+		appSprintf(GDCFrame.Lines[3], "dyn %.1f mesh %.1f light %.1f legacy %d", T[DCFS_Dynamics], T[DCFS_Mesh], T[DCFS_Light], GDCLegacyTimers);
+		appSprintf(GDCFrame.Lines[4], "nodes %.0f polys %.0f pts %.0f rows %.0f", C[DCFC_Nodes], C[DCFC_Polys], C[DCFC_Points], C[DCFC_Spans]);
+		appSprintf(GDCFrame.Lines[5], "tex %.1f read %.1f inflate %.1f alloc %.1f", T[DCFS_Texture], T[DCFS_Read], T[DCFS_Inflate], T[DCFS_Allocate]);
+		appSprintf(GDCFrame.Lines[6], "place %.1f twid+SQ %.1f SQ %.1f %.1fKB", T[DCFS_Place], T[DCFS_Twiddle], T[DCFS_Upload], GDCFrame.UploadKB);
+		appSprintf(GDCFrame.Lines[7], "cold %.0f reload %.0f evict %.0f hdr %.0f", C[DCFC_Cold], C[DCFC_Reload], C[DCFC_Evict], GDCFrame.HeaderCount);
+		appSprintf(GDCFrame.Lines[8], "submit %.1f overlay %.2f GPUlast %.1f", T[DCFS_Submit], T[DCFS_Overlay], GDCFrame.GPUMS);
+		appSprintf(GDCFrame.Lines[9], "VIS frame %.1f detail %d", GDCFrame.FrameMS, GDCFrameProfileDetailed);
+		appSprintf(GDCFrame.Lines[10], "transform %.2f clip-only %.2f", T[DCFS_Transform], T[DCFS_Clip]);
+		appSprintf(GDCFrame.Lines[11], "raster %.2f span %.2f", T[DCFS_Raster], T[DCFS_Span]);
+		appSprintf(GDCFrame.Lines[12], "matrix loads %.0f transformed pts %.0f", C[DCFC_MatrixLoads], C[DCFC_Points]);
+		appSprintf(GDCFrame.Lines[13], "span-copy links %.0f fragments %.0f", C[DCFC_SpanLinks], C[DCFC_SpanFragments]);
+		appSprintf(GDCFrame.Lines[14], "reject clip %.0f raster %.0f span %.0f", C[DCFC_ClipReject], C[DCFC_RasterReject], C[DCFC_SpanReject]);
+		appSprintf(GDCFrame.Lines[15], "scope timer reads/frame %.0f", GDCFrame.TimerReadsSum / (FLOAT)GDCFrame.Frames);
+		appSprintf(GDCFrame.Lines[16], "overlay %.2f ms visible %d", T[DCFS_Overlay], GDCFrameProfileOverlay);
+		appSprintf(GDCFrame.Lines[17], "DCPDETAIL / DCPOVERLAY / DCPDUMP");
+		appSprintf(GDCFrame.Lines[18], "LIGHT frame %.1f setup %.2f tex %.2f", GDCFrame.FrameMS, T[DCFS_Light], T[DCFS_Texture]);
+		appSprintf(GDCFrame.Lines[19], "cooked %.0f static build %.0f hit %.0f", C[DCFC_LightCooked], C[DCFC_LightStaticBuild], C[DCFC_LightStaticHit]);
+		appSprintf(GDCFrame.Lines[20], "dynamic miss %.0f expired %.0f hit %.0f", C[DCFC_LightDynamicMiss], C[DCFC_LightDynamicExpired], C[DCFC_LightDynamicHit]);
+		appSprintf(GDCFrame.Lines[21], "merged regen %.0f lightmap uploads %.0f", C[DCFC_LightMerged], C[DCFC_UploadLightmap]);
+		appSprintf(GDCFrame.Lines[22], "upload cold %.0f missing %.0f", C[DCFC_Cold], C[DCFC_UploadMissing]);
+		appSprintf(GDCFrame.Lines[23], "upload changed %.0f palette %.0f bank %.0f", C[DCFC_UploadChanged], C[DCFC_UploadPalette], C[DCFC_UploadBank]);
+		appSprintf(GDCFrame.Lines[24], "reload %.0f atlas evict %.0f", C[DCFC_Reload], C[DCFC_Evict]);
+		appSprintf(GDCFrame.Lines[25], "build ms static %.2f dynamic %.2f", T[DCFS_LightStaticBuild], T[DCFS_LightDynamicBuild]);
+		appSprintf(GDCFrame.Lines[26], "reason priority: cold/missing/changed/pal/bank");
+		GDCFrame.TimerReadsSum = 0;
+		GDCFrame.IntervalSum = GDCFrame.WorkSum = GDCFrame.BytesSum = GDCFrame.HeadersSum = 0;
+		GDCFrame.Frames = GDCFrame.Worst = 0;
+	}
+}
+
+ENGINE_API void DCFrameDraw( UCanvas* Canvas )
+{
+	if( !GDCFrameProfileEnabled || !GDCFrameProfileOverlay || !Canvas || !Canvas->SmallFont ) return;
+	DC_FRAME_SCOPE(DCFS_Overlay);
+	for( INT i = 0; i < 9; ++i )
+		Canvas->Printf(Canvas->SmallFont, 4, 24 + i * 10, "%s", GDCFrame.Lines[GDCFrameProfilePage * 9 + i]);
+}
 
 extern "C" DWORD PVR_GetVRAMUsed();
 extern "C" DWORD AICA_GetSampleBytes();
 extern CORE_API void appDCProfileObjects( const char* Phase, UBOOL Detailed );
+extern CORE_API void appDCVRAMStats( DWORD& OutUsed, DWORD& OutPeak, INT& OutBlocks );
 
 static DWORD DCSampledArrayRounding = 0;
 static DWORD DCSampledArrayBlocks = 0;
@@ -134,7 +310,7 @@ ENGINE_API void DCProfileMemory( const char* Phase )
 		Phase, MeshFullUsed, MeshCapacity, GetDCMeshDecodeCacheBytes(),
 		Scratch, Pooled, Chunks,
 		GCache.GetDCAllocatedBytes(), NameBytes, VfHashBytes, VfHashCount,
-		(DWORD)(sizeof(INT) * 2 + sizeof(DWORD) * 2),
+		(DWORD)(sizeof(GDCFrame) + sizeof(INT) * 2 + sizeof(DWORD) * 2),
 		Heap.ordblks, (DWORD)Heap.arena);
 
 	for( TObjectIterator<UTexture> It; It; ++It )
@@ -156,6 +332,14 @@ ENGINE_API void DCProfileMemory( const char* Phase )
 		Phase, AuxUsed, AuxCapacity, TextureUsed, TextureCapacity, SoundUsed, SoundCapacity,
 		DCSampledArrayBlocks, DCSampledArrayRounding);
 
+	{
+		DWORD VRAMUsed = 0, VRAMPeak = 0;
+		INT VRAMBlocks = 0;
+		appDCVRAMStats( VRAMUsed, VRAMPeak, VRAMBlocks );
+		debugf( "DCVRAM phase=%s used=%u peak=%u blocks=%d",
+			Phase, VRAMUsed, VRAMPeak, VRAMBlocks );
+	}
+
 	// Payload counters exclude TArray slack and object headers. Heap includes
 	// allocator overhead. Largest free block is deliberately not inferred.
 	debugf( "DCPROFILE phase=%s heap=%u sampled_peak=%u arena_free=%u vram=%u aica_samples=%u"
@@ -165,6 +349,13 @@ ENGINE_API void DCProfileMemory( const char* Phase )
 		PVR_GetVRAMUsed(), AICA_GetSampleBytes(), Bsp, Models, Lighting,
 		LightingStreamed, Meshes, MeshStreamed, Textures, Sounds,
 		DecodeCalls, DecodeBytes, BspCapacity );
-	appDCProfileObjects( Phase, 0 );
+	// Per-package attribution is O(packages * objects) with a parent walk each
+	// time, so it is worth it only where we actually need to know who owns the
+	// resident object graph: once the level is up, and once it is running.
+	appDCProfileObjects( Phase,
+		appStricmp( Phase, "level_ready" ) == 0
+		|| appStricmp( Phase, "play" ) == 0
+		|| appStricmp( Phase, "gameinfo_pre" ) == 0
+		|| appStricmp( Phase, "gameinfo_post" ) == 0 );
 }
 #endif

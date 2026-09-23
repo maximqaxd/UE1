@@ -7,6 +7,7 @@
 =============================================================================*/
 
 #include "RenderPrivate.h"
+#include "UnDCFrameProfile.h"
 
 // Parameters.
 #define SPRITE_PROJECTION_FORWARD 32.f /* Move sprite projection planes forward */
@@ -21,6 +22,7 @@
 void URender::SetupDynamics( FSceneNode* Frame, AActor* Exclude )
 {
 	guard(URender::SetupDynamics);
+	DC_FRAME_SCOPE(DCFS_Dynamics);
 	if
 	(	!(Frame->Level->Model->Nodes->Num())
 	||	!(Frame->Viewport->Actor->ShowFlags & SHOW_Actors) )

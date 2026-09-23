@@ -7,6 +7,7 @@
 =============================================================================*/
 
 #include "RenderPrivate.h"
+#include "UnDCFrameProfile.h"
 
 /*------------------------------------------------------------------------------
 	Globals.
@@ -402,6 +403,7 @@ void URender::DrawMesh
 )
 {
 	guard(URender::DrawMesh);
+	DC_FRAME_SCOPE(DCFS_Mesh);
 	STAT(uclock(GStat.MeshTime));
 	FMemMark Mark(GMem);
 	UMesh*  Mesh = Owner->Mesh;

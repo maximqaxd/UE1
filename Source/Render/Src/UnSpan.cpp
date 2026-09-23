@@ -4,6 +4,33 @@
 =============================================================================*/
 
 #include "RenderPrivate.h"
+#include "UnDCFrameProfile.h"
+
+// Aggregate locally: no profiler function calls in the span-walking loops.
+#if defined(PLATFORM_DREAMCAST)
+struct FDCSpanWork
+{
+    DWORD Links, Fragments;
+    const UBOOL Enabled;
+    FDCSpanWork()
+        : Links(0), Fragments(0),
+          Enabled(GDCFrameProfileEnabled && GDCFrameProfileDetailed) {}
+
+    ~FDCSpanWork()
+    {
+        if( Enabled )
+        {
+            DCFrameCount(DCFC_SpanLinks, Links);
+            DCFrameCount(DCFC_SpanFragments, Fragments);
+        }
+    }
+};
+#define DC_SPAN_VISIT() do { if( SpanWork.Enabled && ScreenSpan ) ++SpanWork.Links; } while(0)
+#define DC_SPAN_FRAGMENT() do { if( SpanWork.Enabled ) ++SpanWork.Fragments; } while(0)
+#else
+#define DC_SPAN_VISIT() do {} while(0)
+#define DC_SPAN_FRAGMENT() do {} while(0)
+#endif
 
 #define UPDATE_PREVLINK(START,END)\
 {\
@@ -17,6 +44,7 @@
 
 #define UPDATE_PREVLINK_ALLOC(START,END)\
 {\
+    DC_SPAN_FRAGMENT();\
     NewSpan         = New<FSpan>(*Mem,1,4);\
     *PrevLink       = NewSpan;\
     NewSpan->Start  = START;\
@@ -196,11 +224,18 @@ INT FSpanBuffer::BoxIsVisible( INT X1, INT Y1, INT X2, INT Y2 )
 INT FSpanBuffer::CopyFromRasterUpdate( FSpanBuffer& Screen, INT RasterStartY, INT RasterEndY, FRasterSpan* Raster )
 {
     guard(FSpanBuffer::CopyFromRasterUpdate);
+#if defined(PLATFORM_DREAMCAST)
+    DCFrameCount(DCFC_Spans, Max(0, RasterEndY - RasterStartY));
+#endif
+    DC_FRAME_SCOPE(DCFS_Span);
 
     FRasterSpan *Line;
     FSpan       **ScreenIndex,*NewScreenSpan,*NewSpan,*ScreenSpan,**PrevScreenLink;
     FSpan       **TempIndex,**PrevLink;
 	int			i,OurStart,OurEnd,Accept=0;
+#if defined(PLATFORM_DREAMCAST)
+    FDCSpanWork SpanWork;
+#endif
 
     if( StartY>RasterStartY || EndY<RasterEndY )
 	{
@@ -231,6 +266,7 @@ INT FSpanBuffer::CopyFromRasterUpdate( FSpanBuffer& Screen, INT RasterStartY, IN
     {
         PrevScreenLink  = ScreenIndex;
         ScreenSpan      = *(ScreenIndex++);
+        DC_SPAN_VISIT();
         PrevLink        = TempIndex++;
 
         // Skip if this screen span is already full, or if the raster is empty.
@@ -242,6 +278,7 @@ INT FSpanBuffer::CopyFromRasterUpdate( FSpanBuffer& Screen, INT RasterStartY, IN
         {
             PrevScreenLink  = &(ScreenSpan->Next);
             ScreenSpan      = ScreenSpan->Next;
+            DC_SPAN_VISIT();
             if( ScreenSpan == NULL )
 				goto NextLine; // This line is full.
         }
@@ -261,6 +298,7 @@ INT FSpanBuffer::CopyFromRasterUpdate( FSpanBuffer& Screen, INT RasterStartY, IN
             {
                 // Get memory for the new span.  Note that this may be drawing from
                 // the same memory pool as the destination.
+                DC_SPAN_FRAGMENT();
                 NewScreenSpan        = New<FSpan>(*Screen.Mem,1,4);
                 NewScreenSpan->Start = Line->X[1];
                 NewScreenSpan->End   = ScreenSpan->End;
@@ -280,6 +318,7 @@ INT FSpanBuffer::CopyFromRasterUpdate( FSpanBuffer& Screen, INT RasterStartY, IN
 
                 PrevScreenLink  = &(ScreenSpan->Next);
                 ScreenSpan      = ScreenSpan->Next;
+                DC_SPAN_VISIT();
                 if (ScreenSpan == NULL) goto NextLine; // Done (everything is clean).
             }
         }
@@ -297,6 +336,7 @@ INT FSpanBuffer::CopyFromRasterUpdate( FSpanBuffer& Screen, INT RasterStartY, IN
             // Delete this span from the span buffer.
             *PrevScreenLink = ScreenSpan->Next;
             ScreenSpan      = ScreenSpan->Next;
+            DC_SPAN_VISIT();
             Screen.ValidLines--;
             if( ScreenSpan==NULL )
 				goto NextLine; // Done (everything is clean).
@@ -341,11 +381,18 @@ INT FSpanBuffer::CopyFromRasterUpdate( FSpanBuffer& Screen, INT RasterStartY, IN
 INT FSpanBuffer::CopyFromRaster( FSpanBuffer& Screen, INT RasterStartY, INT RasterEndY, FRasterSpan* Raster )
 {
     guard(FSpanBuffer::CopyFromRaster);
+#if defined(PLATFORM_DREAMCAST)
+    DCFrameCount(DCFC_Spans, Max(0, RasterEndY - RasterStartY));
+#endif
+    DC_FRAME_SCOPE(DCFS_Span);
 
     FRasterSpan *Line;
     FSpan       **ScreenIndex,*ScreenSpan;
     FSpan       **TempIndex,**PrevLink,*NewSpan;
 	int			i,OurStart,OurEnd,Accept=0;
+#if defined(PLATFORM_DREAMCAST)
+    FDCSpanWork SpanWork;
+#endif
 
     OurStart = Max(RasterStartY,Screen.StartY);
     OurEnd   = Min(RasterEndY,Screen.EndY);
@@ -369,6 +416,7 @@ INT FSpanBuffer::CopyFromRaster( FSpanBuffer& Screen, INT RasterStartY, INT Rast
     for( i=OurStart; i<OurEnd; i++ )
     {
         ScreenSpan      = *(ScreenIndex++);
+        DC_SPAN_VISIT();
         PrevLink        = TempIndex++;
 
         if( !ScreenSpan || Line->X[1] <= Line->X[0] )
@@ -379,6 +427,7 @@ INT FSpanBuffer::CopyFromRaster( FSpanBuffer& Screen, INT RasterStartY, INT Rast
         while( ScreenSpan->End <= Line->X[0] )
         {
             ScreenSpan = ScreenSpan->Next;
+            DC_SPAN_VISIT();
             if( !ScreenSpan )
 				// This line is full.
 				goto NextLine;
@@ -394,6 +443,7 @@ INT FSpanBuffer::CopyFromRaster( FSpanBuffer& Screen, INT RasterStartY, INT Rast
             // Add partial chunk to temporary span buffer.
             UPDATE_PREVLINK_ALLOC(Line->X[0],Min(Line->X[1], ScreenSpan->End));
             ScreenSpan = ScreenSpan->Next;
+            DC_SPAN_VISIT();
             if( !ScreenSpan )
 				goto NextLine;
         }
@@ -408,6 +458,7 @@ INT FSpanBuffer::CopyFromRaster( FSpanBuffer& Screen, INT RasterStartY, INT Rast
             // Add entire chunk to temporary span buffer.
             UPDATE_PREVLINK_ALLOC(ScreenSpan->Start,ScreenSpan->End);
             ScreenSpan = ScreenSpan->Next;
+            DC_SPAN_VISIT();
             if( !ScreenSpan )
 				goto NextLine;
         }
@@ -467,6 +518,7 @@ INT FSpanBuffer::CopyFromRaster( FSpanBuffer& Screen, INT RasterStartY, INT Rast
 void FSpanBuffer::MergeWith( const FSpanBuffer& Other )
 {
     guard(FSpanBuffer::MergeWith);
+    DC_FRAME_SCOPE(DCFS_Span);
 
     // See if the existing span's index is large enough to hold the merged result.
     if( Other.StartY<StartY || Other.EndY>EndY )

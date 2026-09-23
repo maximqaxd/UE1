@@ -26,6 +26,11 @@ public:
 	virtual void Exit() = 0;
 };
 ENGINE_API FMovingBrushTrackerBase* GNewBrushTracker( ULevel* Level );
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+// Reserve dynamic-BSP headroom early, while the map arrays can still grow in
+// place. Idempotent; the brush tracker calls it too.
+ENGINE_API void DCReserveMoverBsp( ULevel* Level );
+#endif
 
 /*---------------------------------------------------------------------------------------
 	The End.

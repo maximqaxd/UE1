@@ -61,6 +61,22 @@ static void init_thread_stack(void) {
     }
 }
 
+static void DCCrashConsole()
+{
+	static UBOOL Switched = 0;
+	if( Switched )
+		return;
+	Switched = 1;
+
+	vid_set_mode( DM_640x480, PM_RGB565 );
+	dbgio_dev_select( "fb" );
+	// Default is a 32-pixel border, which leaves only 17 lines of 48 columns.
+	// 16 still clears CRT overscan but buys back a couple of lines, and a UE1
+	// guard chain needs every one of them.
+	dbgio_fb_set_target( NULL, 640, 480, 16, 16 );
+	dbgio_enable();
+}
+
 //
 // Report through the active serial/dcload device and lock up.
 //
@@ -74,9 +90,18 @@ void FatalError( const char* Fmt, ... )
 	vsnprintf( Msg, sizeof( Msg ), Fmt, Args );
 	va_end( Args );
 
+	// Report over whatever device is already attached before taking it away,
+	// so a developer on dcload still gets the log in natural reading order.
 	printf( "%s\n\n", Msg );
-
 	arch_stk_trace( 2 );
+
+	// Then say it again where a console owner can actually read it. The
+	// framebuffer console scrolls and only holds ~18 lines, so print the
+	// stack first and the message last: whatever overflows is then the tail
+	// of the trace rather than the error itself.
+	DCCrashConsole();
+	arch_stk_trace( 2 );
+	printf( "\n%s\n", Msg );
 
 	while (true)
 		thd_sleep( 100 );
@@ -92,9 +117,18 @@ void HandleAssertFail( const char* File, int Line, const char* Expr, const char*
 
 void HandleIrqException( irq_t Code, irq_context_t* Context, void* Data )
 {
-	printf( "UNHANDLED EXCEPTION 0x%08x\n", Code );
-	printf( "PC: %p PR: %p\n", (void*)Context->pc, (void*)Context->pr );
-	printf( "SR: %p R0: %p\n", (void*)Context->sr, (void*)Context->r[0] );
+	// Report twice: once over dcload/serial if it is attached, then again on
+	// the television, which is the only output a stock console has. The
+	// registers are captured before the first print so the framebuffer switch
+	// cannot lose them if it misbehaves.
+	for( INT Pass = 0; Pass < 2; ++Pass )
+	{
+		if( Pass )
+			DCCrashConsole();
+		printf( "UNHANDLED EXCEPTION 0x%08x\n", Code );
+		printf( "PC: %p PR: %p\n", (void*)Context->pc, (void*)Context->pr );
+		printf( "SR: %p R0: %p\n", (void*)Context->sr, (void*)Context->r[0] );
+	}
 
 	// The exception may have followed memory corruption, so the interrupted
 	// frame pointer cannot be trusted. Walking it can replace the original

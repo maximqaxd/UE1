@@ -25,10 +25,26 @@ class DLL_EXPORT UPVRRenderDevice : public URenderDevice
 	static constexpr INT MaxMipLevel = 0;
 	static constexpr INT MinTexSize = 8;
 
+	static constexpr INT AtlasPageDim  = 256;                        // texels/side
+	static constexpr INT AtlasSlotDim  = MinTexSize;                 // 8
+	static constexpr INT AtlasSlots    = AtlasPageDim / AtlasSlotDim;// 32x32 grid
+	static constexpr INT AtlasMaxTile  = 64;   // wider/taller tiles stay private
+	static constexpr INT AtlasPageMax  = 2;    // 128KB each
+
+	struct FLightAtlasPage
+	{
+		pvr_ptr_t Tex;
+		DWORD     Rows[AtlasSlots];  // occupancy, one bit per slot column
+		INT       SlotsUsed;
+	};
+	FLightAtlasPage AtlasPages[AtlasPageMax];
+	INT AtlasPageCount;
+
 	// Options.
 	UBOOL NoFiltering;
 	UBOOL UseTriStrips;
 	UBOOL DistanceFog;
+	UBOOL Overbright;
 	UBOOL VolumetricFog;
 	INT   FogDistanceDefault;
 	INT   CommandBufferKB;
@@ -46,8 +62,15 @@ class DLL_EXPORT UPVRRenderDevice : public URenderDevice
 		DWORD LastUsedFrame;
 		INT PaletteBank;
 		UBOOL PaletteMasked;
+		INT AtlasPage;
+		INT AtlasX, AtlasY;
 	};
 	TMap<QWORD, FTexBind> BindMap;
+
+	static UBOOL IsAtlased( const FTexBind* Bind )
+	{
+		return Bind && Bind->AtlasPage >= 0;
+	}
 
 	struct FPaletteBank
 	{
@@ -129,6 +152,19 @@ class DLL_EXPORT UPVRRenderDevice : public URenderDevice
 		DWORD StaticLightmapCold;
 		DWORD StaticLightmapReload;
 		DWORD StaticLightmapRetype;
+		// Cooked (already-RGB565) lightmaps. The Static*/Dynamic* counters
+		// above only see TEXF_BGRA8_LM, so without these the cooked path --
+		// which is most of the world -- reports nothing at all.
+		DWORD CookedLightmapCold;    // first upload of this lightmap
+		DWORD CookedLightmapReload;  // uploaded again after being evicted
+		DWORD CookedLightmapBytes;
+		DWORD CookedLightmapCycles;
+		DWORD AtlasInserts;          // tiles newly placed into a shared page
+		DWORD AtlasUpdates;          // dynamic tiles rewritten into their slot
+		DWORD AtlasBlocks;           // 8x8 stores those tiles cost
+		DWORD AtlasOversize;         // too big for a page; kept private
+		DWORD AtlasNoSpace;          // pages full even after evicting
+		DWORD AtlasEvictions;        // slots reclaimed from stale tiles
 	} TextureCPUProfile;
 
 	struct FCachedSceneNode
@@ -175,6 +211,12 @@ class DLL_EXPORT UPVRRenderDevice : public URenderDevice
 	INT AcquirePaletteBank( const FTextureInfo& Info, UBOOL Masked );
 	void UploadPalette( INT Bank, const FTextureInfo& Info, UBOOL Masked );
 	pvr_ptr_t AllocateTexture( INT Size );
+	void  ApplyAtlasTransform( const FTexBind* Bind );
+	UBOOL LightAtlasPlace( FTexBind* Bind, INT USize, INT VSize );
+	INT   LightAtlasReclaim( const FTexBind* Keep );
+	void  LightAtlasStore( const FTexBind* Bind, INT USize, INT VSize, const _WORD* Pixels );
+	void  LightAtlasRelease( FTexBind* Bind );
+	void  LightAtlasFlush();
 	void EnsureComposeSize( const DWORD NewSize );
 	void* TwiddleTextureMipP8( const FMipmap* Mip );
 	void* ConvertTextureMipI8( const FMipmap* Mip, const FColor* Palette );

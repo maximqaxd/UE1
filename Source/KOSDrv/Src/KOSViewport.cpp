@@ -12,25 +12,77 @@ IMPLEMENT_CLASS( UKOSViewport );
 	UKOSViewport implementation.
 -----------------------------------------------------------------------------*/
 
-const BYTE UKOSViewport::JoyBtnMap[MAX_JOY_BTNS] =
+enum EDreamcastJoyAction
 {
-	/* CONT_C           */ IK_None,   // IK_Joy5,
-	/* CONT_B           */ IK_Space,  // IK_Joy2,
-	/* CONT_A           */ IK_Enter,  // IK_Joy1,
-	/* CONT_START       */ IK_Escape, // IK_Joy7,
-	/* CONT_DPAD_UP     */ IK_Up,     // IK_JoyPovUp,
-	/* CONT_DPAD_DOWN   */ IK_Down,   // IK_JoyPovDown,
-	/* CONT_DPAD_LEFT   */ IK_Left,   // IK_JoyPovLeft,
-	/* CONT_DPAD_RIGHT  */ IK_Right,  // IK_JoyPovRight,
-	/* CONT_Z           */ IK_Joy6,
-	/* CONT_Y           */ IK_Shift,  // IK_Joy4,
-	/* CONT_X           */ IK_Ctrl,   // IK_Joy3,
-	/* CONT_D           */ IK_Joy8,
-	/* CONT_DPAD2_UP    */ IK_Joy9,
-	/* CONT_DPAD2_DOWN  */ IK_Joy10,
-	/* CONT_DPAD2_LEFT  */ IK_Joy11,
-	/* CONT_DPAD2_RIGHT */ IK_Joy12,
+	DCJA_MoveForward,
+	DCJA_MoveBackward,
+	DCJA_StrafeLeft,
+	DCJA_StrafeRight,
+	DCJA_Jump,
+	DCJA_Duck,
+	DCJA_ShowMenu,
+	DCJA_InventoryPrevious,
+	DCJA_InventoryNext,
+	DCJA_AltFire,
+	DCJA_Fire,
+	DCJA_Translator,
+	DCJA_InventoryActivate,
+	DCJA_PreviousWeapon,
+	DCJA_NextWeapon,
+	DCJA_UIAccept,
+	DCJA_UICancel,
+	DCJA_UIUp,
+	DCJA_UIDown,
+	DCJA_UILeft,
+	DCJA_UIRight,
 };
+
+const BYTE UKOSViewport::JoyActionMap[MAX_JOY_ACTIONS] =
+{
+	IK_Joy1,
+	IK_Joy2,
+	IK_Joy3,
+	IK_Joy4,
+	IK_Joy5,
+	IK_Joy6,
+	IK_Joy7,
+	IK_Joy8,
+	IK_Joy9,
+	IK_Joy10,
+	IK_Joy11,
+	IK_Joy12,
+	IK_Joy13,
+	IK_Joy14,
+	IK_Joy15,
+	IK_Enter,
+	IK_Escape,
+	IK_Up,
+	IK_Down,
+	IK_Left,
+	IK_Right,
+};
+
+static FLOAT ApplyDreamcastDeadZone( INT Value, FLOAT DeadZone )
+{
+	const FLOAT Normalized = Clamp( Value / 127.f, -1.f, 1.f );
+	const FLOAT Magnitude = Abs(Normalized);
+	const FLOAT ClampedDeadZone = Clamp( DeadZone, 0.f, 0.95f );
+	if( Magnitude <= ClampedDeadZone )
+		return 0.f;
+
+	const FLOAT Rescaled = ( Magnitude - ClampedDeadZone ) / ( 1.f - ClampedDeadZone );
+	return Normalized < 0.f ? -Rescaled : Rescaled;
+}
+
+static void UpdateDreamcastTrigger( UBOOL& Down, INT Value )
+{
+	const INT PressThreshold = 32;
+	const INT ReleaseThreshold = 24;
+	if( Down )
+		Down = Value > ReleaseThreshold;
+	else
+		Down = Value >= PressThreshold;
+}
 
 BYTE UKOSViewport::KeyMap[MAX_KBD_KEYS];
 
@@ -88,8 +140,14 @@ UKOSViewport::UKOSViewport( ULevel* InLevel, UKOSClient* InClient )
 	Caps = 0;
 	appMemset( KeyState, 0, sizeof(KeyState) );
 	appMemset( KeyStatePrev, 0, sizeof(KeyStatePrev) );
-	JoyState = 0;
-	JoyStatePrev = 0;
+	JoyActionState = 0;
+#if defined(PLATFORM_DREAMCAST)
+	ProfilePreviousButtons = 0;
+	ProfileChordActive = false;
+#endif
+	LeftTriggerDown = false;
+	RightTriggerDown = false;
+	MenuStartArmed = true;
 	InputUpdateTime = appSeconds();
 	SavedX = 0;
 	SavedY = 0;
@@ -373,8 +431,14 @@ void UKOSViewport::UpdateInput( UBOOL Reset )
 	{
 		appMemset( KeyState, 0, sizeof(KeyState) );
 		appMemset( KeyStatePrev, 0, sizeof(KeyStatePrev) );
-		JoyState = 0;
-		JoyStatePrev = 0;
+		SetJoyActionState( 0 );
+		LeftTriggerDown = false;
+		RightTriggerDown = false;
+		MenuStartArmed = true;
+#if defined(PLATFORM_DREAMCAST)
+		ProfilePreviousButtons = 0;
+		ProfileChordActive = false;
+#endif
 
 		maple_device_t* Keyboard = maple_enum_type( 0, MAPLE_FUNC_KEYBOARD );
 		if( Keyboard )
@@ -393,8 +457,8 @@ void UKOSViewport::UpdateInput( UBOOL Reset )
 			cont_state_t* State = (cont_state_t*)maple_dev_status( Controller );
 			if( State )
 			{
-				JoyState = State->buttons;
-				JoyStatePrev = State->buttons;
+				UpdateDreamcastTrigger( LeftTriggerDown, State->ltrig );
+				UpdateDreamcastTrigger( RightTriggerDown, State->rtrig );
 			}
 		}
 		InputUpdateTime = appSeconds();
@@ -427,33 +491,143 @@ UBOOL UKOSViewport::CauseInputEvent( INT iKey, EInputAction Action, FLOAT Delta 
 	unguard;
 }
 
+void UKOSViewport::SetJoyActionState( DWORD NewActionState )
+{
+	const DWORD ChangedActions = NewActionState ^ JoyActionState;
+	for( DWORD Action = 0; Action < MAX_JOY_ACTIONS; ++Action )
+	{
+		const DWORD Mask = 1U << Action;
+		if( ChangedActions & Mask )
+		{
+			const EInputAction Event = ( NewActionState & Mask ) ? IST_Press : IST_Release;
+			CauseInputEvent( JoyActionMap[Action], Event );
+		}
+	}
+	JoyActionState = NewActionState;
+}
+
 void UKOSViewport::TickJoystick( maple_device_t* Dev, const FLOAT DeltaTime )
 {
 	cont_state_t* State = (cont_state_t*)maple_dev_status( Dev );
 	if( !State )
-		return;
-
-	// Emit button events
-	JoyStatePrev = JoyState;
-	JoyState = State->buttons;
-	const DWORD Xor = JoyState ^ JoyStatePrev;
-	for( DWORD Bit = 0; Bit < MAX_JOY_BTNS; ++Bit )
 	{
-		const DWORD Mask = ( 1U << Bit );
-		if( Xor & Mask )
+		SetJoyActionState( 0 );
+		LeftTriggerDown = false;
+		RightTriggerDown = false;
+		MenuStartArmed = true;
+#if defined(PLATFORM_DREAMCAST)
+		ProfilePreviousButtons = 0;
+		ProfileChordActive = false;
+#endif
+		return;
+	}
+
+	UpdateDreamcastTrigger( LeftTriggerDown, State->ltrig );
+	UpdateDreamcastTrigger( RightTriggerDown, State->rtrig );
+
+#if defined(PLATFORM_DREAMCAST)
+	// Right trigger + D-pad controls the profiler. Right trigger alone still
+	// fires, so simultaneous input is needed to avoid a shot before the chord.
+	// Consume the release tail so releasing the D-pad first cannot resume fire.
+	const DWORD ProfilePressed = State->buttons & ~ProfilePreviousButtons;
+	ProfilePreviousButtons = State->buttons;
+	const DWORD ProfileDirections = CONT_DPAD_UP | CONT_DPAD_DOWN
+		| CONT_DPAD_LEFT | CONT_DPAD_RIGHT;
+	const UBOOL ProfileModifier = RightTriggerDown;
+	if( ProfileModifier && (State->buttons & ProfileDirections) )
+		ProfileChordActive = true;
+	if( ProfileChordActive )
+	{
+		SetJoyActionState(0);
+		MenuStartArmed = false;
+		if( ProfileModifier && RenDev )
 		{
-			if( JoyState & Mask )
-				CauseInputEvent( JoyBtnMap[Bit], IST_Press );
-			else
-				CauseInputEvent( JoyBtnMap[Bit], IST_Release );
+			// One command per press; a diagonal cannot toggle two settings.
+			if( ProfilePressed & CONT_DPAD_RIGHT ) RenDev->Exec("DCPPAGE", GSystem);
+			else if( ProfilePressed & CONT_DPAD_UP ) RenDev->Exec("DCPDUMP", GSystem);
+			else if( ProfilePressed & CONT_DPAD_DOWN ) RenDev->Exec("DCPOVERLAY", GSystem);
+			else if( ProfilePressed & CONT_DPAD_LEFT ) RenDev->Exec("DCPDETAIL", GSystem);
+		}
+		if( !State->buttons && !LeftTriggerDown && !RightTriggerDown )
+		{
+			ProfileChordActive = false;
+			MenuStartArmed = true;
+		}
+		return;
+	}
+#endif
+
+	const UBOOL InMenu = Console
+		&& ((UObject*)Console)->GetMainFrame()
+		&& ((UObject*)Console)->GetMainFrame()->StateNode
+		&& ((UObject*)Console)->GetMainFrame()->StateNode->GetFName() == "Menuing";
+
+	DWORD NewActionState = 0;
+	#define DC_ACTION(Action, Condition) \
+		do { if( Condition ) NewActionState |= 1U << (Action); } while( 0 )
+
+	if( InMenu )
+	{
+		DC_ACTION( DCJA_UIAccept, State->buttons & CONT_A );
+		DC_ACTION( DCJA_UICancel, ( State->buttons & CONT_B )
+			|| ( MenuStartArmed && ( State->buttons & CONT_START ) ) );
+		DC_ACTION( DCJA_UIUp, State->buttons & CONT_DPAD_UP );
+		DC_ACTION( DCJA_UIDown, State->buttons & CONT_DPAD_DOWN );
+		DC_ACTION( DCJA_UILeft, State->buttons & CONT_DPAD_LEFT );
+		DC_ACTION( DCJA_UIRight, State->buttons & CONT_DPAD_RIGHT );
+		if( !( State->buttons & CONT_START ) )
+			MenuStartArmed = true;
+	}
+	else
+	{
+		DC_ACTION( DCJA_ShowMenu, State->buttons & CONT_START );
+		if( State->buttons & CONT_START )
+			MenuStartArmed = false;
+		DC_ACTION( DCJA_Translator, State->buttons & CONT_DPAD_UP );
+		DC_ACTION( DCJA_InventoryActivate, State->buttons & CONT_DPAD_DOWN );
+		DC_ACTION( DCJA_PreviousWeapon, State->buttons & CONT_DPAD_LEFT );
+		DC_ACTION( DCJA_NextWeapon, State->buttons & CONT_DPAD_RIGHT );
+
+		if( LeftTriggerDown )
+		{
+			DC_ACTION( DCJA_Jump, State->buttons & CONT_Y );
+			DC_ACTION( DCJA_Duck, State->buttons & CONT_A );
+			DC_ACTION( DCJA_InventoryPrevious, State->buttons & CONT_X );
+			DC_ACTION( DCJA_InventoryNext, State->buttons & CONT_B );
+			DC_ACTION( DCJA_AltFire, RightTriggerDown );
+		}
+		else
+		{
+			DC_ACTION( DCJA_MoveForward, State->buttons & CONT_Y );
+			DC_ACTION( DCJA_MoveBackward, State->buttons & CONT_A );
+			DC_ACTION( DCJA_StrafeLeft, State->buttons & CONT_X );
+			DC_ACTION( DCJA_StrafeRight, State->buttons & CONT_B );
+			DC_ACTION( DCJA_Fire, RightTriggerDown );
 		}
 	}
 
+	#undef DC_ACTION
+
+	SetJoyActionState( NewActionState );
+
 	// Reset sequence
-	if( ( JoyState & CONT_RESET_BUTTONS ) == CONT_RESET_BUTTONS )
+	if( ( State->buttons & CONT_RESET_BUTTONS ) == CONT_RESET_BUTTONS )
 		QuitRequested = true;
 
-	// TODO: Stick/triggers
+	if( !InMenu )
+	{
+		const FLOAT CameraX = ApplyDreamcastDeadZone( State->joyx, Client->DeadZoneRUV );
+		const FLOAT CameraY = ApplyDreamcastDeadZone( State->joyy, Client->DeadZoneRUV );
+		const FLOAT AxisDeltaTime = Clamp( DeltaTime, 0.f, 0.1f );
+		const FLOAT AxisScale = Client->ScaleRUV * 60.f * AxisDeltaTime;
+		if( CameraX )
+			CauseInputEvent( IK_JoyU, IST_Axis, CameraX * AxisScale );
+		if( CameraY )
+		{
+			const FLOAT VerticalScale = Client->InvertV ? -AxisScale : AxisScale;
+			CauseInputEvent( IK_JoyV, IST_Axis, CameraY * VerticalScale );
+		}
+	}
 }
 
 void UKOSViewport::TickKeyboard( maple_device_t* Dev, const FLOAT DeltaTime )
@@ -497,10 +671,21 @@ UBOOL UKOSViewport::TickInput()
 	if ( Dev )
 		TickKeyboard( Dev, DeltaTime );
 
-	// Check joystick
-	Dev = maple_enum_type( 0, MAPLE_FUNC_CONTROLLER );
+	// Check joystick.
+	Dev = Client->UseJoystick ? maple_enum_type( 0, MAPLE_FUNC_CONTROLLER ) : NULL;
 	if( Dev )
 		TickJoystick( Dev, DeltaTime );
+	else
+	{
+		SetJoyActionState( 0 );
+		LeftTriggerDown = false;
+		RightTriggerDown = false;
+		MenuStartArmed = true;
+#if defined(PLATFORM_DREAMCAST)
+		ProfilePreviousButtons = 0;
+		ProfileChordActive = false;
+#endif
+	}
 
 	InputUpdateTime = CurTime;
 

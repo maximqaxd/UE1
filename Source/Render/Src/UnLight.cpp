@@ -98,6 +98,7 @@ Revision history:
 =============================================================================*/
 
 #include "RenderPrivate.h"
+#include "UnDCFrameProfile.h"
 #include <math.h>
 
 #define SHADOW_SMOOTHING 1 /* Smooth shadows (should be 1) */
@@ -1556,6 +1557,7 @@ void FLightManager::SetupForSurf
 )
 {
 	guard(FLightManager::SetupForSurf);
+	DC_FRAME_SCOPE(DCFS_Light);
 	STAT(uclock(GStat.IllumTime));
 	INT Key=0;
 
@@ -1880,6 +1882,7 @@ void FLightManager::SetupForSurf
 		const FDCLightmapEntry* Cooked = Level->FindDCLightmap( iLightMap, ZoneID );
 		if( Cooked )
 		{
+			DC_FRAME_COUNT(DCFC_LightCooked);
 			static FColor White(255,255,255,255);
 			LightMip.USize = Cooked->USize;
 			LightMip.VSize = Cooked->VSize;
@@ -1913,6 +1916,8 @@ void FLightManager::SetupForSurf
 	}
 	if( !Stream || StaticLightingChanged )
 	{
+		DC_FRAME_COUNT(DCFC_LightStaticBuild);
+		DC_FRAME_SCOPE(DCFS_LightStaticBuild);
 		// Setup caching.
 		guard(StaticLighting);
 		StaticLightingChanged=1;
@@ -1964,6 +1969,7 @@ void FLightManager::SetupForSurf
 	}
 	else
 	{
+		DC_FRAME_COUNT(DCFC_LightStaticHit);
 		Stream += sizeof(FMoverStamp)/sizeof(DWORD);
 		LightMap.MaxColor = (FColor*)Stream++;
 	}
@@ -1976,6 +1982,7 @@ void FLightManager::SetupForSurf
 		LightMap.CacheID = MakeCacheID( CID_DynamicMap, iLightMap, ZoneID, Model );
 		if( Merged )
 		{
+			DC_FRAME_COUNT(DCFC_LightMerged);
 			// Allocate in temporary memory.
 			Stream = New<DWORD>(GMem,LightMap.USize*LightMap.VSize+1);
 			LightMap.MaxColor = (FColor*)Stream++;
@@ -1992,6 +1999,9 @@ void FLightManager::SetupForSurf
 			Stream = (DWORD*)GCache.Get( LightMap.CacheID, *TopItemToUnlock++ );
 			if( !Stream || *(DOUBLE*)Stream != DynamicLightTime )
 			{
+#if defined(PLATFORM_DREAMCAST)
+				DCFrameCount(Stream ? DCFC_LightDynamicExpired : DCFC_LightDynamicMiss);
+#endif
 				if( !Stream )
 					Stream = (DWORD*)GCache.Create( LightMap.CacheID, TopItemToUnlock[-1], (LightMap.USize*LightMap.VClamp + 3) * sizeof(DWORD), DEFAULT_ALIGNMENT, LightMap.USize*(LightMap.VSize-LightMap.VClamp) );
 				*(DOUBLE*)Stream = DynamicLightTime;
@@ -2000,11 +2010,13 @@ void FLightManager::SetupForSurf
 			}
 			else
 			{
+				DC_FRAME_COUNT(DCFC_LightDynamicHit);
 				Stream += 2;
 				LightMap.MaxColor = (FColor*)Stream++;
 				goto SkipDynamicLight;
 			}
 		}
+		DC_FRAME_SCOPE(DCFS_LightDynamicBuild);
 		*LightMap.MaxColor = FColor(255,255,255,255);
 
 		// Copy the static lighting.
