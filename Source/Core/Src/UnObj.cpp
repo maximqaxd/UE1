@@ -2507,9 +2507,19 @@ UBOOL FObjectManager::SavePackage( UObject* InParent, UObject* Base, DWORD TopLe
 
 		// Save heritage.
 		guard(SaveHeritage);
+#if defined(DC_RESOURCE_COOKER)
+		// The resource importer supplies the retail package's last GUID.
+		// Reusing it makes independent package imports reproducible and keeps
+		// the cooked package compatible with references to that package.
+		if( AddGuid )
+			Linker->Heritage.AddItem( *AddGuid );
+		else
+			Linker->Heritage.AddItem( appCreateGuid() );
+#else
 		if( AddGuid )
 			Linker->Heritage.AddUniqueItem( *AddGuid );
 		Linker->Heritage.AddItem( appCreateGuid() );
+#endif
 		Linker->Summary.HeritageCount = Linker->Heritage.Num();
 		Linker->Summary.HeritageOffset = Linker->Tell();
 		for( INT i=0; i<Linker->Heritage.Num(); i++ )

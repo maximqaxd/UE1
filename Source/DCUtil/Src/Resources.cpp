@@ -480,8 +480,22 @@ void FDCUtil::ProcessResources( const char* PackagePath, const char* ResourceDir
 				Source->ExportMap(i)._Object->SetFlags( RF_Standalone );
 			}
 		}
+		// Bitmap.InternalTime is serialized even though PostLoad replaces it.
+		// A process-clock value here made otherwise identical imports differ.
+		for( TObjectIterator<UTexture> It; It; ++It )
+		{
+			if( It->IsIn( Package ) )
+			{
+				It->LastUpdateTime = 0.0;
+			}
+		}
 
-		if( !GObj.SavePackage( Package, NULL, RF_Standalone, OutPath ) )
+		if( !Source->Heritage.Num() )
+		{
+			appErrorf( "Source package has no GUID: %s", PackagePath );
+		}
+		const FGuid SourceGuid = Source->Heritage(Source->Heritage.Num() - 1);
+		if( !GObj.SavePackage( Package, NULL, RF_Standalone, OutPath, 0, &SourceGuid ) )
 		{
 			appErrorf( "Cannot save cooked package %s", OutPath );
 		}

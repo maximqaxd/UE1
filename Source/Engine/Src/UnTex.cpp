@@ -264,6 +264,13 @@ void UTexture::GetInfo( FTextureInfo& TextureInfo, DOUBLE CurrentTime )
 	if( Format == TEXF_EXT_DCANIM )
 	{
 		const INT Frame = Mips.Num() ? PrimeCurrent % Mips.Num() : 0;
+		// Each cooked frame is immutable. Give it a distinct PVR cache key so
+		// returning to an earlier frame reuses its VRAM image instead of
+		// rereading the same DT slice from the DAT on every animation cycle.
+		// The object index occupies the high word; bits 8..23 are otherwise
+		// unused by the normal CID_RenderTexture key.
+		TextureInfo.CacheID |= (QWORD)(Frame + 1) << 8;
+		TextureInfo.TextureFlags &= ~TF_RealtimeChanged;
 		TextureInfo.Mips[0] = Mips.Num() ? &Mips(Frame) : NULL;
 		if( TextureInfo.Mips[0] )
 		{
