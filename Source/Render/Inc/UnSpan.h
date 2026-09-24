@@ -99,6 +99,13 @@ public:
 	// Grabbing and updating from rasterizations.
 	INT CopyFromRaster( FSpanBuffer& ScreenSpanBuffer, INT RasterStartY, INT RasterEndY, FRasterSpan* Raster );
 	INT CopyFromRasterUpdate( FSpanBuffer& ScreenSpanBuffer, INT RasterStartY, INT RasterEndY, FRasterSpan* Raster );
+#if defined(PLATFORM_DREAMCAST)
+	// Hardware BSP rendering does not consume the visible fragment list for
+	// ordinary polygons. These variants preserve visibility and screen updates
+	// without allocating a throwaway output span buffer.
+	INT TestRaster( INT RasterStartY, INT RasterEndY, FRasterSpan* Raster );
+	INT TestRasterUpdate( INT RasterStartY, INT RasterEndY, FRasterSpan* Raster );
+#endif
 
 	// Occlusion.
 	INT BoxIsVisible( INT X1, INT Y1, INT X2, INT Y2 );
@@ -109,6 +116,7 @@ public:
 	void AssertValid( char* Name );
 	void AssertGoodEnough( char* Name );
 };
+
 
 /*------------------------------------------------------------------------------------
 	The End.

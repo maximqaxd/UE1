@@ -27,7 +27,7 @@ overlaps CPU execution. TA KB comes from the same KOS statistics snapshot.
 Collection uses fixed static storage, no heap allocations, and integer KOS
 microsecond timestamps. Timers have overhead, particularly for many tiny atlas
 uploads. Compare the same scene with the profiler off before treating small
-differences as improvements. This first version does not attribute DAT I/O,
+differences as improvements. This profiler does not attribute every DAT read,
 individual script functions, mesh decode, or audio separately, and does not
 provide percentiles or hardware cache-miss counters.
 
@@ -38,13 +38,19 @@ visits, `polys` counts ClipBspSurf calls, `pts` counts its point-cache misses,
 and `spans` counts requested raster rows passed to span-copy routines (not actual
 span fragments or pixels). These workload counters are averages per tick.
 
-Texture `read` covers streamed mip reads and cooked lightmap reads; it does not
+Texture `read` covers streamed mip reads and cooked lightmap reads. The `DT`
+and `LM` fields split those two sources by average milliseconds and KiB per
+tick. `read` is inside `tex`, so those times must not be added. A high read
+time with few KiB suggests seek/latency, whereas a large KiB count can indicate
+transfer bandwidth or too many uploads. These fields do not
 cover every engine DAT reader or the legacy package-file fallback. `inflate`
 covers cooked-lightmap zlib decoding, `alloc` covers AllocateTexture (including
 its eviction search), and `place` covers atlas placement (including new page
 allocation). `twid+SQ` includes atlas block twiddling and its uploads. `cold`
 means a new texture binding and `reload` means any upload for an existing binding,
 including realtime updates. `evict` counts reclaimed atlas bindings only.
+`vramEv` counts private texture allocations evicted when VRAM allocation
+fails; a zero atlas count does not rule out private lightmap eviction.
 
 `DCLEGACYTIMERS` toggles the old uclock/uunclock timers, off by default on DC.
 The non-DC macros are unchanged. DC no longer applies the old hardcoded 34-unit
@@ -61,12 +67,26 @@ frames before changing compression or residency.
 
 ## Detailed visibility and lighting investigation
 
-`DCPPAGE` cycles three nine-line pages: overview, visibility, lighting.
+`DCPPAGE` cycles four nine-line pages: overview, visibility, lighting, mesh.
 `DCPDUMP` prints the last completed 30-tick window for all pages on demand.
 No per-frame serial output is added. Counts are averages per engine tick.
 
 Controller: hold **right trigger** and tap D-pad:
 right = next page, up = dump to log, down = overlay toggle, left = detail toggle.
+Hold **both triggers** and tap D-pad right to cycle BSP span modes. Mode 0 is
+the original path. Mode 1 is the default: it updates occlusion without allocating discarded
+output fragments for ordinary hardware polygons. Mode 2 additionally bypasses
+opaque BSP span tests and updates for a diagnostic A/B measurement; it can
+render portals or hidden geometry incorrectly and must not be used as a
+production visibility mode. The visibility page shows the current mode and
+output/split/bypass counts. `DCSPANMODE 0`, `1`, or `2` also selects a mode via
+the console. Switching modes clears the profiling window.
+Hold **both triggers** and tap D-pad up to cycle stationary dynamic-lightmap
+rates through 5, 10 and 15 Hz; 5 Hz is the default. Moving lights still
+update every frame. `DCLIGHTRATE 5`, `10`, or `15` selects a rate explicitly.
+The lighting page displays the selected rate. The visibility page reports
+polygon-header compilation time and upload counts for unchanged versus
+changed header state. In-place atlas updates should leave headers valid.
 Works in gameplay and menus. Commands are press-edge driven, without repeat.
 Gameplay/menu input and stick look are suppressed during the chord. Release all
 buttons and both triggers to resume normal input. Right trigger alone still
@@ -81,7 +101,8 @@ Start retains its normal menu behavior outside the chord.
   lookup path; transformed-point counts still cover ClipBspSurf cache misses only.
 - Rows are requested scanlines, not pixels. Span links count non-null list nodes
   reached through row-head or Next reads in CopyFromRaster/CopyFromRasterUpdate.
-  Fragments count output allocations plus screen-span splits in those two routines.
+  Output and split counters separate the two allocation types. The older
+  aggregate fragment count includes both in the original routines.
   They exclude MergeWith allocations and other span-buffer construction. Work
   counts include non-BSP callers. Span rejects, however, are counted at the BSP
   call site when a polygon returns no visible coverage (polygon attempts, not
@@ -90,9 +111,16 @@ Start retains its normal menu behavior outside the chord.
 - Lighting reports cooked hits, static builds/hits, dynamic cache misses,
   expired timestamps, reused timestamps, and uncached merged regeneration.
   Static and dynamic counts can both increase for one surface setup.
+  Static misses mean the base map was absent from the 256 KiB cache;
+  invalidations mean it was present but a mover or changed light forced a rebuild.
+  Cache-create time and count cover static and dynamic lightmap allocations.
   Static build timing covers regeneration including its cache allocation;
   dynamic build timing starts after its cache decision/allocation and covers
   copying the static base, illumination and merging, including merged surfaces.
+- For a lighting-rate comparison, hold the camera still for two 30-tick
+  windows after each `DCLIGHTRATE` change. Compare dynamic expired/hit,
+  changed uploads, header compile time, and total frame time. Moving-light
+  surfaces deliberately remain uncapped.
 - Existing-binding upload reasons are mutually exclusive, in priority order:
   missing residency, realtime changed, palette changed, invalid palette bank.
   Cold bindings are counted separately. Lightmap uploads are a cross-cutting

@@ -1,7 +1,6 @@
 #include <string.h>
 #include <ctype.h>
 #include <kos.h>
-#include "GL/glkos.h"
 
 #include "KOSDrv.h"
 #include "UnRender.h"
@@ -543,8 +542,10 @@ void UKOSViewport::TickJoystick( maple_device_t* Dev, const FLOAT DeltaTime )
 		if( ProfileModifier && RenDev )
 		{
 			// One command per press; a diagonal cannot toggle two settings.
-			if( ProfilePressed & CONT_DPAD_RIGHT ) RenDev->Exec("DCPPAGE", GSystem);
-			else if( ProfilePressed & CONT_DPAD_UP ) RenDev->Exec("DCPDUMP", GSystem);
+			if( ProfilePressed & CONT_DPAD_RIGHT )
+				RenDev->Exec( LeftTriggerDown ? "DCSPANMODE" : "DCPPAGE", GSystem );
+			else if( ProfilePressed & CONT_DPAD_UP )
+				RenDev->Exec(LeftTriggerDown ? "DCLIGHTRATE" : "DCPDUMP", GSystem);
 			else if( ProfilePressed & CONT_DPAD_DOWN ) RenDev->Exec("DCPOVERLAY", GSystem);
 			else if( ProfilePressed & CONT_DPAD_LEFT ) RenDev->Exec("DCPDETAIL", GSystem);
 		}

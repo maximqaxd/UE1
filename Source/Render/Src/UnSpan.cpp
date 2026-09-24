@@ -10,10 +10,10 @@
 #if defined(PLATFORM_DREAMCAST)
 struct FDCSpanWork
 {
-    DWORD Links, Fragments;
+    DWORD Links, Fragments, Outputs, ScreenSplits;
     const UBOOL Enabled;
     FDCSpanWork()
-        : Links(0), Fragments(0),
+        : Links(0), Fragments(0), Outputs(0), ScreenSplits(0),
           Enabled(GDCFrameProfileEnabled && GDCFrameProfileDetailed) {}
 
     ~FDCSpanWork()
@@ -22,14 +22,20 @@ struct FDCSpanWork
         {
             DCFrameCount(DCFC_SpanLinks, Links);
             DCFrameCount(DCFC_SpanFragments, Fragments);
+            DCFrameCount(DCFC_SpanOutputs, Outputs);
+            DCFrameCount(DCFC_SpanScreenSplits, ScreenSplits);
         }
     }
 };
 #define DC_SPAN_VISIT() do { if( SpanWork.Enabled && ScreenSpan ) ++SpanWork.Links; } while(0)
 #define DC_SPAN_FRAGMENT() do { if( SpanWork.Enabled ) ++SpanWork.Fragments; } while(0)
+#define DC_SPAN_OUTPUT() do { if( SpanWork.Enabled ) ++SpanWork.Outputs; } while(0)
+#define DC_SPAN_SPLIT() do { if( SpanWork.Enabled ) ++SpanWork.ScreenSplits; } while(0)
 #else
 #define DC_SPAN_VISIT() do {} while(0)
 #define DC_SPAN_FRAGMENT() do {} while(0)
+#define DC_SPAN_OUTPUT() do {} while(0)
+#define DC_SPAN_SPLIT() do {} while(0)
 #endif
 
 #define UPDATE_PREVLINK(START,END)\
@@ -45,6 +51,7 @@ struct FDCSpanWork
 #define UPDATE_PREVLINK_ALLOC(START,END)\
 {\
     DC_SPAN_FRAGMENT();\
+    DC_SPAN_OUTPUT();\
     NewSpan         = New<FSpan>(*Mem,1,4);\
     *PrevLink       = NewSpan;\
     NewSpan->Start  = START;\
@@ -299,6 +306,7 @@ INT FSpanBuffer::CopyFromRasterUpdate( FSpanBuffer& Screen, INT RasterStartY, IN
                 // Get memory for the new span.  Note that this may be drawing from
                 // the same memory pool as the destination.
                 DC_SPAN_FRAGMENT();
+                DC_SPAN_SPLIT();
                 NewScreenSpan        = New<FSpan>(*Screen.Mem,1,4);
                 NewScreenSpan->Start = Line->X[1];
                 NewScreenSpan->End   = ScreenSpan->End;
@@ -369,6 +377,105 @@ INT FSpanBuffer::CopyFromRasterUpdate( FSpanBuffer& Screen, INT RasterStartY, IN
     return Accept;
     unguard;
 }
+
+#if defined(PLATFORM_DREAMCAST)
+INT FSpanBuffer::TestRaster( INT RasterStartY, INT RasterEndY, FRasterSpan* Raster )
+{
+	DC_FRAME_SCOPE(DCFS_Span);
+	FDCSpanWork SpanWork;
+	DCFrameCount(DCFC_Spans, Max(0, RasterEndY - RasterStartY));
+	const INT FirstY = Max(RasterStartY, StartY);
+	const INT LastY = Min(RasterEndY, EndY);
+	for( INT Y = FirstY; Y < LastY; ++Y )
+	{
+		const FRasterSpan& Line = Raster[Y - RasterStartY];
+		if( Line.X[0] >= Line.X[1] )
+			continue;
+		FSpan* Span = Index[Y - StartY];
+		while( Span && Span->End <= Line.X[0] )
+		{
+			if( SpanWork.Enabled ) ++SpanWork.Links;
+			Span = Span->Next;
+		}
+		if( Span )
+		{
+			if( SpanWork.Enabled ) ++SpanWork.Links;
+			if( Span->Start < Line.X[1] )
+				return 1;
+		}
+	}
+	return 0;
+}
+
+INT FSpanBuffer::TestRasterUpdate( INT RasterStartY, INT RasterEndY, FRasterSpan* Raster )
+{
+	DC_FRAME_SCOPE(DCFS_Span);
+	FDCSpanWork SpanWork;
+	DCFrameCount(DCFC_Spans, Max(0, RasterEndY - RasterStartY));
+	const INT FirstY = Max(RasterStartY, StartY);
+	const INT LastY = Min(RasterEndY, EndY);
+	INT Visible = 0;
+	for( INT Y = FirstY; Y < LastY; ++Y )
+	{
+		const FRasterSpan& Line = Raster[Y - RasterStartY];
+		const INT RasterStart = Line.X[0];
+		const INT RasterEnd = Line.X[1];
+		if( RasterStart >= RasterEnd )
+			continue;
+
+		FSpan** PreviousLink = &Index[Y - StartY];
+		FSpan* Span = *PreviousLink;
+		while( Span && Span->End <= RasterStart )
+		{
+			if( SpanWork.Enabled ) ++SpanWork.Links;
+			PreviousLink = &Span->Next;
+			Span = Span->Next;
+		}
+		if( !Span )
+			continue;
+		if( SpanWork.Enabled ) ++SpanWork.Links;
+
+		if( Span->Start < RasterStart )
+		{
+			Visible = 1;
+			if( Span->End > RasterEnd )
+			{
+				// The raster cuts a hole in this screen span. This node is
+				// required for future polygons even though no output is retained.
+				FSpan* Right = New<FSpan>(*Mem, 1, 4);
+				Right->Start = RasterEnd;
+				Right->End = Span->End;
+				Right->Next = Span->Next;
+				Span->Next = Right;
+				Span->End = RasterStart;
+				++ValidLines;
+				if( SpanWork.Enabled ) ++SpanWork.Fragments;
+				DC_SPAN_SPLIT();
+				continue;
+			}
+			Span->End = RasterStart;
+			PreviousLink = &Span->Next;
+			Span = Span->Next;
+		}
+
+		while( Span && Span->End <= RasterEnd )
+		{
+			if( SpanWork.Enabled ) ++SpanWork.Links;
+			Visible = 1;
+			*PreviousLink = Span->Next;
+			Span = Span->Next;
+			--ValidLines;
+		}
+		if( Span && Span->Start < RasterEnd )
+		{
+			if( SpanWork.Enabled ) ++SpanWork.Links;
+			Visible = 1;
+			Span->Start = RasterEnd;
+		}
+	}
+	return Visible;
+}
+#endif
 
 //
 // Grind this polygon through the span buffer and:

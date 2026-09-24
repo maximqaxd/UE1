@@ -1917,12 +1917,20 @@ void FLightManager::SetupForSurf
 	if( !Stream || StaticLightingChanged )
 	{
 		DC_FRAME_COUNT(DCFC_LightStaticBuild);
+		if( !Stream )
+			DC_FRAME_COUNT(DCFC_LightStaticMiss);
+		else
+			DC_FRAME_COUNT(DCFC_LightStaticInvalidated);
 		DC_FRAME_SCOPE(DCFS_LightStaticBuild);
 		// Setup caching.
 		guard(StaticLighting);
 		StaticLightingChanged=1;
 		if( !Stream )
+		{
+			DC_FRAME_COUNT(DCFC_LightCacheCreate);
+			DC_FRAME_SCOPE(DCFS_LightCacheCreate);
 			Stream = (DWORD*)GCache.Create( LightMap.CacheID, TopItemToUnlock[-1], (LightMap.USize*LightMap.VClamp) * sizeof(DWORD) + sizeof(FColor) + sizeof(FMoverStamp), DEFAULT_ALIGNMENT, LightMap.USize*(LightMap.VSize-LightMap.VClamp) );
+		}
 		if( Mover )
 		{
 			((FMoverStamp*)Stream)->iLeaf    = Mover->Region.iLeaf;
@@ -1992,9 +2000,13 @@ void FLightManager::SetupForSurf
 			// Cache it.
 			DOUBLE DynamicLightTime = Frame->Viewport->CurrentTime;
 #if defined(PLATFORM_DREAMCAST)
-			// Dynamic illumination is expensive to merge and convert on SH-4.
-			// Reuse each cached result for a 1/15-second interval.
-			DynamicLightTime = appFloor((FLOAT)(DynamicLightTime * 15.0)) / 15.0;
+			// Stationary flicker and pulse lights can reuse a cached lightmap
+			// between updates. A moving light must be rebuilt every frame.
+			if( !MovingLights )
+			{
+				const FLOAT Rate = (FLOAT)GDCStationaryLightHz;
+				DynamicLightTime = appFloor((FLOAT)(DynamicLightTime * Rate)) / Rate;
+			}
 #endif
 			Stream = (DWORD*)GCache.Get( LightMap.CacheID, *TopItemToUnlock++ );
 			if( !Stream || *(DOUBLE*)Stream != DynamicLightTime )
@@ -2003,7 +2015,11 @@ void FLightManager::SetupForSurf
 				DCFrameCount(Stream ? DCFC_LightDynamicExpired : DCFC_LightDynamicMiss);
 #endif
 				if( !Stream )
+				{
+					DC_FRAME_COUNT(DCFC_LightCacheCreate);
+					DC_FRAME_SCOPE(DCFS_LightCacheCreate);
 					Stream = (DWORD*)GCache.Create( LightMap.CacheID, TopItemToUnlock[-1], (LightMap.USize*LightMap.VClamp + 3) * sizeof(DWORD), DEFAULT_ALIGNMENT, LightMap.USize*(LightMap.VSize-LightMap.VClamp) );
+				}
 				*(DOUBLE*)Stream = DynamicLightTime;
 				Stream += 2;
 				LightMap.MaxColor = (FColor*)Stream++;

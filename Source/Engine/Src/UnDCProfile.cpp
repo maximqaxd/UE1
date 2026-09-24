@@ -10,6 +10,9 @@ ENGINE_API UBOOL GDCFrameProfileEnabled = 1;
 ENGINE_API UBOOL GDCFrameProfileDetailed = 1;
 ENGINE_API UBOOL GDCFrameProfileOverlay = 1;
 ENGINE_API INT GDCFrameProfilePage = 0;
+ENGINE_API INT GDCSpanMode = 1;
+ENGINE_API INT GDCStationaryLightHz = 5;
+ENGINE_API UBOOL GDCMeshOIXActive = 0;
 // Use the integer KOS timer directly; single-only floating point loses
 // microsecond precision when an absolute timestamp is converted to DOUBLE.
 static struct FDCFrameProfile
@@ -27,7 +30,7 @@ static struct FDCFrameProfile
 	FLOAT CountDisplay[DCFC_Count];
 	DWORD TimerReads;
 	QWORD TimerReadsSum;
-	char Lines[27][128];
+	char Lines[36][128];
 } GDCFrame;
 
 ENGINE_API void DCFrameProfileReset()
@@ -37,9 +40,10 @@ ENGINE_API void DCFrameProfileReset()
 
 ENGINE_API void DCFrameProfileReport( FOutputDevice* Out )
 {
-	Out->Logf("DCPROFILE detail=%d overlay=%d legacy=%d; completed 30-tick window",
-		GDCFrameProfileDetailed, GDCFrameProfileOverlay, GDCLegacyTimers);
-	for( INT i = 0; i < 27; ++i )
+	Out->Logf("DCPROFILE detail=%d overlay=%d legacy=%d TA=SQ mesh_OIX=%d; completed 30-tick window",
+		GDCFrameProfileDetailed, GDCFrameProfileOverlay, GDCLegacyTimers,
+		GDCMeshOIXActive);
+	for( INT i = 0; i < 36; ++i )
 		if( GDCFrame.Lines[i][0] ) Out->Log(GDCFrame.Lines[i]);
 }
 
@@ -137,33 +141,61 @@ ENGINE_API void DCFrameEnd()
 		}
 		const FLOAT* T = GDCFrame.Display;
 		const FLOAT* C = GDCFrame.CountDisplay;
-		appSprintf(GDCFrame.Lines[0], "DC %.1f FPS frame %.1f worst %.1f D%d", GDCFrame.FrameMS > 0 ? 1000.f/GDCFrame.FrameMS : 0.f, GDCFrame.FrameMS, GDCFrame.WorstMS, GDCFrameProfileDetailed);
+		appSprintf(GDCFrame.Lines[0], "DC %.1f FPS frame %.1f worst %.1f D%d TA:SQ M-OIX:%s",
+			GDCFrame.FrameMS > 0 ? 1000.f/GDCFrame.FrameMS : 0.f,
+			GDCFrame.FrameMS, GDCFrame.WorstMS, GDCFrameProfileDetailed,
+			GDCMeshOIXActive ? "ON" : "OFF");
 		appSprintf(GDCFrame.Lines[1], "tick %.1f game %.1f world %.1f wait %.1f", GDCFrame.WorkMS, T[DCFS_Game], T[DCFS_World], T[DCFS_Wait]);
 		appSprintf(GDCFrame.Lines[2], "BSP %.1f clip %.1f raster %.1f span %.1f", T[DCFS_BSP], T[DCFS_Clip], T[DCFS_Raster], T[DCFS_Span]);
 		appSprintf(GDCFrame.Lines[3], "dyn %.1f mesh %.1f light %.1f legacy %d", T[DCFS_Dynamics], T[DCFS_Mesh], T[DCFS_Light], GDCLegacyTimers);
 		appSprintf(GDCFrame.Lines[4], "nodes %.0f polys %.0f pts %.0f rows %.0f", C[DCFC_Nodes], C[DCFC_Polys], C[DCFC_Points], C[DCFC_Spans]);
-		appSprintf(GDCFrame.Lines[5], "tex %.1f read %.1f inflate %.1f alloc %.1f", T[DCFS_Texture], T[DCFS_Read], T[DCFS_Inflate], T[DCFS_Allocate]);
+		appSprintf(GDCFrame.Lines[5], "tex %.1f read %.1f DT %.1f/%.1fK LM %.1f/%.1fK",
+			T[DCFS_Texture], T[DCFS_Read],
+			T[DCFS_ReadDT], C[DCFC_ReadDTBytes] / 1024.f,
+			T[DCFS_ReadLightmap], C[DCFC_ReadLightmapBytes] / 1024.f);
 		appSprintf(GDCFrame.Lines[6], "place %.1f twid+SQ %.1f SQ %.1f %.1fKB", T[DCFS_Place], T[DCFS_Twiddle], T[DCFS_Upload], GDCFrame.UploadKB);
-		appSprintf(GDCFrame.Lines[7], "cold %.0f reload %.0f evict %.0f hdr %.0f", C[DCFC_Cold], C[DCFC_Reload], C[DCFC_Evict], GDCFrame.HeaderCount);
+		appSprintf(GDCFrame.Lines[7], "cold %.0f reload %.0f atlasEv %.0f vramEv %.0f hdr %.0f",
+			C[DCFC_Cold], C[DCFC_Reload], C[DCFC_Evict], C[DCFC_VRAMEvict], GDCFrame.HeaderCount);
 		appSprintf(GDCFrame.Lines[8], "submit %.1f overlay %.2f GPUlast %.1f", T[DCFS_Submit], T[DCFS_Overlay], GDCFrame.GPUMS);
-		appSprintf(GDCFrame.Lines[9], "VIS frame %.1f detail %d", GDCFrame.FrameMS, GDCFrameProfileDetailed);
+		appSprintf(GDCFrame.Lines[9], "VIS frame %.1f detail %d spanmode %d", GDCFrame.FrameMS, GDCFrameProfileDetailed, GDCSpanMode);
 		appSprintf(GDCFrame.Lines[10], "transform %.2f clip-only %.2f", T[DCFS_Transform], T[DCFS_Clip]);
 		appSprintf(GDCFrame.Lines[11], "raster %.2f span %.2f", T[DCFS_Raster], T[DCFS_Span]);
 		appSprintf(GDCFrame.Lines[12], "matrix loads %.0f transformed pts %.0f", C[DCFC_MatrixLoads], C[DCFC_Points]);
-		appSprintf(GDCFrame.Lines[13], "span-copy links %.0f fragments %.0f", C[DCFC_SpanLinks], C[DCFC_SpanFragments]);
+		appSprintf(GDCFrame.Lines[13], "span links %.0f out %.0f split %.0f bypass %.0f",
+			C[DCFC_SpanLinks], C[DCFC_SpanOutputs], C[DCFC_SpanScreenSplits], C[DCFC_SpanBypassed]);
 		appSprintf(GDCFrame.Lines[14], "reject clip %.0f raster %.0f span %.0f", C[DCFC_ClipReject], C[DCFC_RasterReject], C[DCFC_SpanReject]);
 		appSprintf(GDCFrame.Lines[15], "scope timer reads/frame %.0f", GDCFrame.TimerReadsSum / (FLOAT)GDCFrame.Frames);
-		appSprintf(GDCFrame.Lines[16], "overlay %.2f ms visible %d", T[DCFS_Overlay], GDCFrameProfileOverlay);
+		appSprintf(GDCFrame.Lines[16], "hdr %.0f compile %.2fms stable %.0f addr %.0f state %.0f",
+			GDCFrame.HeaderCount, T[DCFS_HeaderCompile],
+			C[DCFC_HeaderUploadStable], C[DCFC_HeaderUploadAddress],
+			C[DCFC_HeaderUploadState]);
 		appSprintf(GDCFrame.Lines[17], "DCPDETAIL / DCPOVERLAY / DCPDUMP");
-		appSprintf(GDCFrame.Lines[18], "LIGHT frame %.1f setup %.2f tex %.2f", GDCFrame.FrameMS, T[DCFS_Light], T[DCFS_Texture]);
+		appSprintf(GDCFrame.Lines[18], "LIGHT frame %.1f setup %.2f tex %.2f rate %dHz", GDCFrame.FrameMS, T[DCFS_Light], T[DCFS_Texture], GDCStationaryLightHz);
 		appSprintf(GDCFrame.Lines[19], "cooked %.0f static build %.0f hit %.0f", C[DCFC_LightCooked], C[DCFC_LightStaticBuild], C[DCFC_LightStaticHit]);
 		appSprintf(GDCFrame.Lines[20], "dynamic miss %.0f expired %.0f hit %.0f", C[DCFC_LightDynamicMiss], C[DCFC_LightDynamicExpired], C[DCFC_LightDynamicHit]);
 		appSprintf(GDCFrame.Lines[21], "merged regen %.0f lightmap uploads %.0f", C[DCFC_LightMerged], C[DCFC_UploadLightmap]);
 		appSprintf(GDCFrame.Lines[22], "upload cold %.0f missing %.0f", C[DCFC_Cold], C[DCFC_UploadMissing]);
 		appSprintf(GDCFrame.Lines[23], "upload changed %.0f palette %.0f bank %.0f", C[DCFC_UploadChanged], C[DCFC_UploadPalette], C[DCFC_UploadBank]);
-		appSprintf(GDCFrame.Lines[24], "reload %.0f atlas evict %.0f", C[DCFC_Reload], C[DCFC_Evict]);
+		appSprintf(GDCFrame.Lines[24], "reload %.0f atlasEv %.0f vramEv %.0f DT %.2f LM %.2f",
+			C[DCFC_Reload], C[DCFC_Evict], C[DCFC_VRAMEvict],
+			T[DCFS_ReadDT], T[DCFS_ReadLightmap]);
 		appSprintf(GDCFrame.Lines[25], "build ms static %.2f dynamic %.2f", T[DCFS_LightStaticBuild], T[DCFS_LightDynamicBuild]);
-		appSprintf(GDCFrame.Lines[26], "reason priority: cold/missing/changed/pal/bank");
+		appSprintf(GDCFrame.Lines[26], "static miss %.0f invalid %.0f cache create %.0f/%.2fms",
+			C[DCFC_LightStaticMiss], C[DCFC_LightStaticInvalidated],
+			C[DCFC_LightCacheCreate], T[DCFS_LightCacheCreate]);
+		appSprintf(GDCFrame.Lines[27], "MESH total %.2f frame %.2f outcode %.2f", T[DCFS_Mesh], T[DCFS_MeshFrame], T[DCFS_MeshOutcode]);
+		appSprintf(GDCFrame.Lines[28], "prepare %.2f texture info %.2f", T[DCFS_MeshPrepare], T[DCFS_MeshTextureInfo]);
+		appSprintf(GDCFrame.Lines[29], "light setup %.2f vertex %.2f", T[DCFS_MeshLightSetup], T[DCFS_MeshVertexLight]);
+		appSprintf(GDCFrame.Lines[30], "draw+submit %.2f unmeasured %.2f", T[DCFS_MeshDraw],
+			Max(0.f, T[DCFS_Mesh] - T[DCFS_MeshFrame] - T[DCFS_MeshOutcode]
+				- T[DCFS_MeshPrepare] - T[DCFS_MeshTextureInfo]
+				- T[DCFS_MeshLightSetup] - T[DCFS_MeshVertexLight] - T[DCFS_MeshDraw]));
+		appSprintf(GDCFrame.Lines[31], "actors %.0f verts %.0f tris %.0f", C[DCFC_MeshActors], C[DCFC_MeshVerts], C[DCFC_MeshTris]);
+		appSprintf(GDCFrame.Lines[32], "visible %.0f strip %.0f fallback %.0f", C[DCFC_MeshVisible], C[DCFC_MeshStripTris], C[DCFC_MeshFallbackTris]);
+		appSprintf(GDCFrame.Lines[33], "strip coverage %.0f%% of drawn tris",
+			100.f * C[DCFC_MeshStripTris] / Max(1.f, C[DCFC_MeshStripTris] + C[DCFC_MeshFallbackTris]));
+		appSprintf(GDCFrame.Lines[34], "frame includes decode+interpolate+transform");
+		appSprintf(GDCFrame.Lines[35], "draw includes clip+header+TA submission");
 		GDCFrame.TimerReadsSum = 0;
 		GDCFrame.IntervalSum = GDCFrame.WorkSum = GDCFrame.BytesSum = GDCFrame.HeadersSum = 0;
 		GDCFrame.Frames = GDCFrame.Worst = 0;

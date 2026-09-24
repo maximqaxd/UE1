@@ -15,8 +15,15 @@ set(SRC_FILES
 add_library(${PROJECT_NAME} ${LIB_TYPE} ${SRC_FILES})
 
 if(TARGET_IS_DREAMCAST AND NOT (CMAKE_BUILD_TYPE STREQUAL "Debug"))
-  # FIXME: the rest is built with -Os, but building this file with -Os causes lightmaps to break
-  set_source_files_properties("Src/UnLight.cpp" PROPERTIES COMPILE_FLAGS -O2)
+  # Keep the large hot loops at -O3 without growing every engine object.
+  # UnLight already required an override: compiling it with -Os breaks lightmaps.
+  set_source_files_properties(
+    "Src/UnLight.cpp"
+    "Src/UnMeshRn.cpp"
+    "Src/UnRender.cpp"
+    "Src/UnSpan.cpp"
+    PROPERTIES COMPILE_FLAGS "-O3"
+  )
 endif()
 
 target_include_directories(${PROJECT_NAME}
