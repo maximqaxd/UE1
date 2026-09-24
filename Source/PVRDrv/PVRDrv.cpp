@@ -1,24 +1,9 @@
 /*=============================================================================
 	PVRDrv.cpp: Unreal PowerVR (Dreamcast) render device.
 
-	Submission model
-	----------------
-	The opaque list is opened in Lock() and written straight to the store
-	queues.  Punch-through and translucent primitives are appended to two flat
-	arenas of finished 32-byte TA payloads and replayed with a single
-	pvr_prim() burst in Unlock().
-
-	Two lists must be buffered because Unreal generates primitives in an order
-	the hardware cannot consume directly:
-
-	  * a lit world surface emits its base texture (opaque) and its lightmap
-	    (modulate, hence translucent) from the same call, and
-	  * the HUD is drawn after DrawWorld() has returned and popped the scene
-	    arenas, so the world cannot be re-walked to pick up its later lists.
-
-	Nothing is allocated per primitive and nothing is projected twice: vertex
-	positions come from the screen coordinates Unreal already computed in
-	FTransform::Project.
+	The engine replays one occluded scene in OP, PT, TR passes. Each pass writes
+	its 32-byte headers and vertices directly to the active KOS TA list. The
+	TR list stays open for the flash and HUD after DrawWorld returns.
 =============================================================================*/
 
 #include <kos.h>
@@ -103,70 +88,94 @@ static inline DWORD PVRLerpARGB( DWORD C1, DWORD C2, FLOAT T )
 }
 
 /*-----------------------------------------------------------------------------
-	Command arenas.
+	Direct TA submission.
 -----------------------------------------------------------------------------*/
 
-//
-// A flat run of finished 32-byte TA payloads.  Replay is a single pvr_prim()
-// store-queue burst, so nothing in here costs anything at submit time beyond
-// the memory write that built it.
-//
-struct FPVRCmdArena
-{
-	BYTE*  Data;
-	DWORD  Capacity;
-	DWORD  Used;
-	DWORD  Peak;
-	DWORD  Dropped;
-
-	void Reset() { Used = 0; Dropped = 0; }
-	void Track() { Peak = Max( Peak, Used ); }
-};
-
-static FPVRCmdArena   GPVRArena[PVR_LIST_PT_POLY + 1];
 static pvr_list_t     GPVRDirectList = (pvr_list_t)-1;
+static INT            GPVRCurrentPass = -1;
 static pvr_dr_state_t GPVRDRState;
 
-// Written to when an arena is full, so a dropped primitive costs a store
-// rather than a branch in every emit.
-static BYTE GPVRBitBucket[64] __attribute__((aligned(32)));
+// Cooked opaque meshes alone may use the SH-4's 8 KiB OIX scratch. The
+// P2 aliases are essential: CCR changes must not execute from cached P1.
+static UBOOL GPVRMeshOIXSupported = 0;
+static UBOOL GPVRMeshOIXEntered = 0;
+static INT GPVRMeshlet = INDEX_NONE;
+static INT GPVRMeshScratchCount = 0;
+static const FSceneNode* GPVRMeshFrame = NULL;
+static const FTextureInfo* GPVRMeshTexture = NULL;
+static const FTransTexture* GPVRMeshKeys[256];
+static pvr_vertex_t* const GPVRMeshScratch = (pvr_vertex_t*)0x92000000;
 
-//
-// Reserve room for one complete primitive group.  Returns false when the
-// arena cannot hold it, in which case the caller must skip the whole draw:
-// truncating a strip halfway would leave the TA without an end-of-list marker.
-//
-static inline UBOOL PVRBeginDraw( pvr_list_t List, DWORD MaxBytes )
+static void PVRMeshOIXEnterImpl()
 {
-	if( List == GPVRDirectList )
-		return 1;
-	FPVRCmdArena& A = GPVRArena[List];
-	if( A.Used + MaxBytes > A.Capacity )
-	{
-		++A.Dropped;
-		return 0;
-	}
-	return 1;
+	const int Mask = irq_disable();
+	dcache_purge_all();
+	volatile uint32_t* CCR = (volatile uint32_t*)0xFF00001C;
+	*CCR |= (1u << 7);
+	for( INT i=0; i<16; ++i ) __asm__ __volatile__("nop");
+	for( uintptr_t Address=0x92000000; Address<0x92002000; Address+=32 )
+		__asm__ __volatile__("movca.l r0,@%0" : : "r"(Address) : "memory");
+	irq_restore(Mask);
 }
 
-// Obtain a 32-byte destination for one TA payload. Only valid between a
-// successful PVRBeginDraw and the matching PVRCommit32.
+static void PVRMeshOIXLeaveImpl()
+{
+	const int Mask = irq_disable();
+	dcache_inval_range(0x92000000, 8192);
+	dcache_purge_all();
+	volatile uint32_t* CCR = (volatile uint32_t*)0xFF00001C;
+	*CCR &= ~(1u << 7);
+	for( INT i=0; i<16; ++i ) __asm__ __volatile__("nop");
+	irq_restore(Mask);
+}
+
+static void (*const PVRMeshOIXEnterP2)() = (void(*)())(((uintptr_t)&PVRMeshOIXEnterImpl & 0x1FFFFFFF) | 0xA0000000);
+static void (*const PVRMeshOIXLeaveP2)() = (void(*)())(((uintptr_t)&PVRMeshOIXLeaveImpl & 0x1FFFFFFF) | 0xA0000000);
+
+static void PVRMeshOIXLeave()
+{
+	if( GPVRMeshOIXEntered )
+	{
+		PVRMeshOIXLeaveP2();
+		GPVRMeshOIXEntered = 0;
+		GPVRMeshlet = INDEX_NONE;
+		GPVRMeshScratchCount = 0;
+		GPVRMeshFrame = NULL;
+		GPVRMeshTexture = NULL;
+	}
+}
+
+static void PVRStartList( pvr_list_t List )
+{
+	check( GPVRDirectList == (pvr_list_t)-1 );
+	const INT Result = pvr_list_begin(List);
+	check( Result == 0 );
+	GPVRDirectList = List;
+}
+
+static void PVRFinishList()
+{
+	check( GPVRDirectList != (pvr_list_t)-1 );
+	const INT Result = pvr_list_finish();
+	check( Result == 0 );
+	GPVRDirectList = (pvr_list_t)-1;
+}
+
+static inline UBOOL PVRBeginDraw( pvr_list_t List, DWORD MaxBytes )
+{
+	return List == GPVRDirectList;
+}
+
 static inline void* PVRAlloc32( pvr_list_t List )
 {
-	if( List == GPVRDirectList )
-		return pvr_dr_target( GPVRDRState );
-	FPVRCmdArena& A = GPVRArena[List];
-	if( A.Used + 32 > A.Capacity )
-		return GPVRBitBucket;
-	BYTE* P = A.Data + A.Used;
-	A.Used += 32;
-	return P;
+	check( List == GPVRDirectList );
+	return pvr_dr_target( GPVRDRState );
 }
 
 static inline void PVRCommit32( pvr_list_t List, void* Dst )
 {
-	if( List == GPVRDirectList )
-		pvr_dr_commit( Dst );
+	check( List == GPVRDirectList );
+	pvr_dr_commit( Dst );
 }
 
 /*-----------------------------------------------------------------------------
@@ -174,14 +183,24 @@ static inline void PVRCommit32( pvr_list_t List, void* Dst )
 -----------------------------------------------------------------------------*/
 
 //
-// Recompiling a polygon context per primitive is pure waste: Unreal already
-// sorts solid surfaces by texture, so consecutive draws usually share state.
-// One cached key per list, since the three lists are built independently.
+// Keep the last hardware state for each list. Texture identity alone is not
+// enough: an upload may change its address, format or dimensions, while an
+// in-place atlas update changes none of those header fields.
 //
 struct FPVRHeaderCache
 {
-	QWORD Key;
 	UBOOL Valid;
+	DWORD PolyFlags;
+	UBOOL NoDepth;
+	UBOOL FilteringDisabled;
+	UBOOL FogEnabled;
+	UBOOL OverbrightEnabled;
+	QWORD TextureKey;
+	pvr_ptr_t Texture;
+	DWORD TextureFormat;
+	INT TextureWidth;
+	INT TextureHeight;
+	UBOOL TextureMipMapped;
 };
 static FPVRHeaderCache GPVRHeaderCache[PVR_LIST_PT_POLY + 1];
 
@@ -341,11 +360,11 @@ void UPVRRenderDevice::InternalClassInitializer( UClass* Class )
 	guardSlow(UPVRRenderDevice::InternalClassInitializer);
 	new(Class, "NoFiltering",     RF_Public)UBoolProperty( CPP_PROPERTY(NoFiltering),     "Options", CPF_Config );
 	new(Class, "UseTriStrips",    RF_Public)UBoolProperty( CPP_PROPERTY(UseTriStrips),    "Options", CPF_Config );
+	new(Class, "UseMeshOIX",      RF_Public)UBoolProperty( CPP_PROPERTY(UseMeshOIX),      "Options", CPF_Config );
 	new(Class, "DistanceFog",     RF_Public)UBoolProperty( CPP_PROPERTY(DistanceFog),     "Options", CPF_Config );
 	new(Class, "Overbright",      RF_Public)UBoolProperty( CPP_PROPERTY(Overbright),      "Options", CPF_Config );
 	new(Class, "VolumetricFog",   RF_Public)UBoolProperty( CPP_PROPERTY(VolumetricFog),   "Options", CPF_Config );
 	new(Class, "FogDistanceDefault", RF_Public)UIntProperty( CPP_PROPERTY(FogDistanceDefault), "Options", CPF_Config );
-	new(Class, "CommandBufferKB", RF_Public)UIntProperty ( CPP_PROPERTY(CommandBufferKB), "Options", CPF_Config );
 	unguardSlow;
 }
 
@@ -359,11 +378,11 @@ UPVRRenderDevice::UPVRRenderDevice()
 {
 	NoFiltering = false;
 	UseTriStrips = true;
+	UseMeshOIX = false;
 	DistanceFog = false;
 	Overbright = true;
 	VolumetricFog = false;
 	FogDistanceDefault = 0;
-	CommandBufferKB = 256;
 	OverlayZFlash = 1024.f;
 	OverlayZUI = 4096.f;
 	UIZStep = 1.f;
@@ -401,6 +420,19 @@ UBOOL UPVRRenderDevice::Init( UViewport* InViewport )
 	pvr_init(&GPVRInitParams);
 #endif
 
+	// Flycast builds without OIX must never receive ocbwb-backed mesh data.
+	// Probe once, outside a scene, and retain the normal SQ strip path there.
+	GPVRMeshOIXSupported = 0;
+	if( UseMeshOIX )
+	{
+		PVRMeshOIXEnterP2();
+		*(volatile BYTE*)GPVRMeshScratch = 0x5A;
+		GPVRMeshOIXSupported = (*(volatile BYTE*)GPVRMeshScratch == 0x5A);
+		PVRMeshOIXLeaveP2();
+	}
+	debugf( NAME_Log, "PVR mesh OIX: %s", !UseMeshOIX ? "disabled by config" :
+		GPVRMeshOIXSupported ? "enabled" : "unsupported, using SQ" );
+
 	// Volumetric fog costs a third translucent pass per surface plus the
 	// per-texel Volumetric() loop in FLightManager, so it is opt-in.
 	SupportsFogMaps     = VolumetricFog ? 1 : 0;
@@ -408,20 +440,7 @@ UBOOL UPVRRenderDevice::Init( UViewport* InViewport )
 	NoVolumetricBlend   = true;
 	SupportsTriStrips   = UseTriStrips ? 1 : 0;
 
-	// Split the command budget between the two buffered lists. Translucent
-	// carries a lightmap pass for every lit surface, so it needs the bulk.
-	CommandBufferKB = Clamp( CommandBufferKB, 64, 1024 );
-	const DWORD Budget = (DWORD)CommandBufferKB * 1024;
-	const DWORD TRBytes = (Budget * 3 / 4) & ~31u;
-	const DWORD PTBytes = (Budget - TRBytes) & ~31u;
-	appMemset( GPVRArena, 0, sizeof(GPVRArena) );
-	GPVRArena[PVR_LIST_TR_POLY].Data     = (BYTE*)memalign( 32, TRBytes );
-	GPVRArena[PVR_LIST_TR_POLY].Capacity = TRBytes;
-	GPVRArena[PVR_LIST_PT_POLY].Data     = (BYTE*)memalign( 32, PTBytes );
-	GPVRArena[PVR_LIST_PT_POLY].Capacity = PTBytes;
-	if( !GPVRArena[PVR_LIST_TR_POLY].Data || !GPVRArena[PVR_LIST_PT_POLY].Data )
-		appErrorf( "PVR command buffer allocation failed (%u bytes)", Budget );
-	debugf( NAME_Log, "PVR command buffers: PT=%u TR=%u bytes", PTBytes, TRBytes );
+	debugf( NAME_Log, "PVR command submission: direct OP/PT/TR" );
 	debugf( NAME_Log, "PVR options: tristrips=%i distancefog=%i fogdefault=%i volumetricfog=%i"
 		" shiny=%i volumetriclighting=%i coronas=%i filtering=%i overbright=%i",
 		(INT)UseTriStrips, (INT)DistanceFog, FogDistanceDefault, (INT)VolumetricFog,
@@ -460,14 +479,6 @@ void UPVRRenderDevice::Exit()
 		Compose = NULL;
 	}
 	ComposeSize = 0;
-
-	for( INT i = 0; i <= PVR_LIST_PT_POLY; ++i )
-	{
-		if( GPVRArena[i].Data )
-			free( GPVRArena[i].Data );
-		GPVRArena[i].Data = NULL;
-		GPVRArena[i].Capacity = 0;
-	}
 
 	GPVRDeviceInstance = NULL;
 #if defined(PLATFORM_DREAMCAST)
@@ -542,12 +553,38 @@ UBOOL UPVRRenderDevice::Exec( const char* Cmd, FOutputDevice* Out )
 	}
 	if( ParseCommand(&Cmd, "DCPPAGE") )
 	{
-		GDCFrameProfilePage = (GDCFrameProfilePage + 1) % 3;
+		GDCFrameProfilePage = (GDCFrameProfilePage + 1) % 4;
 		return true;
 	}
 	if( ParseCommand(&Cmd, "DCPDUMP") )
 	{
 		DCFrameProfileReport(Out);
+		return true;
+	}
+	if( ParseCommand(&Cmd, "DCSPANMODE") )
+	{
+		if( *Cmd >= '0' && *Cmd <= '2' )
+			GDCSpanMode = *Cmd - '0';
+		else
+			GDCSpanMode = (GDCSpanMode + 1) % 3;
+		DCFrameProfileReset();
+		Out->Logf( "BSP span mode %d: %s", GDCSpanMode,
+			GDCSpanMode == 0 ? "original" : GDCSpanMode == 1
+				? "update visibility without output fragments"
+				: "DIAGNOSTIC opaque occlusion bypass; portals may be wrong" );
+		return true;
+	}
+	if( ParseCommand(&Cmd, "DCLIGHTRATE") )
+	{
+		const INT Requested = appAtoi(Cmd);
+		if( Requested == 5 || Requested == 10 || Requested == 15 )
+			GDCStationaryLightHz = Requested;
+		else
+			GDCStationaryLightHz = GDCStationaryLightHz == 5 ? 10
+				: GDCStationaryLightHz == 10 ? 15 : 5;
+		DCFrameProfileReset();
+		Out->Logf("Stationary dynamic lightmaps: %d Hz; moving lights: every frame",
+			GDCStationaryLightHz);
 		return true;
 	}
 	if( ParseCommand(&Cmd, "DCLEGACYTIMERS") )
@@ -575,13 +612,9 @@ UBOOL UPVRRenderDevice::Exec( const char* Cmd, FOutputDevice* Out )
 void UPVRRenderDevice::Lock( FPlane FlashScale, FPlane FlashFog, FPlane ScreenClear, DWORD RenderLockFlags, BYTE* InHitData, INT* InHitSize )
 {
 	guard(UPVRRenderDevice::Lock);
+	PVRMeshOIXLeave();
+	GDCMeshOIXActive = 0;
 
-	// Texture uploads and eviction happen while building this frame's lists.
-	// Wait here, before either can alter memory used by the previous scene.
-	{
-		DC_FRAME_SCOPE(DCFS_Wait);
-		pvr_wait_ready();
-	}
 	++TextureFrame;
 #if defined(PLATFORM_DREAMCAST)
 	pvr_stats_t ProfileStats;
@@ -589,18 +622,14 @@ void UPVRRenderDevice::Lock( FPlane FlashScale, FPlane FlashFog, FPlane ScreenCl
 		DCFrameGPU(ProfileStats.frame_count, ProfileStats.rnd_last_time, ProfileStats.vtx_buffer_used);
 #endif
 
-	GPVRArena[PVR_LIST_PT_POLY].Reset();
-	GPVRArena[PVR_LIST_TR_POLY].Reset();
 	PVRInvalidateHeaders();
 	UIZCursor = 0.f;
 
 	pvr_set_bg_color( 0.f, 0.f, 0.f );
 	pvr_scene_begin();
 
-	// Opaque geometry is generated in an order the hardware accepts, so it
-	// goes straight to the TA; the other two lists are buffered.
-	pvr_list_begin( PVR_LIST_OP_POLY );
-	GPVRDirectList = PVR_LIST_OP_POLY;
+	PVRStartList( PVR_LIST_OP_POLY );
+	GPVRCurrentPass = 0;
 
 	if( FlashScale != FPlane(0.5f, 0.5f, 0.5f, 0.0f) || FlashFog != FPlane(0.0f, 0.0f, 0.0f, 0.0f) )
 		ColorMod = FPlane( FlashFog.X, FlashFog.Y, FlashFog.Z, 1.f - Min( FlashScale.X * 2.f, 1.f ) );
@@ -610,35 +639,42 @@ void UPVRRenderDevice::Lock( FPlane FlashScale, FPlane FlashFog, FPlane ScreenCl
 	unguard;
 }
 
+void UPVRRenderDevice::BeginRenderPass( INT Pass )
+{
+	check( Pass >= 0 && Pass <= 2 );
+	check( GPVRCurrentPass >= 0 && Pass >= GPVRCurrentPass );
+	while( GPVRCurrentPass < Pass )
+	{
+		PVRMeshOIXLeave();
+		PVRFinishList();
+		++GPVRCurrentPass;
+		const pvr_list_t List = GPVRCurrentPass == 1 ? PVR_LIST_PT_POLY : PVR_LIST_TR_POLY;
+		if( List == PVR_LIST_PT_POLY )
+			PVR_SET(PVR_PT_ALPHA_REF, PVR_PT_ALPHA_THRESHOLD);
+		PVRStartList( List );
+	}
+}
+
+UBOOL UPVRRenderDevice::WantsBspSurface( DWORD PolyFlags, INT Pass ) const
+{
+	// TR also carries lightmaps and fog for OP/PT base surfaces.
+	if( Pass == 2 )
+		return 1;
+	if( PolyFlags & (PF_Translucent|PF_Modulated|PF_Highlighted) )
+		return 0;
+	return Pass == ((PolyFlags & PF_Masked) ? 1 : 0);
+}
+
 void UPVRRenderDevice::Unlock( UBOOL Blit )
 {
 	guard(UPVRRenderDevice::Unlock);
 	DC_FRAME_SCOPE(DCFS_Submit);
+	PVRMeshOIXLeave();
 
-	// Close the opaque list; everything after this is replayed from RAM.
-	pvr_list_finish();
-	GPVRDirectList = (pvr_list_t)-1;
-
-	FPVRCmdArena& PT = GPVRArena[PVR_LIST_PT_POLY];
-	FPVRCmdArena& TR = GPVRArena[PVR_LIST_TR_POLY];
-	PT.Track();
-	TR.Track();
-
-	// Submission order is free: the tile accelerator only bins, and the ISP
-	// always renders opaque, then punch-through, then translucent.
-	if( PT.Used )
-	{
-		PVR_SET(PVR_PT_ALPHA_REF, PVR_PT_ALPHA_THRESHOLD);
-		pvr_list_begin( PVR_LIST_PT_POLY );
-		pvr_prim( PT.Data, PT.Used );
-		pvr_list_finish();
-	}
-	if( TR.Used )
-	{
-		pvr_list_begin( PVR_LIST_TR_POLY );
-		pvr_prim( TR.Data, TR.Used );
-		pvr_list_finish();
-	}
+	// KOS may close each list only once. DrawWorld and the HUD have already
+	// submitted directly to OP, PT and TR in that order.
+	PVRFinishList();
+	GPVRCurrentPass = -1;
 
 	// Measure TA vertex-buffer usage BEFORE scene_finish (which resets POS).
 	// If the buffer fills, the TA silently drops subsequent polys -> geometry
@@ -653,21 +689,8 @@ void UPVRRenderDevice::Unlock( UBOOL Blit )
 
 	pvr_scene_finish();
 
-	if( PT.Dropped || TR.Dropped )
-	{
-		static DWORD LastWarnFrame = 0;
-		if( TextureFrame - LastWarnFrame >= 60 )
-		{
-			LastWarnFrame = TextureFrame;
-			debugf( NAME_Warning, "PVR command buffer full: pt_dropped=%u tr_dropped=%u pt_peak=%u/%u tr_peak=%u/%u"
-				" (raise PVRDrv.PVRRenderDevice.CommandBufferKB)",
-				PT.Dropped, TR.Dropped, PT.Peak, PT.Capacity, TR.Peak, TR.Capacity );
-		}
-	}
-
 	if( TextureFrame % 300 == 0 )
 	{
-		debugf( "DCPVRCMD pt_peak=%u/%u tr_peak=%u/%u", PT.Peak, PT.Capacity, TR.Peak, TR.Capacity );
 		PrintTextureCPUProfile( 300 );
 #if defined(PLATFORM_DREAMCAST)
 		appDCDumpProceduralTextureProfile( 300 );
@@ -708,19 +731,42 @@ pvr_list_t UPVRRenderDevice::ListFor( DWORD PolyFlags ) const
 //
 void UPVRRenderDevice::EmitHeader( pvr_list_t List, DWORD PolyFlags, const FTexState* Tex, UBOOL NoDepth )
 {
-	// State that actually reaches the hardware, hashed into one key. The
-	// texture is identified by its cache ID rather than its VRAM address:
-	// re-uploads move the address, and those already invalidate the cache.
 	const DWORD StateBits =
-		  ( PolyFlags & (PF_Translucent|PF_Modulated|PF_Highlighted|PF_Invisible|PF_Occlude|PF_Masked) )
-		| ( NoDepth ? 0x1u : 0u );
-	const QWORD Key = ( Tex && Tex->Tex ) ? ( (Tex->Key << 8) ^ StateBits ) : StateBits;
+		PolyFlags & (PF_Translucent|PF_Modulated|PF_Highlighted|PF_Invisible|PF_Occlude|PF_Masked);
+	const UBOOL Textured = Tex && Tex->Tex;
+	const QWORD TextureKey = Textured ? Tex->Key : 0;
+	const pvr_ptr_t Texture = Textured ? Tex->Tex : NULL;
+	const DWORD TextureFormat = Textured ? Tex->Format : 0;
+	const INT TextureWidth = Textured ? Tex->Width : 0;
+	const INT TextureHeight = Textured ? Tex->Height : 0;
+	const UBOOL TextureMipMapped = Textured ? Tex->MipMapped : 0;
 
 	FPVRHeaderCache& Cache = GPVRHeaderCache[List];
-	if( Cache.Valid && Cache.Key == Key )
+	if( Cache.Valid
+		&& Cache.PolyFlags == StateBits
+		&& Cache.NoDepth == NoDepth
+		&& Cache.FilteringDisabled == NoFiltering
+		&& Cache.FogEnabled == FogActive
+		&& Cache.OverbrightEnabled == Overbright
+		&& Cache.TextureKey == TextureKey
+		&& Cache.Texture == Texture
+		&& Cache.TextureFormat == TextureFormat
+		&& Cache.TextureWidth == TextureWidth
+		&& Cache.TextureHeight == TextureHeight
+		&& Cache.TextureMipMapped == TextureMipMapped )
 		return;
 	Cache.Valid = 1;
-	Cache.Key = Key;
+	Cache.PolyFlags = StateBits;
+	Cache.NoDepth = NoDepth;
+	Cache.FilteringDisabled = NoFiltering;
+	Cache.FogEnabled = FogActive;
+	Cache.OverbrightEnabled = Overbright;
+	Cache.TextureKey = TextureKey;
+	Cache.Texture = Texture;
+	Cache.TextureFormat = TextureFormat;
+	Cache.TextureWidth = TextureWidth;
+	Cache.TextureHeight = TextureHeight;
+	Cache.TextureMipMapped = TextureMipMapped;
 #if defined(PLATFORM_DREAMCAST)
 	DCFrameHeader();
 #endif
@@ -756,7 +802,7 @@ void UPVRRenderDevice::EmitHeader( pvr_list_t List, DWORD PolyFlags, const FTexS
 		// depth buffer alone, letting the world overwrite it.
 		//
 		// depth.write is the raw hardware "Z-write disable" bit despite its
-		// "Enable depth writes" doc comment: pvr_prim.c does
+		// "Enable depth writes" doc comment: KOS header compilation does
 		//   FIELD_PREP(PVR_TA_PM1_DEPTHWRITE, depth.write)
 		// so 0 = writes ENABLED, 1 = writes DISABLED. Always assign
 		// PVR_DEPTHWRITE_ENABLE/DISABLE, never true/false.
@@ -820,7 +866,10 @@ void UPVRRenderDevice::EmitHeader( pvr_list_t List, DWORD PolyFlags, const FTexS
 		? PVR_FOG_TABLE : PVR_FOG_DISABLE;
 
 	pvr_poly_hdr_t Hdr;
-	pvr_poly_compile( &Hdr, &Cxt );
+	{
+		DC_FRAME_SCOPE(DCFS_HeaderCompile);
+		pvr_poly_compile( &Hdr, &Cxt );
+	}
 
 	pvr_poly_hdr_t* Out = (pvr_poly_hdr_t*)PVRAlloc32( List );
 	*Out = Hdr;
@@ -846,17 +895,25 @@ void UPVRRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& Surf
 
 	const DWORD BaseFlags = AdjustFlags( Surface.PolyFlags );
 	const pvr_list_t BaseList = ListFor( BaseFlags );
+	const UBOOL DrawBase = BaseList == GPVRDirectList;
+	const UBOOL DrawLight = GPVRDirectList == PVR_LIST_TR_POLY
+		&& Surface.LightMap != NULL && !CurrentSceneNode.bIsSky;
+	const UBOOL DrawFog = GPVRDirectList == PVR_LIST_TR_POLY
+		&& Surface.FogMap != NULL && !CurrentSceneNode.bIsSky;
+	if( !DrawBase && !DrawLight && !DrawFog )
+		return;
 
-	// Bind both textures up front so the per-polygon loop can emit the base
-	// and lightmap passes from one set of screen coordinates.
-	SetTexture( *Surface.Texture, ( Surface.PolyFlags & PF_Masked ), 0.f );
+	// Only bind textures needed by the active TA list.
 	FTexState Base;
-	CaptureTexState( Base );
+	if( DrawBase )
+	{
+		SetTexture( *Surface.Texture, ( Surface.PolyFlags & PF_Masked ), 0.f );
+		CaptureTexState( Base );
+	}
 
-	const UBOOL HasLightMap = ( Surface.LightMap != NULL ) && !CurrentSceneNode.bIsSky;
 	FTexState Light;
 	DWORD LightFlags = 0;
-	if( HasLightMap )
+	if( DrawLight )
 	{
 		SetTexture( *Surface.LightMap, 0, -0.5f );
 		CaptureTexState( Light );
@@ -864,10 +921,9 @@ void UPVRRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& Surf
 	}
 
 	// Volumetric light shafts, when the device advertises fog maps.
-	const UBOOL HasFogMap = ( Surface.FogMap != NULL ) && !CurrentSceneNode.bIsSky;
 	FTexState Fog;
 	DWORD FogFlags = 0;
-	if( HasFogMap )
+	if( DrawFog )
 	{
 		SetTexture( *Surface.FogMap, ( Surface.PolyFlags & PF_Masked ), -0.5f );
 		CaptureTexState( Fog );
@@ -939,7 +995,7 @@ void UPVRRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& Surf
 		const DWORD MaxBytes = 32 + Count * 32;
 
 		// Base texture pass.
-		if( PVRBeginDraw( BaseList, MaxBytes ) )
+		if( DrawBase && PVRBeginDraw( BaseList, MaxBytes ) )
 		{
 			EmitHeader( BaseList, BaseFlags, &Base, 0 );
 			for( i = 0; i < Count; ++i )
@@ -951,7 +1007,7 @@ void UPVRRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& Surf
 		}
 
 		// Lightmap modulate pass.
-		if( HasLightMap && PVRBeginDraw( PVR_LIST_TR_POLY, MaxBytes ) )
+		if( DrawLight && PVRBeginDraw( PVR_LIST_TR_POLY, MaxBytes ) )
 		{
 			EmitHeader( PVR_LIST_TR_POLY, LightFlags, &Light, 0 );
 			for( i = 0; i < Count; ++i )
@@ -963,7 +1019,7 @@ void UPVRRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& Surf
 		}
 
 		// Volumetric fog pass.
-		if( HasFogMap && PVRBeginDraw( PVR_LIST_TR_POLY, MaxBytes ) )
+		if( DrawFog && PVRBeginDraw( PVR_LIST_TR_POLY, MaxBytes ) )
 		{
 			EmitHeader( PVR_LIST_TR_POLY, FogFlags, &Fog, 0 );
 			for( i = 0; i < Count; ++i )
@@ -995,6 +1051,24 @@ static inline void PVRBuildGouraudVert( const FTransTexture& P, FLOAT UMult, FLO
 	Out.ARGB = Modulated ? 0xFFFFFFFFu : PVRPackLight( P.Light );
 }
 
+// The common, unclipped mesh strip writes its final 32-byte TA vertex in
+// place.  In particular, do not construct an FPVRVert on the stack and copy
+// its fields into the store queue for every vertex.
+static inline void PVREmitGouraudVert( pvr_list_t List, const FTransTexture& P,
+	FLOAT UMult, FLOAT VMult, UBOOL Modulated, DWORD Flags )
+{
+	pvr_vertex_t* Vtx = (pvr_vertex_t*)PVRAlloc32( List );
+	Vtx->flags = Flags;
+	Vtx->x = P.ScreenX;
+	Vtx->y = P.ScreenY;
+	Vtx->z = P.RZ;
+	Vtx->u = P.U * UMult;
+	Vtx->v = P.V * VMult;
+	Vtx->argb = Modulated ? 0xFFFFFFFFu : PVRPackLight( P.Light );
+	Vtx->oargb = 0;
+	PVRCommit32( List, Vtx );
+}
+
 static inline void PVRBuildGouraudClipVert( const FTransTexture& P, FLOAT UMult, FLOAT VMult, UBOOL Modulated, FPVRClipVert& Out )
 {
 	Out.X    = P.Point.X;
@@ -1024,15 +1098,18 @@ static void PVREmitClippedTriangle( pvr_list_t List, const FSceneNode* Frame, co
 void UPVRRenderDevice::DrawGouraudPolygon( FSceneNode* Frame, FTextureInfo& Texture, FTransTexture** Pts, INT NumPts, DWORD PolyFlags, FSpanBuffer* SpanBuffer )
 {
 	guard(UPVRRenderDevice::DrawGouraudPolygon);
+	PVRMeshOIXLeave();
 
 	if( NumPts < 3 || NumPts > FBspNode::MAX_FINAL_VERTICES )
+		return;
+	const DWORD Flags = AdjustFlags( PolyFlags );
+	const pvr_list_t List = ListFor( Flags );
+	if( List != GPVRDirectList )
 		return;
 
 	SetSceneNode( Frame );
 	SetTexture( Texture, ( PolyFlags & PF_Masked ), 0.f );
 
-	const DWORD Flags = AdjustFlags( PolyFlags );
-	const pvr_list_t List = ListFor( Flags );
 	const UBOOL Modulated = ( PolyFlags & PF_Modulated ) != 0;
 
 	UBOOL NeedsClip = 0;
@@ -1079,15 +1156,18 @@ void UPVRRenderDevice::DrawGouraudPolygon( FSceneNode* Frame, FTextureInfo& Text
 void UPVRRenderDevice::DrawGouraudTriStrip( FSceneNode* Frame, FTextureInfo& Texture, FTransTexture** Pts, INT NumPts, DWORD PolyFlags, FSpanBuffer* SpanBuffer )
 {
 	guard(UPVRRenderDevice::DrawGouraudTriStrip);
+	PVRMeshOIXLeave();
 
 	if( NumPts < 3 )
+		return;
+	const DWORD Flags = AdjustFlags( PolyFlags );
+	const pvr_list_t List = ListFor( Flags );
+	if( List != GPVRDirectList )
 		return;
 
 	SetSceneNode( Frame );
 	SetTexture( Texture, ( PolyFlags & PF_Masked ), 0.f );
 
-	const DWORD Flags = AdjustFlags( PolyFlags );
-	const pvr_list_t List = ListFor( Flags );
 	const UBOOL Modulated = ( PolyFlags & PF_Modulated ) != 0;
 
 	UBOOL NeedsClip = 0;
@@ -1106,11 +1186,8 @@ void UPVRRenderDevice::DrawGouraudTriStrip( FSceneNode* Frame, FTextureInfo& Tex
 			return;
 		EmitHeader( List, Flags, &Tex, 0 );
 		for( i = 0; i < NumPts; ++i )
-		{
-			FPVRVert V;
-			PVRBuildGouraudVert( *Pts[i], TexInfo.UMult, TexInfo.VMult, Modulated, V );
-			PVREmitVert( List, V, ( i == NumPts - 1 ) ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX );
-		}
+			PVREmitGouraudVert( List, *Pts[i], TexInfo.UMult, TexInfo.VMult,
+				Modulated, ( i == NumPts - 1 ) ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX );
 		return;
 	}
 
@@ -1133,6 +1210,90 @@ void UPVRRenderDevice::DrawGouraudTriStrip( FSceneNode* Frame, FTextureInfo& Tex
 	unguard;
 }
 
+void UPVRRenderDevice::BeginCookedMesh()
+{
+	PVRMeshOIXLeave();
+	GPVRMeshlet = INDEX_NONE;
+	GPVRMeshScratchCount = 0;
+}
+
+void UPVRRenderDevice::EndCookedMesh()
+{
+	PVRMeshOIXLeave();
+}
+
+UBOOL UPVRRenderDevice::DrawCookedMeshStrip( FSceneNode* Frame, FTextureInfo& Texture,
+	FTransTexture** Pts, INT NumPts, DWORD PolyFlags, FSpanBuffer* SpanBuffer, INT MeshletId )
+{
+	// Cooked opaque strips use OIX by default, including short strips. All
+	// other lists and near-plane clipping retain the direct-SQ renderer.
+	if( !GPVRMeshOIXSupported || NumPts < 3 || NumPts > 256
+		|| GPVRDirectList != PVR_LIST_OP_POLY )
+		return 0;
+	const DWORD Flags = AdjustFlags(PolyFlags);
+	if( ListFor(Flags) != PVR_LIST_OP_POLY )
+		return 0;
+	for( INT i=0; i<NumPts; ++i )
+		if( Pts[i]->Point.Z < PVR_NEAR_Z )
+			return 0;
+
+	// Texture setup may stream, upload, or yield. Keep OIX only across runs
+	// that use the already-bound state; end the phase before any new bind.
+	if( !GPVRMeshOIXEntered || GPVRMeshFrame != Frame || GPVRMeshTexture != &Texture )
+	{
+		PVRMeshOIXLeave();
+		SetSceneNode(Frame);
+		SetTexture(Texture, (PolyFlags & PF_Masked), 0.f);
+		GPVRMeshFrame = Frame;
+		GPVRMeshTexture = &Texture;
+	}
+	FTexState Tex;
+	CaptureTexState(Tex);
+	if( !PVRBeginDraw(PVR_LIST_OP_POLY, 32 + NumPts * 32) )
+		return 1;
+	EmitHeader(PVR_LIST_OP_POLY, Flags, &Tex, 0);
+
+	// Each cooker meshlet has at most 128 source vertices. Reserve up to 256
+	// cache lines for UV seams, and recycle those lines on a meshlet change.
+	if( GPVRMeshlet != MeshletId || GPVRMeshScratchCount + NumPts > 256 )
+	{
+		appMemset(GPVRMeshKeys, 0, sizeof(GPVRMeshKeys));
+		GPVRMeshScratchCount = 0;
+		GPVRMeshlet = MeshletId;
+	}
+	if( !GPVRMeshOIXEntered )
+	{
+		PVRMeshOIXEnterP2();
+		GPVRMeshOIXEntered = 1;
+	}
+
+	const UBOOL Modulated = (PolyFlags & PF_Modulated) != 0;
+	for( INT i=0; i<NumPts; ++i )
+	{
+		const FTransTexture* P = Pts[i];
+		INT Slot = ((uintptr_t)P >> 4) & 255;
+		while( GPVRMeshKeys[Slot] && GPVRMeshKeys[Slot] != P )
+			Slot = (Slot + 1) & 255;
+		pvr_vertex_t* Vtx = &GPVRMeshScratch[Slot];
+		if( !GPVRMeshKeys[Slot] )
+		{
+			GPVRMeshKeys[Slot] = P;
+			++GPVRMeshScratchCount;
+			Vtx->x = P->ScreenX;
+			Vtx->y = P->ScreenY;
+			Vtx->z = P->RZ;
+		}
+		Vtx->flags = (i == NumPts - 1) ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
+		Vtx->u = P->U * TexInfo.UMult;
+		Vtx->v = P->V * TexInfo.VMult;
+		Vtx->argb = Modulated ? 0xFFFFFFFFu : PVRPackLight(P->Light);
+		Vtx->oargb = 0;
+		__asm__ __volatile__("ocbwb @%0" : : "r"(Vtx) : "memory");
+	}
+	GDCMeshOIXActive = 1;
+	return 1;
+}
+
 /*-----------------------------------------------------------------------------
 	Tiles.
 -----------------------------------------------------------------------------*/
@@ -1140,6 +1301,8 @@ void UPVRRenderDevice::DrawGouraudTriStrip( FSceneNode* Frame, FTextureInfo& Tex
 void UPVRRenderDevice::DrawTile( FSceneNode* Frame, FTextureInfo& Texture, FLOAT X, FLOAT Y, FLOAT XL, FLOAT YL, FLOAT U, FLOAT V, FLOAT UL, FLOAT VL, FSpanBuffer* Span, FLOAT Z, FPlane Light, FPlane Fog, DWORD PolyFlags )
 {
 	guard(UPVRRenderDevice::DrawTile);
+	if( GPVRDirectList != PVR_LIST_TR_POLY )
+		return;
 
 	// Mark as UI tile so UploadTexture keeps SH4-side data for reloads.
 	TexInfo.bIsTile = true;
@@ -1533,13 +1696,31 @@ void UPVRRenderDevice::SetTexture( FTextureInfo& Info, DWORD PolyFlags, FLOAT Pa
 		}
 
 		// New texture or it has changed, upload it to VRAM.
+		FTexState HeaderBefore;
+		CaptureTexState( HeaderBefore );
 		Bind->LastType = NewType;
 		Info.TextureFlags &= ~TF_RealtimeChanged;
 		UploadTexture( Info, NewTexture, Masked );
 
-		// A bind whose VRAM address just moved invalidates any header that
-		// referenced it.
-		PVRInvalidateHeaders();
+		FTexState HeaderAfter;
+		CaptureTexState( HeaderAfter );
+		const UBOOL AddressChanged = HeaderBefore.Tex != HeaderAfter.Tex;
+		const UBOOL OtherStateChanged = HeaderBefore.Key != HeaderAfter.Key
+			|| HeaderBefore.Format != HeaderAfter.Format
+			|| HeaderBefore.Width != HeaderAfter.Width
+			|| HeaderBefore.Height != HeaderAfter.Height
+			|| HeaderBefore.MipMapped != HeaderAfter.MipMapped;
+		if( AddressChanged || OtherStateChanged )
+		{
+			DC_FRAME_COUNT(AddressChanged
+				? DCFC_HeaderUploadAddress : DCFC_HeaderUploadState);
+			PVRInvalidateHeaders();
+		}
+		else
+		{
+			// Rewriting the same VRAM tile changes pixels, not PVR context.
+			DC_FRAME_COUNT(DCFC_HeaderUploadStable);
+		}
 	}
 
 	ApplyAtlasTransform( Bind );
@@ -1882,6 +2063,7 @@ pvr_ptr_t UPVRRenderDevice::AllocateTexture( INT Size )
 			|| Candidate.LastUsedFrame == TextureFrame )
 			continue;
 		pvr_mem_free( Candidate.Tex );
+		DCFrameCount(DCFC_VRAMEvict);
 		if( Candidate.SizeBytes > 0 && VRAMUsed >= (DWORD)Candidate.SizeBytes )
 			VRAMUsed -= (DWORD)Candidate.SizeBytes;
 		Candidate.Tex = NULL;
@@ -2108,6 +2290,8 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, UBOOL NewTexture, UBOO
 			DCLoaded = (BYTE*)appMalloc( Mip0->StreamData.Size(), "DatTexStream" );
 			{
 				DC_FRAME_SCOPE(DCFS_Read);
+				FDCFrameScope ReadDTScope(DCFS_ReadDT);
+				DCFrameCount(DCFC_ReadDTBytes, Mip0->StreamData.Size());
 				Mip0->StreamData.Read( DCLoaded );
 			}
 			Mip0->DataPtr = DCLoaded;
@@ -2215,6 +2399,8 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, UBOOL NewTexture, UBOO
 				appErrorf( "Invalid raw cooked lightmap size" );
 			{
 				DC_FRAME_SCOPE(DCFS_Read);
+				FDCFrameScope ReadLightmapScope(DCFS_ReadLightmap);
+				DCFrameCount(DCFC_ReadLightmapBytes, SizeBytes);
 				Mip0->DCExternalStream->ReadRange(Mip0->DCExternalOffset, Pixels, SizeBytes);
 			}
 		}
@@ -2224,6 +2410,8 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, UBOOL NewTexture, UBOO
 			BYTE* Packed = (BYTE*)appMalloc( PackedSize, "DCLightmapPacked" );
 			{
 				DC_FRAME_SCOPE(DCFS_Read);
+				FDCFrameScope ReadLightmapScope(DCFS_ReadLightmap);
+				DCFrameCount(DCFC_ReadLightmapBytes, PackedSize);
 				Mip0->DCExternalStream->ReadRange(Mip0->DCExternalOffset, Packed, PackedSize);
 			}
 			uLongf OutputSize = SizeBytes;
@@ -2240,9 +2428,12 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, UBOOL NewTexture, UBOO
 		{
 			appErrorf( "Unsupported cooked lightmap codec" );
 		}
-		// Release against the dimensions the slots were reserved with, before
-		// the new ones overwrite them.
-		LightAtlasRelease( Bind );
+		// A reload of the same tile can update its current atlas address. Only
+		// release the reservation when its dimensions really change.
+		if( IsAtlased( Bind )
+			&& ( Bind->DCWidth != Mip0->USize || Bind->DCHeight != Mip0->VSize ) )
+			LightAtlasRelease( Bind );
+		const UBOOL KeptSlot = IsAtlased( Bind );
 
 		Bind->DCWidth = Mip0->USize;
 		Bind->DCHeight = Mip0->VSize;
@@ -2252,7 +2443,7 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, UBOOL NewTexture, UBOO
 
 		// Prefer a shared page. Every tile that lands in one is a texture
 		// header the translucent pass no longer has to emit.
-		if( LightAtlasPlace( Bind, Mip0->USize, Mip0->VSize ) )
+		if( KeptSlot || LightAtlasPlace( Bind, Mip0->USize, Mip0->VSize ) )
 		{
 			if( Bind->Tex )
 			{
@@ -2486,7 +2677,7 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, UBOOL NewTexture, UBOO
 		}
 		else
 		{
-			if( Bind->Tex )
+			if( Bind->Tex && Bind->SizeBytes != SizeBytes )
 			{
 				pvr_mem_free( Bind->Tex );
 				if( Bind->SizeBytes > 0 && VRAMUsed >= (DWORD)Bind->SizeBytes )
@@ -2494,13 +2685,17 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, UBOOL NewTexture, UBOO
 				Bind->Tex = NULL;
 				Bind->SizeBytes = 0;
 			}
-			Bind->Tex = AllocateTexture( SizeBytes );
-			if( Bind->Tex )
+			if( !Bind->Tex )
 			{
-				pvr_txr_load( Lin, Bind->Tex, SizeBytes );
-				Bind->SizeBytes = SizeBytes;
-				VRAMUsed += SizeBytes;
+				Bind->Tex = AllocateTexture( SizeBytes );
+				if( Bind->Tex )
+				{
+					Bind->SizeBytes = SizeBytes;
+					VRAMUsed += SizeBytes;
+				}
 			}
+			if( Bind->Tex )
+				pvr_txr_load( Lin, Bind->Tex, SizeBytes );
 			Bind->DCFormat = PVR_TXRFMT_RGB565 | PVR_TXRFMT_NONTWIDDLED;
 		}
 	}

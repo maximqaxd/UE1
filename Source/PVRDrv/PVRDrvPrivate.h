@@ -12,11 +12,8 @@
 //
 // Fixed function PVR renderer for the Dreamcast.
 //
-// Submission model: the opaque list is opened in Lock() and written straight
-// to the store queues.  Punch-through and translucent primitives are appended
-// to two flat arenas of finished 32-byte TA payloads and replayed in Unlock(),
-// which is what lets the HUD (drawn after the world) reach both lists without
-// any per-primitive allocation.
+// The occluded world is emitted directly in OP, PT and TR passes. The HUD is
+// drawn into the still-open TR list after DrawWorld returns.
 //
 class DLL_EXPORT UPVRRenderDevice : public URenderDevice
 {
@@ -43,11 +40,11 @@ class DLL_EXPORT UPVRRenderDevice : public URenderDevice
 	// Options.
 	UBOOL NoFiltering;
 	UBOOL UseTriStrips;
+	UBOOL UseMeshOIX;
 	UBOOL DistanceFog;
 	UBOOL Overbright;
 	UBOOL VolumetricFog;
 	INT   FogDistanceDefault;
-	INT   CommandBufferKB;
 
     // All currently cached textures (CacheID -> VRAM ptr + last type).
 	struct FTexBind
@@ -188,9 +185,15 @@ class DLL_EXPORT UPVRRenderDevice : public URenderDevice
 	virtual UBOOL Exec( const char* Cmd, FOutputDevice* Out ) override;
 	virtual void Lock( FPlane FlashScale, FPlane FlashFog, FPlane ScreenClear, DWORD RenderLockFlags, BYTE* InHitData, INT* InHitSize ) override;
 	virtual void Unlock( UBOOL Blit ) override;
+	virtual UBOOL UsesOrderedLists() const override { return 1; }
+	virtual void BeginRenderPass( INT Pass ) override;
+	virtual UBOOL WantsBspSurface( DWORD PolyFlags, INT Pass ) const override;
 	virtual void DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& Surface, FSurfaceFacet& Facet ) override;
 	virtual void DrawGouraudPolygon( FSceneNode* Frame, FTextureInfo& Texture, FTransTexture** Pts, INT NumPts, DWORD PolyFlags, FSpanBuffer* SpanBuffer ) override;
 	virtual void DrawGouraudTriStrip( FSceneNode* Frame, FTextureInfo& Texture, FTransTexture** Pts, INT NumPts, DWORD PolyFlags, FSpanBuffer* SpanBuffer ) override;
+	virtual void BeginCookedMesh() override;
+	virtual void EndCookedMesh() override;
+	virtual UBOOL DrawCookedMeshStrip( FSceneNode* Frame, FTextureInfo& Texture, FTransTexture** Pts, INT NumPts, DWORD PolyFlags, FSpanBuffer* SpanBuffer, INT MeshletId ) override;
 	virtual void DrawTile( FSceneNode* Frame, FTextureInfo& Texture, FLOAT X, FLOAT Y, FLOAT XL, FLOAT YL, FLOAT U, FLOAT V, FLOAT UL, FLOAT VL, FSpanBuffer* Span, FLOAT Z, FPlane Light, FPlane Fog, DWORD PolyFlags ) override;
 	virtual void EndFlash() override;
 	virtual void GetStats( char* Result ) override;

@@ -1094,7 +1094,7 @@ ULevel* UGameEngine::LoadMap( const FURL& URL, UPendingLevel* Pending, char* Err
 	}
 	if( GLevel->IsServer() && !Info->Game )
 	{
-#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+#if defined(PLATFORM_DREAMCAST)
 		DCProfileMemory( "gameinfo_pre" );
 #endif
 		// Get the GameInfo class.
@@ -1111,7 +1111,7 @@ ULevel* UGameEngine::LoadMap( const FURL& URL, UPendingLevel* Pending, char* Err
 		debugf( NAME_Log, "Game class is '%s'", GameClass->GetName() );
 		Info->Game = (AGameInfo*)GLevel->SpawnActor( GameClass );
 		check(Info->Game!=NULL);
-#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+#if defined(PLATFORM_DREAMCAST)
 		DCProfileMemory( "gameinfo_post" );
 #endif
 	}
@@ -1355,6 +1355,11 @@ void UGameEngine::Draw( UViewport* Viewport, BYTE* HitData, INT* HitSize )
 	Viewport->Actor->eventPreRender( Viewport->Canvas );
 	if( Frame->X>0 && Frame->Y>0 )
 		Render->DrawWorld( Frame );
+	#if defined(PLATFORM_DREAMCAST)
+	// The HUD and flash are TR. Even an empty viewport must advance past OP/PT.
+	if( Viewport->RenDev->UsesOrderedLists() )
+		Viewport->RenDev->BeginRenderPass( 2 );
+	#endif
 	Viewport->RenDev->EndFlash();
 	Viewport->Actor->eventPostRender( Viewport->Canvas );
 	if( Viewport->Console )

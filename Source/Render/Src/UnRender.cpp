@@ -1636,6 +1636,12 @@ void URender::OccludeBsp( FSceneNode* Frame )
 	INT					DrawBin;
 	INT                 NumActiveZones;
 	BYTE                ActiveZones[64];
+	UBOOL               UpdatesScreen;
+#if defined(PLATFORM_DREAMCAST)
+	UBOOL               OrdinaryHardware;
+	UBOOL               NoOutput;
+	UBOOL               BypassOpaqueSpans;
+#endif
 	guard(URender::OccludeBsp);
 	DC_FRAME_SCOPE(DCFS_BSP);
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
@@ -1924,18 +1930,42 @@ void URender::OccludeBsp( FSceneNode* Frame )
 							break;
 				}
 
-				// Allocate fragment span buffer.
-				TempDrawList->Span.AllocIndex( RasterStartY, RasterEndY, (Merge || !RenDev->SpanBased) ? &GMem : &GDynMem );
+				// Ordinary hardware polygons retain vertices, not visible spans.
+				// Portals, sky and mirrors still need exact fragment masks.
+#if defined(PLATFORM_DREAMCAST)
+				OrdinaryHardware = !RenDev->SpanBased
+					&& !(PolyFlags & (PF_Portal|PF_Mirrored|PF_FakeBackdrop|PF_Invisible));
+				NoOutput = OrdinaryHardware && GDCSpanMode >= 1;
+				BypassOpaqueSpans = OrdinaryHardware && GDCSpanMode >= 2
+					&& !(PolyFlags & PF_NoOcclude);
+				if( NoOutput )
+					TempDrawList->Span.AllocIndex( 0, 0, &GMem );
+				else
+#endif
+					TempDrawList->Span.AllocIndex( RasterStartY, RasterEndY,
+						(Merge || !RenDev->SpanBased) ? &GMem : &GDynMem );
 
 				// Perform the span buffer clipping and updating.
 				uclock(GStat.SpanTime);
-				if
-				(	!(PolyFlags & PF_NoOcclude)
-				||	(PolyFlags&(PF_Portal|PF_Invisible))==(PF_Portal|PF_Invisible) 
-				||	(PolyFlags&(PF_Mirrored)) )
-					Visible = TempDrawList->Span.CopyFromRasterUpdate( *SpanBuffer, RasterStartY, RasterEndY, HackRaster+RasterStartY );
-				else		
-					Visible = TempDrawList->Span.CopyFromRaster( *SpanBuffer, RasterStartY, RasterEndY, HackRaster+RasterStartY );
+				UpdatesScreen = !(PolyFlags & PF_NoOcclude)
+					|| (PolyFlags&(PF_Portal|PF_Invisible))==(PF_Portal|PF_Invisible)
+					|| (PolyFlags&PF_Mirrored);
+#if defined(PLATFORM_DREAMCAST)
+				if( BypassOpaqueSpans )
+				{
+					// Diagnostic only: later portals no longer see these walls.
+					Visible = 1;
+					DC_FRAME_COUNT(DCFC_SpanBypassed);
+				}
+				else if( NoOutput )
+					Visible = UpdatesScreen
+						? SpanBuffer->TestRasterUpdate( RasterStartY, RasterEndY, HackRaster+RasterStartY )
+						: SpanBuffer->TestRaster( RasterStartY, RasterEndY, HackRaster+RasterStartY );
+				else
+#endif
+					Visible = UpdatesScreen
+						? TempDrawList->Span.CopyFromRasterUpdate( *SpanBuffer, RasterStartY, RasterEndY, HackRaster+RasterStartY )
+						: TempDrawList->Span.CopyFromRaster( *SpanBuffer, RasterStartY, RasterEndY, HackRaster+RasterStartY );
 				uunclock(GStat.SpanTime);
 
 				// Process the spans.
@@ -2386,6 +2416,11 @@ void URender::OccludeFrame( FSceneNode* Frame )
 	unguard;
 }
 
+#if defined(PLATFORM_DREAMCAST)
+// Only the direct PVR renderer replays the visible frame for ordered TA lists.
+static INT GDCOrderedWorldPass = -1;
+#endif
+
 void URender::DrawFrame( FSceneNode* Frame )
 {
 	guard(URender::DrawFrame);
@@ -2429,6 +2464,11 @@ void URender::DrawFrame( FSceneNode* Frame )
 			// Setup for this surface.
 			FBspDrawList*	Draw = DrawPtr->Ptr;
 			FBspSurf*		Surf = &Model->Surfs->Element( Draw->iSurf );
+			#if defined(PLATFORM_DREAMCAST)
+			if( GDCOrderedWorldPass >= 0
+				&& !Viewport->RenDev->WantsBspSurface( Draw->PolyFlags, GDCOrderedWorldPass ) )
+				continue;
+			#endif
 
 			// Setup panning.
 			FLOAT PanU = Surf->PanU;
@@ -2501,9 +2541,16 @@ void URender::DrawFrame( FSceneNode* Frame )
 				Model->Vectors->Element(Surf->vNormal)
 			);
 
+			// Direct TA submission needs the lightmap only in the TR pass.
+			#if defined(PLATFORM_DREAMCAST)
+			const UBOOL DoSurfaceLight = (GDCOrderedWorldPass < 0 || GDCOrderedWorldPass == 2);
+			#else
+			const UBOOL DoSurfaceLight = 1;
+			#endif
 			// Setup lighting for this surface.
 			if
-			(	Surf->iLightMap!=INDEX_NONE
+			(	DoSurfaceLight
+			&&	Surf->iLightMap!=INDEX_NONE
 			&&	Viewport->Actor->RendMap==REN_DynLight
 			&&	Model->LightMap.Num() 
 			&&	!Viewport->Client->NoLighting )
@@ -2565,9 +2612,16 @@ void URender::DrawFrame( FSceneNode* Frame )
 				DrawActorSprite( Frame, Sprite );
 	}
 
+	// Optics are a side effect: update them once, during the TR pass.
+	#if defined(PLATFORM_DREAMCAST)
+	const UBOOL DoOptics = (GDCOrderedWorldPass < 0 || GDCOrderedWorldPass == 2);
+	#else
+	const UBOOL DoOptics = 1;
+	#endif
 	// Optics.
 	if
-	(	Viewport->Actor->Region.iLeaf!=INDEX_NONE
+	(	DoOptics
+	&&	Viewport->Actor->Region.iLeaf!=INDEX_NONE
 	&&	Viewport->Actor->Region.Zone 
 	&&	Viewport->RenDev->Coronas 
 	&&	Frame->Recursion==0 )
@@ -2661,27 +2715,55 @@ void URender::DrawWorld( FSceneNode* Frame )
 	FMemMark VectorMark( VectorMem );
 	GFrameStamp++;
 
-	// Occlude and render all scene frames.
+	// Occlude once. Ordered-list devices submit the retained frame separately
+	// to OP, PT and TR; every list is then written directly to the TA.
 	OccludeFrame( Frame );
-	DrawFrame( Frame );
 
 	// Draw the player's weapon on top.
 	APawn* Actor
 	= Frame->Viewport->Actor->ViewTarget ? Cast<APawn>( Frame->Viewport->Actor->ViewTarget )
 	: Frame->Viewport->Actor->bBehindView ? NULL 
 	: Frame->Viewport->Actor;
-	if
+	const UBOOL DrawWeapon =
 	(	!GIsEditor
 	&&	Actor
 	&&	Actor->Weapon
-	&&	(Frame->Viewport->Actor->ShowFlags & SHOW_Actors) )
+	&&	(Frame->Viewport->Actor->ShowFlags & SHOW_Actors) );
+	if( DrawWeapon )
 	{
 		Actor->Weapon->eventInvCalcView();
-		Actor->Weapon->bHidden = 0;
 		Actor->XLevel->SetActorZone( Actor->Weapon, 1, 0 );
-		GRender->DrawActor( Frame, Actor->Weapon );
-		Actor->Weapon->bHidden = 1;
 	}
+	#if defined(PLATFORM_DREAMCAST)
+	const UBOOL OrderedLists = Frame->Viewport->RenDev->UsesOrderedLists();
+	const INT NumPasses = OrderedLists ? 3 : 1;
+	#else
+	const INT NumPasses = 1;
+	#endif
+	for( INT OrderedPass=0; OrderedPass<NumPasses; ++OrderedPass )
+	{
+		// DrawFrame's sorted draw arrays and mesh scratch belong to this pass;
+		// the occlusion result was allocated before this mark and stays live.
+		FMemMark PassMark(GMem);
+		#if defined(PLATFORM_DREAMCAST)
+		if( OrderedLists )
+		{
+			GDCOrderedWorldPass = OrderedPass;
+			Frame->Viewport->RenDev->BeginRenderPass( OrderedPass );
+		}
+		#endif
+		DrawFrame( Frame );
+		if( DrawWeapon )
+		{
+			Actor->Weapon->bHidden = 0;
+			GRender->DrawActor( Frame, Actor->Weapon );
+			Actor->Weapon->bHidden = 1;
+		}
+		PassMark.Pop();
+	}
+	#if defined(PLATFORM_DREAMCAST)
+	GDCOrderedWorldPass = -1;
+	#endif
 
 	MemMark.Pop();
 	DynMark.Pop();
