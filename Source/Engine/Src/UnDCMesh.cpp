@@ -5,6 +5,7 @@
 static const INT DCFrameTag = -0x44434631;
 static const INT DCFrameTemporalTag = -0x44434632;
 static const INT DCTopologyTag = -0x44435431;
+static const INT DCTopologyClusterTag = -0x44435432;
 
 static INT DCFrameWordCount( const UMesh& Mesh )
 {
@@ -400,10 +401,12 @@ void UMesh::SerializeDCTopology( FArchive& Ar )
 		Ar << Tris << DCRuns << DCMaterials << DCIndices << DCUVs;
 		return;
 	}
-	INT Count = DCRuns.Num() ? DCTopologyTag : Tris.Num();
+	INT Count = DCRuns.Num() ? (DCClusteredRuns ? DCTopologyClusterTag : DCTopologyTag) : Tris.Num();
 	Ar << AR_INDEX(Count);
-	if( Count == DCTopologyTag )
+	if( Count == DCTopologyTag || Count == DCTopologyClusterTag )
 	{
+		if( Ar.IsLoading() )
+			DCClusteredRuns = Count == DCTopologyClusterTag;
 		Ar << DCRuns << DCMaterials << DCIndices << DCUVs;
 	}
 	else
@@ -462,12 +465,43 @@ void UMesh::ValidateDCMesh()
 	for( INT i = 0; i < DCRuns.Num(); ++i )
 	{
 		FDCMeshRun& Run = DCRuns(i);
-		if( Run.Reserved || Run.Count < 3 || Run.First != Next
+		if( (!DCClusteredRuns && Run.Reserved) || Run.Count < 3 || Run.First != Next
 			|| Run.Count > DCIndices.Num() - Next || Run.Material >= DCMaterials.Num() )
 		{
 			appErrorf( "Invalid cooked mesh strip" );
 		}
 		Next += Run.Count;
+	}
+	if( DCClusteredRuns && DCRuns.Num() )
+	{
+		TArray<BYTE> Seen( FrameVerts );
+		appMemset( Seen.GetData(), 0, Seen.Num() );
+		INT Group = 0;
+		INT GroupVertices = 0;
+		for( INT RunIndex = 0; RunIndex < DCRuns.Num(); ++RunIndex )
+		{
+			const FDCMeshRun& Run = DCRuns(RunIndex);
+			if( Run.Reserved != Group )
+			{
+				if( Run.Reserved != Group + 1 )
+					appErrorf( "Invalid cooked meshlet order" );
+				Group = Run.Reserved;
+				GroupVertices = 0;
+				appMemset( Seen.GetData(), 0, Seen.Num() );
+			}
+			for( INT Slot = 0; Slot < Run.Count; ++Slot )
+			{
+				const INT Vertex = DCIndices(Run.First + Slot);
+				if( Vertex >= FrameVerts )
+					appErrorf( "Cooked meshlet vertex out of range" );
+				if( !Seen(Vertex) )
+				{
+					Seen(Vertex) = 1;
+					if( ++GroupVertices > 128 )
+						appErrorf( "Cooked meshlet exceeds 128 vertices" );
+				}
+			}
+		}
 	}
 	if( Next != DCIndices.Num() || DCIndices.Num() != DCUVs.Num() )
 	{
@@ -700,6 +734,9 @@ void UMesh::CookDCMesh()
 
 	TArray<BYTE> Used( Tris.Num() );
 	appMemset( Used.GetData(), 0, Used.Num() );
+	TArray<INT> TrialMarks( Tris.Num() );
+	appMemset( TrialMarks.GetData(), 0, TrialMarks.Num() * sizeof(INT) );
+	INT TrialId = 0;
 	for( INT Start = 0; Start < Tris.Num(); ++Start )
 	{
 		if( Used(Start) )
@@ -718,52 +755,128 @@ void UMesh::CookDCMesh()
 			FDCMeshMaterial Entry = { First.PolyFlags, First.TextureIndex };
 			DCMaterials.AddItem( Entry );
 		}
-		FDCMeshRun Run = { (_WORD)Material, 0, (_WORD)DCIndices.Num(), 3 };
-		for( INT i = 0; i < 3; ++i )
+		// The first corner of a strip is arbitrary, but it decides which edge
+		// can be extended. Try all three cyclic (winding-preserving) starts and
+		// keep the longest strip. Every triangle, UV seam and material is still
+		// checked by the full topology roundtrip below.
+		TArray<_WORD> BestIndices;
+		TArray<_WORD> BestUVs;
+		TArray<INT> BestTriangles;
+		for( INT Rotation = 0; Rotation < 3; ++Rotation )
 		{
-			DCIndices.AddItem( First.iVertex[i] );
-			DCUVs.AddItem( PackedUV(First.Tex[i]) );
-		}
-		Used(Start) = 1;
-		while( true )
-		{
-			INT A = DCIndices.Num() - 2;
-			INT B = DCIndices.Num() - 1;
-			if( Run.Count & 1 )
+			TArray<_WORD> CandidateIndices;
+			TArray<_WORD> CandidateUVs;
+			TArray<INT> CandidateTriangles;
+			for( INT Corner = 0; Corner < 3; ++Corner )
 			{
-				Exchange( A, B );
+				const INT SourceCorner = (Corner + Rotation) % 3;
+				CandidateIndices.AddItem( First.iVertex[SourceCorner] );
+				CandidateUVs.AddItem( PackedUV(First.Tex[SourceCorner]) );
 			}
-			INT Match = INDEX_NONE;
-			INT Corner = 0;
-			for( INT i = 0; i < Tris.Num() && Match == INDEX_NONE; ++i )
+			CandidateTriangles.AddItem( Start );
+			++TrialId;
+			TrialMarks(Start) = TrialId;
+		while( CandidateIndices.Num() < 128 )
 			{
-				const FMeshTri& Tri = Tris(i);
-				if( Used(i) || Tri.PolyFlags != First.PolyFlags || Tri.TextureIndex != First.TextureIndex )
+				INT A = CandidateIndices.Num() - 2;
+				INT B = CandidateIndices.Num() - 1;
+				if( CandidateIndices.Num() & 1 )
+					Exchange( A, B );
+				INT Match = INDEX_NONE;
+				INT MatchCorner = 0;
+				for( INT i = 0; i < Tris.Num() && Match == INDEX_NONE; ++i )
 				{
-					continue;
-				}
-				for( INT k = 0; k < 3; ++k )
-				{
-					INT Next = (k + 1) % 3;
-					if( Tri.iVertex[k] == DCIndices(A) && PackedUV(Tri.Tex[k]) == DCUVs(A)
-						&& Tri.iVertex[Next] == DCIndices(B) && PackedUV(Tri.Tex[Next]) == DCUVs(B) )
+					const FMeshTri& Tri = Tris(i);
+					if( Used(i) || TrialMarks(i) == TrialId
+						|| Tri.PolyFlags != First.PolyFlags
+						|| Tri.TextureIndex != First.TextureIndex )
+						continue;
+					for( INT Corner = 0; Corner < 3; ++Corner )
 					{
-						Match = i;
-						Corner = (k + 2) % 3;
-						break;
+						const INT Next = (Corner + 1) % 3;
+						if( Tri.iVertex[Corner] == CandidateIndices(A)
+							&& PackedUV(Tri.Tex[Corner]) == CandidateUVs(A)
+							&& Tri.iVertex[Next] == CandidateIndices(B)
+							&& PackedUV(Tri.Tex[Next]) == CandidateUVs(B) )
+						{
+							Match = i;
+							MatchCorner = (Corner + 2) % 3;
+							break;
+						}
 					}
 				}
+				if( Match == INDEX_NONE )
+					break;
+				CandidateIndices.AddItem( Tris(Match).iVertex[MatchCorner] );
+				CandidateUVs.AddItem( PackedUV(Tris(Match).Tex[MatchCorner]) );
+				CandidateTriangles.AddItem( Match );
+				TrialMarks(Match) = TrialId;
 			}
-			if( Match == INDEX_NONE )
+			if( CandidateTriangles.Num() > BestTriangles.Num() )
 			{
-				break;
+				BestIndices = CandidateIndices;
+				BestUVs = CandidateUVs;
+				BestTriangles = CandidateTriangles;
 			}
-			DCIndices.AddItem( Tris(Match).iVertex[Corner] );
-			DCUVs.AddItem( PackedUV(Tris(Match).Tex[Corner]) );
-			Used(Match) = 1;
-			++Run.Count;
 		}
+		FDCMeshRun Run = { (_WORD)Material, 0, (_WORD)DCIndices.Num(), (_WORD)BestIndices.Num() };
+		for( INT i = 0; i < BestIndices.Num(); ++i )
+		{
+			DCIndices.AddItem( BestIndices(i) );
+			DCUVs.AddItem( BestUVs(i) );
+		}
+		for( INT i = 0; i < BestTriangles.Num(); ++i )
+			Used(BestTriangles(i)) = 1;
 		DCRuns.AddItem( Run );
+	}
+
+	// Store a meshlet ID in the run's formerly reserved word. Meshlets keep
+	// input order (important for translucent materials) and contain at most
+	// 128 distinct animated vertices, matching one 8 KiB/64-byte TA workset.
+	INT MeshletCount = 0;
+	if( DCRuns.Num() )
+	{
+		TArray<BYTE> Seen( FrameVerts );
+		TArray<INT> TrialSeen( FrameVerts );
+		appMemset( Seen.GetData(), 0, Seen.Num() );
+		appMemset( TrialSeen.GetData(), 0, TrialSeen.Num() * sizeof(INT) );
+		INT Stamp = 0;
+		INT Unique = 0;
+		for( INT RunIndex = 0; RunIndex < DCRuns.Num(); ++RunIndex )
+		{
+			FDCMeshRun& Run = DCRuns(RunIndex);
+			INT Added = 0;
+			++Stamp;
+			for( INT Slot = 0; Slot < Run.Count; ++Slot )
+			{
+				const INT Vertex = DCIndices(Run.First + Slot);
+				if( !Seen(Vertex) && TrialSeen(Vertex) != Stamp )
+				{
+					TrialSeen(Vertex) = Stamp;
+					++Added;
+				}
+			}
+			if( RunIndex && Unique + Added > 128 )
+			{
+				++MeshletCount;
+				Unique = 0;
+				appMemset( Seen.GetData(), 0, Seen.Num() );
+			}
+			Run.Reserved = MeshletCount;
+			for( INT Slot = 0; Slot < Run.Count; ++Slot )
+			{
+				const INT Vertex = DCIndices(Run.First + Slot);
+				if( !Seen(Vertex) )
+				{
+					Seen(Vertex) = 1;
+					++Unique;
+				}
+			}
+			if( Unique > 128 )
+				appErrorf( "Meshlet vertex budget exceeded" );
+		}
+		++MeshletCount;
+		DCClusteredRuns = 1;
 	}
 
 	// Reconstruct and match oriented triangles, UV seams and materials before
@@ -815,8 +928,8 @@ void UMesh::CookDCMesh()
 	}
 	INT After = Verts.Num() * 4 + DCFrameWords.Num() * 2 + DCFrameOffsets.Num() * 4
 		+ DCRuns.Num() * 8 + DCMaterials.Num() * 8 + DCIndices.Num() * 4;
-	printf( "DCMESH %s frames=%i vertices=%i strips=%i indices=%i raw=%i cooked=%i\n",
-		GetPathName(), AnimFrames, FrameVerts, DCRuns.Num(), DCIndices.Num(), Before, After );
+	printf( "DCMESH %s frames=%i vertices=%i strips=%i indices=%i meshlets=%i raw=%i cooked=%i\n",
+		GetPathName(), AnimFrames, FrameVerts, DCRuns.Num(), DCIndices.Num(), MeshletCount, Before, After );
 	unguard;
 }
 #endif

@@ -54,6 +54,7 @@ UMesh::UMesh()
 	RotOrigin		= FRotator(0,0,0);
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
 	DCTemporalFrames = 0;
+	DCClusteredRuns = 0;
 #endif
 
 	// Flags.
@@ -331,6 +332,7 @@ UMesh::UMesh( INT NumPolys, INT NumVerts, INT NumFrames )
 
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
 	DCTemporalFrames = 0;
+	DCClusteredRuns = 0;
 #endif
 
 	// Set counts.

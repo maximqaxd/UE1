@@ -180,6 +180,7 @@ class ENGINE_API UMesh : public UPrimitive
 	TArray<_WORD>            DCIndices;
 	TArray<_WORD>            DCUVs;
 	UBOOL                    DCTemporalFrames;
+	UBOOL                    DCClusteredRuns;
 	void SerializeDCVerts( FArchive& Ar );
 	void SerializeDCTopology( FArchive& Ar );
 	void ValidateDCMesh();

@@ -352,7 +352,8 @@ static UBOOL EmitMeshStrip
 		Pts[Num++] = &V;
 	}
 
-	Frame->Viewport->RenDev->DrawGouraudTriStrip( Frame, Info, Pts, Num, PolyFlags, SpanBuffer );
+	if( !Frame->Viewport->RenDev->DrawCookedMeshStrip( Frame, Info, Pts, Num, PolyFlags, SpanBuffer, Run.Reserved ) )
+		Frame->Viewport->RenDev->DrawGouraudTriStrip( Frame, Info, Pts, Num, PolyFlags, SpanBuffer );
 	return 1;
 
 	unguardSlow;
@@ -420,6 +421,11 @@ void URender::DrawMesh
 	FVector* DCVertexNormals = NULL;
 #endif
 	FVector Hack = FVector(0,-8,0);
+#if defined(PLATFORM_DREAMCAST)
+	DCFrameCount( DCFC_MeshActors );
+	DCFrameCount( DCFC_MeshVerts, Mesh->FrameVerts );
+	DCFrameCount( DCFC_MeshTris, TriangleCount );
+#endif
 	UBOOL NotWeaponHeuristic=(Owner->Owner!=Frame->Viewport->Actor);
 	if( !Engine->Client->CurvedSurfaces )
 		ExtraFlags |= PF_Flat;
@@ -437,21 +443,33 @@ void URender::DrawMesh
 	UBOOL bWire=0;
 	guardSlow(Transform);
 	STAT(uclock(GStat.MeshGetFrameTime));
+#if defined(PLATFORM_DREAMCAST)
+	DCFrameEnter( DCFS_MeshFrame );
+#endif
 	Samples = New<FTransTexture>(GMem,Mesh->FrameVerts);
 	bWire = Frame->Viewport->IsOrtho() || Frame->Viewport->Actor->RendMap==REN_Wire;
 	Mesh->GetFrame( &Samples->Point, sizeof(Samples[0]), bWire ? GMath.UnitCoords : Coords, Owner );
+#if defined(PLATFORM_DREAMCAST)
+	DCFrameLeave( DCFS_MeshFrame );
+#endif
 	STAT(uunclock(GStat.MeshGetFrameTime));
 	unguardSlow;
 
 	// Compute outcodes.
 	BYTE Outcode = FVF_OutReject;
 	guardSlow(Outcode);
+#if defined(PLATFORM_DREAMCAST)
+	DCFrameEnter( DCFS_MeshOutcode );
+#endif
 	for( INT i=0; i<Mesh->FrameVerts; i++ )
 	{
 		Samples[i].Light.R = -1;
 		Samples[i].ComputeOutcode( Frame );
 		Outcode &= Samples[i].Flags;
 	}
+#if defined(PLATFORM_DREAMCAST)
+	DCFrameLeave( DCFS_MeshOutcode );
+#endif
 	unguardSlow;
 
 	// Render a wireframe view or textured view.
@@ -550,15 +568,21 @@ void URender::DrawMesh
 	{
 		// Process triangles.
 		guardSlow(Process);
-		TriPool    = New<FMeshTriSort>(GMem,TriangleCount);
-		TriNormals = New<FVector>(GMem,TriangleCount);
+#if defined(PLATFORM_DREAMCAST)
+		DCFrameEnter( DCFS_MeshPrepare );
+#endif
+		TriPool = New<FMeshTriSort>(GMem,TriangleCount);
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
 		if( Mesh->DCRuns.Num() )
 		{
 			DCVertexNormals = New<FVector>( GMem, Mesh->FrameVerts );
 			appMemset( DCVertexNormals, 0, Mesh->FrameVerts * sizeof(FVector) );
 		}
+		else
 #endif
+		{
+			TriNormals = New<FVector>(GMem,TriangleCount);
+		}
 
 		// Set up list for triangle sorting, adding all possibly visible triangles.
 		STAT(uclock(GStat.MeshProcessTime));
@@ -582,24 +606,38 @@ void URender::DrawMesh
 			DWORD PolyFlags = ExtraFlags | Tri->PolyFlags;
 
 			// Compute triangle normal.
-			TriNormals[i] = (V1.Point-V2.Point) ^ (V3.Point-V1.Point);
-			TriNormals[i] *= DivSqrtApprox(TriNormals[i].SizeSquared()+0.001);
+			FVector FaceNormal = (V1.Point-V2.Point) ^ (V3.Point-V1.Point);
+			// For this winding, FTriple(V1,V2,V3) is the negative dot of
+			// V1 with the face normal. Reuse the cross product for culling
+			// instead of evaluating a second three-vector determinant.
+#if defined(PLATFORM_DREAMCAST)
+			const FLOAT Facing = -(FaceNormal | V1.Point);
+#endif
+			FaceNormal *= DivSqrtApprox(FaceNormal.SizeSquared()+0.001);
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
 			if( DCVertexNormals )
 			{
 				for( INT Corner = 0; Corner < 3; ++Corner )
 				{
-					DCVertexNormals[Tri->iVertex[Corner]] += TriNormals[i];
+					DCVertexNormals[Tri->iVertex[Corner]] += FaceNormal;
 				}
 			}
+			else
 #endif
+			{
+				TriNormals[i] = FaceNormal;
+			}
 
 			// See if potentially visible.
 			if( !(V1.Flags & V2.Flags & V3.Flags) )
 			{
 				if
 				(	(PolyFlags & (PF_TwoSided|PF_Flat|PF_Invisible))!=(PF_Flat)
+#if defined(PLATFORM_DREAMCAST)
+				||	Frame->Mirror*Facing>0.0 )
+#else
 				||	Frame->Mirror*FTriple(V1.Point,V2.Point,V3.Point)>0.0 )
+#endif
 				{
 					// This is visible.
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
@@ -622,8 +660,15 @@ void URender::DrawMesh
 			}
 		}
 		STAT(uunclock(GStat.MeshProcessTime));
+#if defined(PLATFORM_DREAMCAST)
+		DCFrameLeave( DCFS_MeshPrepare );
+#endif
 		unguardSlow;
 	}
+
+#if defined(PLATFORM_DREAMCAST)
+	DCFrameCount( DCFC_MeshVisible, VisibleTriangles );
+#endif
 
 	// Render triangles.
 	if( VisibleTriangles>0 )
@@ -641,6 +686,9 @@ void URender::DrawMesh
 		// Lock the textures.
 		UTexture* EnvironmentMap = NULL;
 		guardSlow(Lock);
+#if defined(PLATFORM_DREAMCAST)
+		DCFrameEnter( DCFS_MeshTextureInfo );
+#endif
 		check(Mesh->Textures.Num()<=ARRAY_COUNT(TextureInfo));
 		for( INT i=0; i<Mesh->Textures.Num(); i++ )
 		{
@@ -659,15 +707,27 @@ void URender::DrawMesh
 			EnvironmentMap = Owner->Level->EnvironmentMap;
 		check(EnvironmentMap);
 		EnvironmentMap->GetInfo( EnvironmentInfo, Frame->Viewport->CurrentTime );
+#if defined(PLATFORM_DREAMCAST)
+		DCFrameLeave( DCFS_MeshTextureInfo );
+#endif
 		unguardSlow;
 
 		// Build list of all incident lights on the mesh.
 		STAT(uclock(GStat.MeshLightSetupTime));
+#if defined(PLATFORM_DREAMCAST)
+		DCFrameEnter( DCFS_MeshLightSetup );
+#endif
 		ExtraFlags |= GLightManager->SetupForActor( Frame, Owner, LeafLights, Volumetrics );
+#if defined(PLATFORM_DREAMCAST)
+		DCFrameLeave( DCFS_MeshLightSetup );
+#endif
 		STAT(uunclock(GStat.MeshLightSetupTime));
 
 		// Perform all vertex lighting.
 		guardSlow(Light);
+#if defined(PLATFORM_DREAMCAST)
+		DCFrameEnter( DCFS_MeshVertexLight );
+#endif
 		for( INT i=0; i<VisibleTriangles; i++ )
 		{
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
@@ -714,10 +774,16 @@ void URender::DrawMesh
 				}
 			}
 		}
+#if defined(PLATFORM_DREAMCAST)
+		DCFrameLeave( DCFS_MeshVertexLight );
+#endif
 		unguardSlow;
 
 		// Draw the triangles.
 		guardSlow(DrawVisible);
+#if defined(PLATFORM_DREAMCAST)
+		DCFrameEnter( DCFS_MeshDraw );
+#endif
 		STAT(GStat.MeshPolyCount+=VisibleTriangles);
 
 #if defined(PLATFORM_DREAMCAST)
@@ -749,6 +815,8 @@ void URender::DrawMesh
 				UseStrips = 0;
 			}
 		}
+		if( UseStrips )
+			Frame->Viewport->RenDev->BeginCookedMesh();
 #endif
 
 		for( INT i=0; i<VisibleTriangles; i++ )
@@ -790,6 +858,7 @@ void URender::DrawMesh
 								StripPts, StripStamp, ++StripId ) )
 						{
 							STAT(GStat.MeshSubCount += End - i + 1);
+							DCFrameCount( DCFC_MeshStripTris, End - i + 1 );
 							i = End;
 							continue;
 						}
@@ -800,6 +869,9 @@ void URender::DrawMesh
 
 			if( !(Tri.PolyFlags & PF_Invisible) )
 			{
+#if defined(PLATFORM_DREAMCAST)
+				DCFrameCount( DCFC_MeshFallbackTris );
+#endif
 				// Get texture.
 				DWORD PolyFlags = Tri.PolyFlags | ExtraFlags;
 				INT Index = Tri.TextureIndex;
@@ -817,7 +889,23 @@ void URender::DrawMesh
 				}
 				if( Frame->Mirror == -1 )
 					Exchange( Pts[2], Pts[0] );
-				RenderSubsurface( Frame, Info, SpanBuffer, Pts, PolyFlags, 0 );
+#if defined(PLATFORM_DREAMCAST)
+				// A flat triangle entirely inside the view requires neither curved
+				// subdivision nor the general mesh clipper. Keep special shading,
+				// two-sided winding, and near-plane cases on the original path.
+				if( (PolyFlags & PF_Flat)
+					&& !(PolyFlags & (PF_Environment | PF_Unlit | PF_TwoSided))
+					&& !(Pts[0]->Flags | Pts[1]->Flags | Pts[2]->Flags)
+					&& Frame->NearClip.W == 0.0f )
+				{
+					Frame->Viewport->RenDev->DrawGouraudPolygon(
+						Frame, Info, Pts, 3, PolyFlags, SpanBuffer );
+				}
+				else
+#endif
+				{
+					RenderSubsurface( Frame, Info, SpanBuffer, Pts, PolyFlags, 0 );
+				}
 			}
 			else
 			{
@@ -834,7 +922,14 @@ void URender::DrawMesh
 				HasSpecialCoords = 1;
 			}
 		}
+#if defined(PLATFORM_DREAMCAST)
+		if( UseStrips )
+			Frame->Viewport->RenDev->EndCookedMesh();
+#endif
 		GLightManager->FinishActor();
+#if defined(PLATFORM_DREAMCAST)
+		DCFrameLeave( DCFS_MeshDraw );
+#endif
 		unguardSlow;
 		unguardSlow;
 	}

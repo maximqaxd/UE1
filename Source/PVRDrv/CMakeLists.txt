@@ -8,6 +8,11 @@ set(SRC_FILES "PVRDrv.cpp")
 
 add_library(${PROJECT_NAME} ${LIB_TYPE} ${SRC_FILES})
 
+if(NOT (CMAKE_BUILD_TYPE STREQUAL "Debug"))
+  # This source-level flag follows the global -O2/-Os flags from Source/CMakeLists.txt.
+  set_source_files_properties("PVRDrv.cpp" PROPERTIES COMPILE_FLAGS "-O3")
+endif()
+
 target_include_directories(${PROJECT_NAME}
   PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/Inc
