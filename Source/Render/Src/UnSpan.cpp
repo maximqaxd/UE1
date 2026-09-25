@@ -10,10 +10,10 @@
 #if defined(PLATFORM_DREAMCAST)
 struct FDCSpanWork
 {
-    DWORD Links, Fragments, Outputs, ScreenSplits;
+	DWORD Links, Fragments, Outputs, ScreenSplits;
     const UBOOL Enabled;
     FDCSpanWork()
-        : Links(0), Fragments(0), Outputs(0), ScreenSplits(0),
+		: Links(0), Fragments(0), Outputs(0), ScreenSplits(0),
           Enabled(GDCFrameProfileEnabled && GDCFrameProfileDetailed) {}
 
     ~FDCSpanWork()
@@ -23,7 +23,7 @@ struct FDCSpanWork
             DCFrameCount(DCFC_SpanLinks, Links);
             DCFrameCount(DCFC_SpanFragments, Fragments);
             DCFrameCount(DCFC_SpanOutputs, Outputs);
-            DCFrameCount(DCFC_SpanScreenSplits, ScreenSplits);
+			DCFrameCount(DCFC_SpanScreenSplits, ScreenSplits);
         }
     }
 };
@@ -77,6 +77,10 @@ void FSpanBuffer::AllocIndex( int AllocStartY, int AllocEndY, FMemStack* MemStac
     StartY      = AllocStartY;
     EndY        = AllocEndY;
     ValidLines  = 0;
+#if defined(PLATFORM_DREAMCAST)
+	UpdateSpanPool = NULL;
+	UpdateSpanRemaining = 0;
+#endif
 
     if( StartY <= EndY )
         Index = New<FSpan*>(*Mem,AllocEndY-AllocStartY);
@@ -99,6 +103,10 @@ void FSpanBuffer::AllocIndexForScreen( INT SXR, INT SYR, FMemStack* MemStack )
     Mem     = MemStack;
     StartY  = 0;
     EndY    = ValidLines = SYR;
+#if defined(PLATFORM_DREAMCAST)
+	UpdateSpanPool = NULL;
+	UpdateSpanRemaining = 0;
+#endif
 
     Index       = New<FSpan*>(*Mem,SYR,4);
     FSpan *List = New<FSpan>(*Mem,SYR,4);
@@ -120,6 +128,10 @@ void FSpanBuffer::Release()
 {
     guard(FSpanBuffer::Release);
     Mark.Pop();
+#if defined(PLATFORM_DREAMCAST)
+	UpdateSpanPool = NULL;
+	UpdateSpanRemaining = 0;
+#endif
     unguard;
 }
 
@@ -231,6 +243,7 @@ INT FSpanBuffer::BoxIsVisible( INT X1, INT Y1, INT X2, INT Y2 )
 INT FSpanBuffer::CopyFromRasterUpdate( FSpanBuffer& Screen, INT RasterStartY, INT RasterEndY, FRasterSpan* Raster )
 {
     guard(FSpanBuffer::CopyFromRasterUpdate);
+	DC_FRAME_SCOPE_NAMED(SpanCopyScope, DCFS_SpanCopy);
 #if defined(PLATFORM_DREAMCAST)
     DCFrameCount(DCFC_Spans, Max(0, RasterEndY - RasterStartY));
 #endif
@@ -381,6 +394,7 @@ INT FSpanBuffer::CopyFromRasterUpdate( FSpanBuffer& Screen, INT RasterStartY, IN
 #if defined(PLATFORM_DREAMCAST)
 INT FSpanBuffer::TestRaster( INT RasterStartY, INT RasterEndY, FRasterSpan* Raster )
 {
+	DC_FRAME_SCOPE_NAMED(SpanTestScope, DCFS_SpanTest);
 	DC_FRAME_SCOPE(DCFS_Span);
 	FDCSpanWork SpanWork;
 	DCFrameCount(DCFC_Spans, Max(0, RasterEndY - RasterStartY));
@@ -409,6 +423,7 @@ INT FSpanBuffer::TestRaster( INT RasterStartY, INT RasterEndY, FRasterSpan* Rast
 
 INT FSpanBuffer::TestRasterUpdate( INT RasterStartY, INT RasterEndY, FRasterSpan* Raster )
 {
+	DC_FRAME_SCOPE_NAMED(SpanUpdateScope, DCFS_SpanUpdate);
 	DC_FRAME_SCOPE(DCFS_Span);
 	FDCSpanWork SpanWork;
 	DCFrameCount(DCFC_Spans, Max(0, RasterEndY - RasterStartY));
@@ -442,7 +457,16 @@ INT FSpanBuffer::TestRasterUpdate( INT RasterStartY, INT RasterEndY, FRasterSpan
 			{
 				// The raster cuts a hole in this screen span. This node is
 				// required for future polygons even though no output is retained.
-				FSpan* Right = New<FSpan>(*Mem, 1, 4);
+				// Split nodes live until the span buffer is released. Reserve a
+				// small run at once instead of invoking the mem-stack allocator
+				// for each scanline cut.
+				if( !UpdateSpanRemaining )
+				{
+					UpdateSpanPool = New<FSpan>(*Mem, 32, 4);
+					UpdateSpanRemaining = 32;
+				}
+				FSpan* Right = UpdateSpanPool++;
+				--UpdateSpanRemaining;
 				Right->Start = RasterEnd;
 				Right->End = Span->End;
 				Right->Next = Span->Next;
@@ -488,6 +512,7 @@ INT FSpanBuffer::TestRasterUpdate( INT RasterStartY, INT RasterEndY, FRasterSpan
 INT FSpanBuffer::CopyFromRaster( FSpanBuffer& Screen, INT RasterStartY, INT RasterEndY, FRasterSpan* Raster )
 {
     guard(FSpanBuffer::CopyFromRaster);
+	DC_FRAME_SCOPE_NAMED(SpanCopyScope, DCFS_SpanCopy);
 #if defined(PLATFORM_DREAMCAST)
     DCFrameCount(DCFC_Spans, Max(0, RasterEndY - RasterStartY));
 #endif
@@ -625,6 +650,7 @@ INT FSpanBuffer::CopyFromRaster( FSpanBuffer& Screen, INT RasterStartY, INT Rast
 void FSpanBuffer::MergeWith( const FSpanBuffer& Other )
 {
     guard(FSpanBuffer::MergeWith);
+	DC_FRAME_SCOPE_NAMED(SpanMergeScope, DCFS_SpanMerge);
     DC_FRAME_SCOPE(DCFS_Span);
 
     // See if the existing span's index is large enough to hold the merged result.

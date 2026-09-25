@@ -147,8 +147,11 @@ text and counter arrays are included in profiler_static memory accounting.
 
 ## Atlas implementation
 
-The current cooker in URender::Exec writes independent RGB565 lightmap entries
-with lightmap/zone keys, dimensions, offsets, and optional zlib compression.
-It does not assign atlas page rectangles. At runtime LightAtlasPlace allocates
-page slots, ApplyAtlasTransform remaps UVs, and LightAtlasStore arranges blocks
-and uploads them. Static lighting is cooked offline; atlas packing is runtime.
+The renderer's cooker first writes independent RGB565 lightmap entries with
+lightmap/zone keys, dimensions, offsets, and optional zlib compression. The
+`cook_lightmaps.py` post-pass packs these entries into 256x256 static pages and
+encodes each page as RGB565 VQ with `pvrtex`. Version 4 `.dlm` sidecars retain
+the individual entries as fallback data and add page/slot placements and full
+`.DT` page images. At level load, the PVR driver uploads each static page once;
+dynamic and mover lightmaps use separate writable RGB565 pages. Version 3
+sidecars retain the former runtime placement and twiddled tile upload path.

@@ -62,9 +62,16 @@ public:
 	FSpan**		Index;		// Contains (EndY-StartY) units pointing to first span or NULL.
 	FMemStack*	Mem;		// Memory pool everything is stored in.
 	FMemMark	Mark;		// Top of memory pool marker.
+#if defined(PLATFORM_DREAMCAST)
+	FSpan*		UpdateSpanPool;
+	INT			UpdateSpanRemaining;
+#endif
 
 	// Constructors.
 	FSpanBuffer()
+	#if defined(PLATFORM_DREAMCAST)
+	: UpdateSpanPool(NULL), UpdateSpanRemaining(0)
+	#endif
 	{}
 	FSpanBuffer( const FSpanBuffer& Source, FMemStack& InMem )
 	:	StartY		(Source.StartY)
@@ -73,6 +80,10 @@ public:
 	,	Index		(new(InMem,EndY-StartY)FSpan*)
 	,	Mem			(&InMem)
 	,	Mark		(InMem)
+	#if defined(PLATFORM_DREAMCAST)
+	,	UpdateSpanPool(NULL)
+	,	UpdateSpanRemaining(0)
+	#endif
 	{
 		for( int i=0; i<EndY-StartY; i++ )
 		{
