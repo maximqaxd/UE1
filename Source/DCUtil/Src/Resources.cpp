@@ -102,7 +102,8 @@ static void BakeDreamcastProcedural( UTexture* Texture )
 	}
 }
 
-static UBOOL TextureNeedsMipmaps( UTexture* Texture, UPackage* Package )
+static UBOOL TextureNeedsMipmaps( UTexture* Texture, UPackage* Package,
+	const TArray<UTexture*>& MeshTextures )
 {
 	// Sparse one-pixel stars are a worst case for both 2x2 VQ blocks and mip
 	// averaging. Preserve the authored base image exactly for the sky dome.
@@ -115,6 +116,18 @@ static UBOOL TextureNeedsMipmaps( UTexture* Texture, UPackage* Package )
 	{
 		return 0;
 	}
+	// Keep animated world/procedural frames mipmapped while their visual
+	// quality is being evaluated; an actor may also use one as a mesh skin.
+	if( IsAnimatedDreamcastProcedural(Texture) )
+		return 1;
+	// Mesh skins and actor/prop skins are sampled at their authored UV scale;
+	// they do not benefit enough from a hardware mip chain to justify its VRAM.
+	INT MeshIndex;
+	if( MeshTextures.FindItem(Texture, MeshIndex) )
+		return 0;
+	const char* Group = Texture->GetParent() ? Texture->GetParent()->GetName() : "";
+	if( !appStricmp(Group, "Skins") )
+		return 0;
 
 	// Font glyph atlases are always sampled in screen space. Their character
 	// metrics remain in UFont; only the immutable bitmap is cooked to DT.
@@ -126,7 +139,6 @@ static UBOOL TextureNeedsMipmaps( UTexture* Texture, UPackage* Package )
 	// MenuGr is imported into Unreal.MenuGfx. Icons contains the HUD and
 	// crosshair atlas. These are drawn in screen space and must stay base-only
 	// even when a retail package happens to carry a generated mip chain.
-	const char* Group = Texture->GetParent() ? Texture->GetParent()->GetName() : "";
 	if( !appStricmp(Package->GetName(), "MenuGr")
 		|| !appStricmp(Group, "MenuGfx")
 		|| !appStricmp(Group, "Icons") )
@@ -138,11 +150,6 @@ static UBOOL TextureNeedsMipmaps( UTexture* Texture, UPackage* Package )
 	// The Dreamcast encoder can still build the complete hardware mip chain
 	// from each cooked animation frame. Leaving these base-only causes severe
 	// aliasing on receding water, fire and smoke surfaces.
-	if( IsAnimatedDreamcastProcedural(Texture) )
-	{
-		return 1;
-	}
-
 	if( Texture->Mips.Num() <= 1 )
 	{
 		return 0;
@@ -219,6 +226,17 @@ void FDCUtil::ProcessResources( const char* PackagePath, const char* ResourceDir
 	INT Meshes = 0;
 	INT Models = 0;
 	char Path[2048];
+	TArray<UTexture*> MeshTextures;
+	if( !Import )
+	{
+		for( TObjectIterator<UMesh> Mesh; Mesh; ++Mesh )
+			for( INT i = 0; i < Mesh->Textures.Num(); ++i )
+				if( Mesh->Textures(i) )
+					MeshTextures.AddUniqueItem( Mesh->Textures(i) );
+		for( TObjectIterator<AActor> Actor; Actor; ++Actor )
+			if( Actor->Mesh && Actor->Skin )
+				MeshTextures.AddUniqueItem( Actor->Skin );
+	}
 
 	for( TObjectIterator<USound> It; It; ++It )
 	{
@@ -336,7 +354,7 @@ void FDCUtil::ProcessResources( const char* PackagePath, const char* ResourceDir
 					snprintf( MarkerExtension, sizeof(MarkerExtension),
 						"frame%02d.png.nomip", Frame );
 					ResourceFile( Path, ARRAY_COUNT(Path), ResourceDir, *It, MarkerExtension );
-					if( !TextureNeedsMipmaps(*It, Package) )
+					if( !TextureNeedsMipmaps(*It, Package, MeshTextures) )
 					{
 						TArray<BYTE> Marker;
 						WriteResource( Path, Marker );
@@ -378,7 +396,7 @@ void FDCUtil::ProcessResources( const char* PackagePath, const char* ResourceDir
 			// interface groups. A sidecar lets the external encoder distinguish
 			// base-only textures without relying on individual object names.
 			ResourceFile( Path, ARRAY_COUNT(Path), ResourceDir, *It, "png.nomip" );
-			if( !TextureNeedsMipmaps(*It, Package) )
+			if( !TextureNeedsMipmaps(*It, Package, MeshTextures) )
 			{
 				TArray<BYTE> Marker;
 				WriteResource( Path, Marker );
