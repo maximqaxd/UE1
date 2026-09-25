@@ -51,11 +51,19 @@ class ENGINE_API URenderDevice : public USubsystem
 	virtual void Exit()=0;
 	virtual void Flush()=0;
 	virtual UBOOL Exec( const char* Cmd, FOutputDevice* Out )=0;
+	// Optional loading-screen warmup for frame-keyed cooked animations.
+	virtual void PreloadCookedAnimationFrames() {}
+	virtual void PreloadCookedStaticTextures() {}
+#if defined(PLATFORM_DREAMCAST)
+	virtual void PreloadCookedLightmaps( ULevel* Level ) {}
+#endif
 	virtual void Lock( FPlane FlashScale, FPlane FlashFog, FPlane ScreenClear, DWORD RenderLockFlags, BYTE* HitData, INT* HitSize )=0;
 	virtual void Unlock( UBOOL Blit )=0;
 #if defined(PLATFORM_DREAMCAST)
 	// A direct-list device renders one occluded world in OP, PT, TR order.
 	virtual UBOOL UsesOrderedLists() const { return 0; }
+	// True only when eligible one-sided mesh faces can be rejected by the TA.
+	virtual UBOOL UsesHardwareMeshCulling() const { return 0; }
 	virtual void BeginRenderPass( INT Pass ) {}
 	virtual UBOOL WantsBspSurface( DWORD PolyFlags, INT Pass ) const { return 1; }
 #endif

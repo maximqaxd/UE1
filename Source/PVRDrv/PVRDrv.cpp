@@ -13,6 +13,190 @@
 #include "PVRDrvPrivate.h"
 #include "UnDCFrameProfile.h"
 
+// KOS' texture heap is a general-purpose malloc heap. Its available-byte
+// count is not the size of its largest hole, and repeated failed allocations
+// are particularly costly during animation. Reserve its texture region once
+// and suballocate it in 256-byte units, keeping large images 2 KiB aligned.
+// This follows the layout idea of xash3d_dc's pvr_alloc without relocating
+// live textures: TA headers may still refer to their current VRAM addresses.
+namespace
+{
+	static const DWORD PVRPoolUnit = 256;
+	static const INT PVRPoolMaxRanges = 2048;
+	struct FPVRPoolRange { DWORD Start, Count; };
+	struct FPVRPoolAllocation { pvr_ptr_t Ptr; DWORD Count; };
+	static pvr_ptr_t GPVRPoolRaw = NULL;
+	static BYTE* GPVRPoolBase = NULL;
+	static DWORD GPVRPoolUnits = 0;
+	static DWORD GPVRPoolFreeUnits = 0;
+	static FPVRPoolRange GPVRPoolFree[PVRPoolMaxRanges];
+	static FPVRPoolAllocation GPVRPoolAlloc[PVRPoolMaxRanges];
+	static INT GPVRPoolFreeCount = 0;
+	static INT GPVRPoolAllocCount = 0;
+
+	static void PVRPoolInit()
+	{
+		if( GPVRPoolRaw )
+			return;
+		const size_t Available = pvr_mem_available();
+		// Leave dlmalloc metadata and a small amount of VRAM outside the pool.
+		if( Available <= 128 * 1024 )
+			appErrorf( "PVR texture pool has only %u bytes", (unsigned)Available );
+		const size_t Requested = Available - 64 * 1024;
+		GPVRPoolRaw = pvr_mem_malloc( Requested );
+		if( !GPVRPoolRaw )
+			appErrorf( "PVR texture pool reservation failed: %u bytes", (unsigned)Requested );
+		const uintptr_t Aligned = ((uintptr_t)GPVRPoolRaw + 2047u) & ~(uintptr_t)2047u;
+		GPVRPoolBase = (BYTE*)Aligned;
+		GPVRPoolUnits = (DWORD)((Requested - (Aligned - (uintptr_t)GPVRPoolRaw)) / PVRPoolUnit);
+		GPVRPoolFreeUnits = GPVRPoolUnits;
+		GPVRPoolFree[0] = { 0, GPVRPoolUnits };
+		GPVRPoolFreeCount = 1;
+		GPVRPoolAllocCount = 0;
+		debugf( NAME_Log, "PVRPOOL init capacity=%uKB raw=%p base=%p", GPVRPoolUnits / 4,
+			GPVRPoolRaw, GPVRPoolBase );
+	}
+
+	static void PVRPoolShutdown()
+	{
+		if( !GPVRPoolRaw )
+			return;
+		if( GPVRPoolAllocCount )
+			debugf( NAME_Warning, "PVRPOOL shutdown with %i live allocations", GPVRPoolAllocCount );
+		pvr_mem_free( GPVRPoolRaw );
+		GPVRPoolRaw = NULL;
+		GPVRPoolBase = NULL;
+		GPVRPoolUnits = GPVRPoolFreeUnits = 0;
+		GPVRPoolFreeCount = GPVRPoolAllocCount = 0;
+	}
+
+	static size_t PVRPoolAvailable() { return (size_t)GPVRPoolFreeUnits * PVRPoolUnit; }
+	static size_t PVRPoolLargest()
+	{
+		DWORD Largest = 0;
+		for( INT i=0; i<GPVRPoolFreeCount; ++i )
+			Largest = Max( Largest, GPVRPoolFree[i].Count );
+		return (size_t)Largest * PVRPoolUnit;
+	}
+	static void PVRPoolStats()
+	{
+		debugf( NAME_Log, "PVRPOOL capacity=%uKB free=%uKB largest=%uKB ranges=%i allocations=%i",
+			GPVRPoolUnits / 4, GPVRPoolFreeUnits / 4,
+			(unsigned)(PVRPoolLargest() / 1024), GPVRPoolFreeCount, GPVRPoolAllocCount );
+	}
+
+	static UBOOL PVRPoolFind( size_t Bytes, INT& FoundIndex, DWORD& FoundStart )
+	{
+		if( !Bytes || !GPVRPoolBase || GPVRPoolAllocCount == PVRPoolMaxRanges )
+			return 0;
+		const DWORD Units = (DWORD)((Bytes + PVRPoolUnit - 1) / PVRPoolUnit);
+		const UBOOL Small = Bytes < 2048;
+		// Preferred packing first; then permit any 256-byte-aligned hole. The
+		// hardware does not require 2 KiB alignment for these texture pointers.
+		for( INT Pass=0; Pass<2; ++Pass )
+		for( INT Step=0; Step<GPVRPoolFreeCount; ++Step )
+		{
+			const INT i = Small ? GPVRPoolFreeCount-1-Step : Step;
+			const FPVRPoolRange Range = GPVRPoolFree[i];
+			DWORD Start;
+			if( Small )
+			{
+				DWORD End = Range.Start + Range.Count;
+				if( End < Units ) continue;
+				Start = End - Units;
+				if( Pass == 0 && Start / 8 != (End - 1) / 8 )
+				{
+					End &= ~7u;
+					if( End < Units ) continue;
+					Start = End - Units;
+				}
+			}
+			else Start = Pass == 0 ? (Range.Start + 7) & ~7u : Range.Start;
+			if( Start < Range.Start ) continue;
+			const DWORD Prefix = Start - Range.Start;
+			if( Prefix + Units > Range.Count )
+				continue;
+			const DWORD Suffix = Range.Count - Prefix - Units;
+			if( Prefix && Suffix && GPVRPoolFreeCount == PVRPoolMaxRanges )
+				continue;
+			FoundIndex = i;
+			FoundStart = Start;
+			return 1;
+		}
+		return 0;
+	}
+
+	static UBOOL PVRPoolCanAlloc( size_t Bytes )
+	{
+		INT Index;
+		DWORD Start;
+		return PVRPoolFind( Bytes, Index, Start );
+	}
+
+	static pvr_ptr_t PVRPoolMalloc( size_t Bytes )
+	{
+		INT i;
+		DWORD Start;
+		if( !PVRPoolFind( Bytes, i, Start ) )
+			return NULL;
+		const DWORD Units = (DWORD)((Bytes + PVRPoolUnit - 1) / PVRPoolUnit);
+		const FPVRPoolRange Range = GPVRPoolFree[i];
+		const DWORD Prefix = Start - Range.Start;
+		const DWORD Suffix = Range.Count - Prefix - Units;
+		if( Prefix && Suffix )
+		{
+			for( INT j=GPVRPoolFreeCount; j>i+1; --j ) GPVRPoolFree[j] = GPVRPoolFree[j-1];
+			GPVRPoolFree[i].Count = Prefix;
+			GPVRPoolFree[i+1] = { Start + Units, Suffix };
+			++GPVRPoolFreeCount;
+		}
+		else if( Prefix ) GPVRPoolFree[i].Count = Prefix;
+		else if( Suffix ) { GPVRPoolFree[i].Start = Start + Units; GPVRPoolFree[i].Count = Suffix; }
+		else
+		{
+			for( INT j=i; j+1<GPVRPoolFreeCount; ++j ) GPVRPoolFree[j] = GPVRPoolFree[j+1];
+			--GPVRPoolFreeCount;
+		}
+		pvr_ptr_t Ptr = (pvr_ptr_t)(GPVRPoolBase + (size_t)Start * PVRPoolUnit);
+		GPVRPoolAlloc[GPVRPoolAllocCount++] = { Ptr, Units };
+		GPVRPoolFreeUnits -= Units;
+		return Ptr;
+	}
+
+	static void PVRPoolFree( pvr_ptr_t Ptr )
+	{
+		if( !Ptr ) return;
+		INT Allocation = 0;
+		for( ; Allocation<GPVRPoolAllocCount; ++Allocation )
+			if( GPVRPoolAlloc[Allocation].Ptr == Ptr ) break;
+		if( Allocation == GPVRPoolAllocCount )
+			appErrorf( "PVRPOOL free of unknown texture %p", Ptr );
+		const DWORD Start = (DWORD)(((BYTE*)Ptr - GPVRPoolBase) / PVRPoolUnit);
+		const DWORD Units = GPVRPoolAlloc[Allocation].Count;
+		GPVRPoolAlloc[Allocation] = GPVRPoolAlloc[--GPVRPoolAllocCount];
+		INT At = 0;
+		while( At<GPVRPoolFreeCount && GPVRPoolFree[At].Start<Start ) ++At;
+		const UBOOL JoinLeft = At>0 && GPVRPoolFree[At-1].Start + GPVRPoolFree[At-1].Count == Start;
+		const UBOOL JoinRight = At<GPVRPoolFreeCount && Start + Units == GPVRPoolFree[At].Start;
+		if( JoinLeft && JoinRight )
+		{
+			GPVRPoolFree[At-1].Count += Units + GPVRPoolFree[At].Count;
+			for( INT j=At; j+1<GPVRPoolFreeCount; ++j ) GPVRPoolFree[j] = GPVRPoolFree[j+1];
+			--GPVRPoolFreeCount;
+		}
+		else if( JoinLeft ) GPVRPoolFree[At-1].Count += Units;
+		else if( JoinRight ) { GPVRPoolFree[At].Start = Start; GPVRPoolFree[At].Count += Units; }
+		else
+		{
+			if( GPVRPoolFreeCount == PVRPoolMaxRanges ) appErrorf( "PVRPOOL free range table full" );
+			for( INT j=GPVRPoolFreeCount; j>At; --j ) GPVRPoolFree[j] = GPVRPoolFree[j-1];
+			GPVRPoolFree[At] = { Start, Units };
+			++GPVRPoolFreeCount;
+		}
+		GPVRPoolFreeUnits += Units;
+	}
+}
+
 #if defined(PLATFORM_DREAMCAST)
 static void DCProfileTextureLoad( const void* Source, pvr_ptr_t Destination, size_t Bytes )
 {
@@ -195,6 +379,7 @@ struct FPVRHeaderCache
 	UBOOL FilteringDisabled;
 	UBOOL FogEnabled;
 	UBOOL OverbrightEnabled;
+	pvr_cull_mode_t Cull;
 	QWORD TextureKey;
 	pvr_ptr_t Texture;
 	DWORD TextureFormat;
@@ -361,6 +546,7 @@ void UPVRRenderDevice::InternalClassInitializer( UClass* Class )
 	new(Class, "NoFiltering",     RF_Public)UBoolProperty( CPP_PROPERTY(NoFiltering),     "Options", CPF_Config );
 	new(Class, "UseTriStrips",    RF_Public)UBoolProperty( CPP_PROPERTY(UseTriStrips),    "Options", CPF_Config );
 	new(Class, "UseMeshOIX",      RF_Public)UBoolProperty( CPP_PROPERTY(UseMeshOIX),      "Options", CPF_Config );
+	new(Class, "UseVQDynamicLightmaps", RF_Public)UBoolProperty( CPP_PROPERTY(UseVQDynamicLightmaps), "Options", CPF_Config );
 	new(Class, "DistanceFog",     RF_Public)UBoolProperty( CPP_PROPERTY(DistanceFog),     "Options", CPF_Config );
 	new(Class, "Overbright",      RF_Public)UBoolProperty( CPP_PROPERTY(Overbright),      "Options", CPF_Config );
 	new(Class, "VolumetricFog",   RF_Public)UBoolProperty( CPP_PROPERTY(VolumetricFog),   "Options", CPF_Config );
@@ -379,6 +565,11 @@ UPVRRenderDevice::UPVRRenderDevice()
 	NoFiltering = false;
 	UseTriStrips = true;
 	UseMeshOIX = false;
+	UseVQDynamicLightmaps = true;
+	// CPU culling avoids lighting and submitting hidden faces. The PVR's
+	// backface test occurs only after those costs have already been paid.
+	UseHardwareMeshCull = false;
+	MeshDrawScope = false;
 	DistanceFog = false;
 	Overbright = true;
 	VolumetricFog = false;
@@ -396,6 +587,11 @@ UPVRRenderDevice::UPVRRenderDevice()
 	appMemset( &TextureCPUProfile, 0, sizeof(TextureCPUProfile) );
 	appMemset( AtlasPages, 0, sizeof(AtlasPages) );
 	AtlasPageCount = 0;
+	AtlasDynamicFirstPage = 0;
+	AtlasPreloadActive = false;
+	TexturePreloadActive = false;
+	PreloadedLightmapLevel = NULL;
+	appMemset( &PreloadedLightmapBind, 0, sizeof(PreloadedLightmapBind) );
 }
 
 UBOOL UPVRRenderDevice::Init( UViewport* InViewport )
@@ -403,21 +599,16 @@ UBOOL UPVRRenderDevice::Init( UViewport* InViewport )
 	guard(UPVRRenderDevice::Init)
 
 #if defined(PLATFORM_DREAMCAST)
-	struct mallinfo InitBefore = mallinfo();
-	UBOOL ReusedPVR = GPVRSessionInitialized;
 	if( !GPVRSessionInitialized )
 	{
 		if( pvr_init(&GPVRInitParams) < 0 )
 			appErrorf("PVR initialization failed");
 		GPVRSessionInitialized = 1;
 	}
-	struct mallinfo InitAfter = mallinfo();
-	debugf( "DCPVRLIFETIME phase=init reused=%d heap_before=%u heap_after=%u delta=%d",
-		ReusedPVR,
-		(DWORD)InitBefore.uordblks, (DWORD)InitAfter.uordblks,
-		(INT)InitAfter.uordblks - (INT)InitBefore.uordblks );
+	PVRPoolInit();
 #else
 	pvr_init(&GPVRInitParams);
+	PVRPoolInit();
 #endif
 
 	// Flycast builds without OIX must never receive ocbwb-backed mesh data.
@@ -439,11 +630,13 @@ UBOOL UPVRRenderDevice::Init( UViewport* InViewport )
 	SupportsDistanceFog = false;
 	NoVolumetricBlend   = true;
 	SupportsTriStrips   = UseTriStrips ? 1 : 0;
+	GDCUseVQDynamicLightmaps = UseVQDynamicLightmaps;
 
 	debugf( NAME_Log, "PVR command submission: direct OP/PT/TR" );
-	debugf( NAME_Log, "PVR options: tristrips=%i distancefog=%i fogdefault=%i volumetricfog=%i"
+	debugf( NAME_Log, "PVR mesh hardware culling: %s", UseHardwareMeshCull ? "enabled" : "disabled" );
+	debugf( NAME_Log, "PVR options: tristrips=%i vqdyn=%i distancefog=%i fogdefault=%i volumetricfog=%i"
 		" shiny=%i volumetriclighting=%i coronas=%i filtering=%i overbright=%i",
-		(INT)UseTriStrips, (INT)DistanceFog, FogDistanceDefault, (INT)VolumetricFog,
+		(INT)UseTriStrips, (INT)UseVQDynamicLightmaps, (INT)DistanceFog, FogDistanceDefault, (INT)VolumetricFog,
 		(INT)ShinySurfaces, (INT)VolumetricLighting, (INT)Coronas, (INT)!NoFiltering,
 		(INT)Overbright );
 
@@ -487,18 +680,9 @@ void UPVRRenderDevice::Exit()
 	// sessions; Flush above has released all renderer-owned textures.
 	if( !appDCHasSessionTravel() )
 	{
-		struct mallinfo ShutdownBefore = mallinfo();
+		PVRPoolShutdown();
 		pvr_shutdown();
 		GPVRSessionInitialized = 0;
-		struct mallinfo ShutdownAfter = mallinfo();
-		debugf( "DCPVRLIFETIME phase=shutdown heap_before=%u heap_after=%u delta=%d",
-			(DWORD)ShutdownBefore.uordblks, (DWORD)ShutdownAfter.uordblks,
-			(INT)ShutdownAfter.uordblks - (INT)ShutdownBefore.uordblks );
-	}
-	else
-	{
-		struct mallinfo TravelHeap = mallinfo();
-		debugf( "DCPVRLIFETIME phase=travel_keepalive heap=%u", (DWORD)TravelHeap.uordblks );
 	}
 #endif
 
@@ -511,6 +695,10 @@ void UPVRRenderDevice::Flush()
 
 	ResetTexture();
 	PVRInvalidateHeaders();
+	PreloadedLightmapLevel = NULL;
+	PreloadedLightmaps.Empty();
+	AtlasPreloadActive = false;
+	TexturePreloadActive = false;
 
 	if( BindMap.Size() )
 	{
@@ -519,7 +707,7 @@ void UPVRRenderDevice::Flush()
 		{
 			if( BindMap[i].Tex )
 			{
-				pvr_mem_free( BindMap[i].Tex );
+				PVRPoolFree( BindMap[i].Tex );
 				if( BindMap[i].SizeBytes > 0 && VRAMUsed >= (DWORD)BindMap[i].SizeBytes )
 					VRAMUsed -= (DWORD)BindMap[i].SizeBytes;
 				BindMap[i].Tex = NULL;
@@ -574,6 +762,14 @@ UBOOL UPVRRenderDevice::Exec( const char* Cmd, FOutputDevice* Out )
 				: "DIAGNOSTIC opaque occlusion bypass; portals may be wrong" );
 		return true;
 	}
+	if( ParseCommand(&Cmd, "DCMESHHCULL") )
+	{
+		UseHardwareMeshCull = !UseHardwareMeshCull;
+		PVRInvalidateHeaders();
+		DCFrameProfileReset();
+		Out->Logf( "Mesh PVR backface culling %s", UseHardwareMeshCull ? "on" : "off" );
+		return true;
+	}
 	if( ParseCommand(&Cmd, "DCLIGHTRATE") )
 	{
 		const INT Requested = appAtoi(Cmd);
@@ -614,6 +810,7 @@ void UPVRRenderDevice::Lock( FPlane FlashScale, FPlane FlashFog, FPlane ScreenCl
 	guard(UPVRRenderDevice::Lock);
 	PVRMeshOIXLeave();
 	GDCMeshOIXActive = 0;
+	MeshDrawScope = false;
 
 	++TextureFrame;
 #if defined(PLATFORM_DREAMCAST)
@@ -680,9 +877,24 @@ void UPVRRenderDevice::Unlock( UBOOL Blit )
 	// If the buffer fills, the TA silently drops subsequent polys -> geometry
 	// vanishes depending on view angle.
 	{
+		static DWORD TAPeakUsed = 0;
+		static DWORD TAPeakCapacity = 0;
+		const size_t Start = PVR_GET(PVR_TA_VERTBUF_START);
 		const size_t End  = PVR_GET(PVR_TA_VERTBUF_END);
 		const size_t Pos  = PVR_GET(PVR_TA_VERTBUF_POS);
 		const DWORD  Free = (End > Pos) ? (DWORD)(End - Pos) : 0;
+		if( End > Start && Pos >= Start )
+		{
+			TAPeakUsed = Max( TAPeakUsed, (DWORD)(Min(Pos, End) - Start) );
+			TAPeakCapacity = (DWORD)(End - Start);
+		}
+		if( TextureFrame % 300 == 0 )
+		{
+			debugf( NAME_Log, "PVRTA 300-frame peak=%u/%uKB spare=%uKB",
+				(unsigned)(TAPeakUsed / 1024), (unsigned)(TAPeakCapacity / 1024),
+				(unsigned)((TAPeakCapacity - TAPeakUsed) / 1024) );
+			TAPeakUsed = 0;
+		}
 		if( Free == 0 )
 			debugf( "PVR: TA VERTEX BUFFER FULL (Pos=%u End=%u) - geometry being dropped!", (unsigned)Pos, (unsigned)End );
 	}
@@ -690,12 +902,7 @@ void UPVRRenderDevice::Unlock( UBOOL Blit )
 	pvr_scene_finish();
 
 	if( TextureFrame % 300 == 0 )
-	{
 		PrintTextureCPUProfile( 300 );
-#if defined(PLATFORM_DREAMCAST)
-		appDCDumpProceduralTextureProfile( 300 );
-#endif
-	}
 
 	unguard;
 }
@@ -729,7 +936,7 @@ pvr_list_t UPVRRenderDevice::ListFor( DWORD PolyFlags ) const
 // Compile and emit a polygon header, skipping it when the previous primitive
 // in this list already established the same state.
 //
-void UPVRRenderDevice::EmitHeader( pvr_list_t List, DWORD PolyFlags, const FTexState* Tex, UBOOL NoDepth )
+void UPVRRenderDevice::EmitHeader( pvr_list_t List, DWORD PolyFlags, const FTexState* Tex, UBOOL NoDepth, pvr_cull_mode_t Cull )
 {
 	const DWORD StateBits =
 		PolyFlags & (PF_Translucent|PF_Modulated|PF_Highlighted|PF_Invisible|PF_Occlude|PF_Masked);
@@ -748,6 +955,7 @@ void UPVRRenderDevice::EmitHeader( pvr_list_t List, DWORD PolyFlags, const FTexS
 		&& Cache.FilteringDisabled == NoFiltering
 		&& Cache.FogEnabled == FogActive
 		&& Cache.OverbrightEnabled == Overbright
+		&& Cache.Cull == Cull
 		&& Cache.TextureKey == TextureKey
 		&& Cache.Texture == Texture
 		&& Cache.TextureFormat == TextureFormat
@@ -761,6 +969,7 @@ void UPVRRenderDevice::EmitHeader( pvr_list_t List, DWORD PolyFlags, const FTexS
 	Cache.FilteringDisabled = NoFiltering;
 	Cache.FogEnabled = FogActive;
 	Cache.OverbrightEnabled = Overbright;
+	Cache.Cull = Cull;
 	Cache.TextureKey = TextureKey;
 	Cache.Texture = Texture;
 	Cache.TextureFormat = TextureFormat;
@@ -810,9 +1019,10 @@ void UPVRRenderDevice::EmitHeader( pvr_list_t List, DWORD PolyFlags, const FTexS
 			? PVR_DEPTHWRITE_DISABLE : PVR_DEPTHWRITE_ENABLE;
 	}
 
-	// Unreal's BSP and mesh code do their own backface rejection, and mirrored
-	// scene nodes invert winding, so leave the hardware culler off.
-	Cxt.gen.culling = PVR_CULLING_NONE;
+	// BSP, UI, two-sided and special mesh paths retain their original state.
+	// Eligible mesh fronts project clockwise in screen coordinates under the
+	// engine's Frame->Mirror == 1 convention, so reject counterclockwise faces.
+	Cxt.gen.culling = Cull;
 
 	if( PolyFlags & PF_Invisible )
 	{
@@ -1119,12 +1329,18 @@ void UPVRRenderDevice::DrawGouraudPolygon( FSceneNode* Frame, FTextureInfo& Text
 
 	FTexState Tex;
 	CaptureTexState( Tex );
+	const pvr_cull_mode_t Cull = MeshDrawScope && UseHardwareMeshCull
+		&& Frame->Mirror == 1.f && Frame->NearClip.W == 0.f
+		&& NumPts == 3 && !NeedsClip && !(Pts[0]->Flags | Pts[1]->Flags | Pts[2]->Flags)
+		&& (Flags & (PF_TwoSided|PF_Flat|PF_Invisible)) == PF_Flat
+		&& !(Flags & (PF_Environment|PF_Unlit))
+		? PVR_CULLING_CCW : PVR_CULLING_NONE;
 
 	if( !NeedsClip )
 	{
 		if( !PVRBeginDraw( List, 32 + NumPts * 32 ) )
 			return;
-		EmitHeader( List, Flags, &Tex, 0 );
+		EmitHeader( List, Flags, &Tex, 0, Cull );
 		FPVRVert Verts[PVR_MAX_POLY_VERTS];
 		for( i = 0; i < NumPts; ++i )
 			PVRBuildGouraudVert( *Pts[i], TexInfo.UMult, TexInfo.VMult, Modulated, Verts[i] );
@@ -1138,7 +1354,7 @@ void UPVRRenderDevice::DrawGouraudPolygon( FSceneNode* Frame, FTextureInfo& Text
 	// Fan the polygon into triangles and clip each one.
 	if( !PVRBeginDraw( List, 32 + (NumPts - 2) * 4 * 32 ) )
 		return;
-	EmitHeader( List, Flags, &Tex, 0 );
+	EmitHeader( List, Flags, &Tex, 0, Cull );
 	FPVRClipVert V0;
 	PVRBuildGouraudClipVert( *Pts[0], TexInfo.UMult, TexInfo.VMult, Modulated, V0 );
 	for( i = 1; i < NumPts - 1; ++i )
@@ -1177,6 +1393,11 @@ void UPVRRenderDevice::DrawGouraudTriStrip( FSceneNode* Frame, FTextureInfo& Tex
 
 	FTexState Tex;
 	CaptureTexState( Tex );
+	const pvr_cull_mode_t Cull = MeshDrawScope && UseHardwareMeshCull
+		&& Frame->Mirror == 1.f && Frame->NearClip.W == 0.f && !NeedsClip
+		&& (Flags & (PF_TwoSided|PF_Flat|PF_Invisible)) == PF_Flat
+		&& !(Flags & (PF_Environment|PF_Unlit))
+		? PVR_CULLING_CCW : PVR_CULLING_NONE;
 
 	if( !NeedsClip )
 	{
@@ -1184,7 +1405,7 @@ void UPVRRenderDevice::DrawGouraudTriStrip( FSceneNode* Frame, FTextureInfo& Tex
 		// triangles, which is the entire point of cooking meshes this way.
 		if( !PVRBeginDraw( List, 32 + NumPts * 32 ) )
 			return;
-		EmitHeader( List, Flags, &Tex, 0 );
+		EmitHeader( List, Flags, &Tex, 0, Cull );
 		for( i = 0; i < NumPts; ++i )
 			PVREmitGouraudVert( List, *Pts[i], TexInfo.UMult, TexInfo.VMult,
 				Modulated, ( i == NumPts - 1 ) ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX );
@@ -1195,7 +1416,7 @@ void UPVRRenderDevice::DrawGouraudTriStrip( FSceneNode* Frame, FTextureInfo& Tex
 	// of the strip independently, preserving the strip's winding alternation.
 	if( !PVRBeginDraw( List, 32 + (NumPts - 2) * 4 * 32 ) )
 		return;
-	EmitHeader( List, Flags, &Tex, 0 );
+	EmitHeader( List, Flags, &Tex, 0, Cull );
 	for( i = 2; i < NumPts; ++i )
 	{
 		FPVRClipVert Tri[3];
@@ -1213,6 +1434,7 @@ void UPVRRenderDevice::DrawGouraudTriStrip( FSceneNode* Frame, FTextureInfo& Tex
 void UPVRRenderDevice::BeginCookedMesh()
 {
 	PVRMeshOIXLeave();
+	MeshDrawScope = true;
 	GPVRMeshlet = INDEX_NONE;
 	GPVRMeshScratchCount = 0;
 }
@@ -1220,6 +1442,7 @@ void UPVRRenderDevice::BeginCookedMesh()
 void UPVRRenderDevice::EndCookedMesh()
 {
 	PVRMeshOIXLeave();
+	MeshDrawScope = false;
 }
 
 UBOOL UPVRRenderDevice::DrawCookedMeshStrip( FSceneNode* Frame, FTextureInfo& Texture,
@@ -1251,7 +1474,12 @@ UBOOL UPVRRenderDevice::DrawCookedMeshStrip( FSceneNode* Frame, FTextureInfo& Te
 	CaptureTexState(Tex);
 	if( !PVRBeginDraw(PVR_LIST_OP_POLY, 32 + NumPts * 32) )
 		return 1;
-	EmitHeader(PVR_LIST_OP_POLY, Flags, &Tex, 0);
+	const pvr_cull_mode_t Cull = MeshDrawScope && UseHardwareMeshCull
+		&& Frame->Mirror == 1.f && Frame->NearClip.W == 0.f
+		&& (Flags & (PF_TwoSided|PF_Flat|PF_Invisible)) == PF_Flat
+		&& !(Flags & (PF_Environment|PF_Unlit))
+		? PVR_CULLING_CCW : PVR_CULLING_NONE;
+	EmitHeader(PVR_LIST_OP_POLY, Flags, &Tex, 0, Cull);
 
 	// Each cooker meshlet has at most 128 source vertices. Reserve up to 256
 	// cache lines for UV seams, and recycle those lines on a meshlet change.
@@ -1559,6 +1787,417 @@ void UPVRRenderDevice::ResetTexture( )
 	unguard;
 }
 
+void UPVRRenderDevice::PreloadCookedLightmapPages( ULevel* Level )
+{
+	guard(UPVRRenderDevice::PreloadCookedLightmapPages);
+#if defined(PLATFORM_DREAMCAST)
+	AtlasPreloadActive = true;
+	PreloadedLightmapLevel = Level;
+	const INT Count = Level->DCLightmaps.Num();
+	PreloadedLightmaps.SetNum( Count );
+	for( INT i=0; i<Count; ++i )
+		PreloadedLightmaps(i).Page = -1;
+
+	const INT PageCount = Level->DCLightmapPages.Num();
+	if( PageCount >= AtlasPageMax )
+		appErrorf( "Too many cooked lightmap atlas pages: %i", PageCount );
+	const INT DynamicPageCount = UseVQDynamicLightmaps ? Level->DCDynamicLightmapPages.Num() : 0;
+	if( PageCount + DynamicPageCount >= AtlasPageMax )
+		appErrorf( "Too many combined cooked lightmap pages: %i+%i",
+			PageCount, DynamicPageCount );
+	const size_t FreeReserve = 3 * 1024 * 1024;
+	INT LoadedPages = 0;
+	DWORD LoadedBytes = 0;
+	for( INT i=0; i<PageCount; ++i )
+	{
+		const FDCLightmapPage& Entry = Level->DCLightmapPages(i);
+		if( Entry.Size < 32 || Entry.Size > 64 * 1024 )
+			appErrorf( "Invalid cooked VQ lightmap page size: %u", Entry.Size );
+		BYTE* Data = (BYTE*)appMalloc( Entry.Size, "CookedLightmapAtlas" );
+		Level->DCLightmapAtlasData.ReadRange( Entry.Offset, Data, Entry.Size );
+		DWORD Header[8];
+		appMemcpy( Header, Data, sizeof(Header) );
+		const INT HeaderSize = (Data[9] + 1) * 32;
+		const DWORD Mode = Header[4];
+		const INT Width = 8 << ((Mode >> 3) & 7);
+		const INT Height = 8 << (Mode & 7);
+		if( Header[0] != 0x78546344 || Header[1] != Entry.Size
+			|| HeaderSize >= (INT)Entry.Size || Data[10] != 255
+			|| Width != AtlasPageDim || Height != AtlasPageDim
+			|| (Mode & (PVR_TXRFMT_RGB565 | PVR_TXRFMT_VQ_ENABLE))
+				!= (PVR_TXRFMT_RGB565 | PVR_TXRFMT_VQ_ENABLE)
+			|| (Mode & 0x80000000) )
+			appErrorf( "Invalid cooked VQ lightmap page %i", i );
+		const INT PayloadSize = Entry.Size - HeaderSize;
+		FLightAtlasPage& Page = AtlasPages[i];
+		if( PVRPoolAvailable() >= FreeReserve + (size_t)PayloadSize )
+			Page.Tex = PVRPoolMalloc( PayloadSize );
+		if( Page.Tex )
+		{
+			pvr_txr_load( Data + HeaderSize, Page.Tex, PayloadSize );
+			Page.SizeBytes = PayloadSize;
+			Page.Format = Mode & 0x7e000000;
+			VRAMUsed += PayloadSize;
+			LoadedBytes += PayloadSize;
+			++LoadedPages;
+		}
+		appFree( Data );
+	}
+	INT DynamicLoadedPages = 0;
+	DWORD DynamicLoadedBytes = 0;
+	for( INT i=0; i<DynamicPageCount; ++i )
+	{
+		const FDCLightmapPage& Entry = Level->DCDynamicLightmapPages(i);
+		if( Entry.Size < 32 || Entry.Size > 64*1024 )
+			appErrorf( "Invalid dynamic VQ lightmap page size: %u", Entry.Size );
+		BYTE* Data = (BYTE*)appMalloc(Entry.Size,"CookedDynamicLightmapAtlas");
+		Level->DCDynamicLightmapAtlasData.ReadRange(Entry.Offset,Data,Entry.Size);
+		DWORD Header[8];
+		appMemcpy(Header,Data,sizeof(Header));
+		const INT HeaderSize = (Data[9]+1)*32;
+		const DWORD Mode = Header[4];
+		const INT Width = 8 << ((Mode >> 3) & 7);
+		const INT Height = 8 << (Mode & 7);
+		if( Header[0] != 0x78546344 || Header[1] != Entry.Size
+			|| HeaderSize >= (INT)Entry.Size || Data[10] != 255
+			|| Width != AtlasPageDim || Height != AtlasPageDim
+			|| (Mode & (PVR_TXRFMT_RGB565 | PVR_TXRFMT_VQ_ENABLE))
+				!= (PVR_TXRFMT_RGB565 | PVR_TXRFMT_VQ_ENABLE) )
+			appErrorf( "Invalid dynamic VQ lightmap page %i", i );
+		const INT PayloadSize = Entry.Size - HeaderSize;
+		FLightAtlasPage& Page = AtlasPages[PageCount+i];
+		if( PVRPoolAvailable() >= FreeReserve + (size_t)PayloadSize )
+			Page.Tex = PVRPoolMalloc(PayloadSize);
+		if( Page.Tex )
+		{
+			pvr_txr_load(Data+HeaderSize,Page.Tex,PayloadSize);
+			Page.SizeBytes = PayloadSize;
+			Page.Format = Mode & 0x7e000000;
+			VRAMUsed += PayloadSize;
+			DynamicLoadedBytes += PayloadSize;
+			Level->DCDynamicPageResident(i) = 1;
+			++DynamicLoadedPages;
+		}
+		appFree(Data);
+	}
+	AtlasPageCount = PageCount + DynamicPageCount;
+	AtlasDynamicFirstPage = AtlasPageCount;
+	INT LoadedTiles = 0;
+	for( INT i=0; i<Count; ++i )
+	{
+		const FDCLightmapPlacement& Placement = Level->DCLightmapPlacements(i);
+		if( Placement.Page >= PageCount || !AtlasPages[Placement.Page].Tex )
+			continue;
+		FPreloadedLightmap& Resident = PreloadedLightmaps(i);
+		Resident.Page = Placement.Page;
+		Resident.X = Placement.X;
+		Resident.Y = Placement.Y;
+		++LoadedTiles;
+	}
+	// The mutable page remains RGB565. It is never shared with immutable VQ
+	// pages, so dynamic/moving lights retain the exact existing upload path.
+	if( AtlasPageCount < AtlasPageMax
+		&& PVRPoolAvailable() >= FreeReserve + AtlasPageDim * AtlasPageDim * sizeof(_WORD) )
+	{
+		FLightAtlasPage& Runtime = AtlasPages[AtlasPageCount];
+		Runtime.Tex = PVRPoolMalloc( AtlasPageDim * AtlasPageDim * sizeof(_WORD) );
+		if( Runtime.Tex )
+		{
+			Runtime.SizeBytes = AtlasPageDim * AtlasPageDim * sizeof(_WORD);
+			Runtime.Format = PVR_TXRFMT_RGB565;
+			VRAMUsed += Runtime.SizeBytes;
+			debugf( NAME_Log, "PVR: lightmap atlas page %i allocated phase=preload-dynamic-reserve (128 KB)", AtlasPageCount );
+			++AtlasPageCount;
+		}
+	}
+	AtlasPreloadActive = false;
+	debugf( NAME_Log, "DCLIGHTMAP VQ preload map=%s tiles=%i/%i pages=%i/%i bytes=%uKB free=%uKB",
+		Level->GetParent()->GetName(), LoadedTiles, Count, LoadedPages, PageCount,
+		LoadedBytes / 1024, (unsigned)(PVRPoolAvailable() / 1024) );
+	debugf( NAME_Log, "DCDYNLIGHT VQ preload map=%s variants=%i pages=%i/%i bytes=%uKB enabled=%d",
+		Level->GetParent()->GetName(), Level->DCDynamicLightmaps.Num(), DynamicLoadedPages,
+		DynamicPageCount, DynamicLoadedBytes/1024, (INT)UseVQDynamicLightmaps );
+#endif
+	unguard;
+}
+
+void UPVRRenderDevice::PreloadCookedLightmaps( ULevel* Level )
+{
+	guard(UPVRRenderDevice::PreloadCookedLightmaps);
+#if defined(PLATFORM_DREAMCAST)
+	if( !Level || !Level->Model || !Level->DCLightmaps.Num() || !Level->DCLightmapData.Size() )
+	{
+		debugf( NAME_Log, "DCLIGHTMAP preload skipped level=%s model=%i entries=%i bytes=%u",
+			Level ? Level->GetParent()->GetName() : "None", Level && Level->Model ? 1 : 0,
+			Level ? Level->DCLightmaps.Num() : 0,
+			Level ? (unsigned)Level->DCLightmapData.Size() : 0 );
+		return;
+	}
+	if( Level->DCLightmapPages.Num() )
+	{
+		PreloadCookedLightmapPages( Level );
+		return;
+	}
+	AtlasPreloadActive = true;
+
+	const INT Count = Level->DCLightmaps.Num();
+	PreloadedLightmaps.SetNum( Count );
+	for( INT i = 0; i < Count; ++i )
+		PreloadedLightmaps(i).Page = -1;
+	PreloadedLightmapLevel = Level;
+
+	// Vortex2's complete compressed payload is only about 409KB. Bulk-read it
+	// once to avoid a seek for every tile. Larger maps use bounded scratch RAM.
+	const DWORD PackedBytes = Level->DCLightmapData.Size();
+	BYTE* Bulk = NULL;
+	BYTE* PackedScratch = NULL;
+	DWORD MaxPacked = 0;
+	for( INT i = 0; i < Count; ++i )
+	{
+		const FDCLightmapEntry& Entry = Level->DCLightmaps(i);
+		if( Entry.USize <= AtlasMaxTile && Entry.VSize <= AtlasMaxTile )
+			MaxPacked = Max( MaxPacked, Entry.PackedSize );
+	}
+	if( PackedBytes <= 512 * 1024 )
+	{
+		Bulk = (BYTE*)malloc( PackedBytes );
+		if( Bulk )
+			Level->DCLightmapData.Read( Bulk );
+	}
+	if( !Bulk && MaxPacked )
+	{
+		PackedScratch = (BYTE*)appMalloc( MaxPacked, "CookedLightmapScratch" );
+	}
+	_WORD* Pixels = (_WORD*)memalign( 32, AtlasMaxTile * AtlasMaxTile * sizeof(_WORD) );
+	if( !Pixels )
+		appErrorf( "Cooked lightmap preload scratch allocation failed" );
+
+	INT Loaded = 0, Oversize = 0, NoRoom = 0;
+	DWORD LoadedPixels = 0;
+	const size_t FreeReserve = 3 * 1024 * 1024;
+	for( INT i = 0; i < Count; ++i )
+	{
+		const FDCLightmapEntry& Entry = Level->DCLightmaps(i);
+		if( Entry.USize > AtlasMaxTile || Entry.VSize > AtlasMaxTile )
+		{
+			++Oversize;
+			continue;
+		}
+		if( PVRPoolAvailable() < FreeReserve + AtlasPageDim * AtlasPageDim * sizeof(_WORD) )
+		{
+			++NoRoom;
+			continue;
+		}
+
+		FTexBind Slot = { NULL, 0, 0, PVR_TXRFMT_RGB565,
+			Entry.USize, Entry.VSize, 0, 0, INDEX_NONE, 0, -1, 0, 0 };
+		// The final page remains available for moving/dynamic lightmaps. Pinned
+		// cooked slots never enter BindMap and therefore cannot be reclaimed.
+		if( !LightAtlasPlace( &Slot, Entry.USize, Entry.VSize, AtlasPageMax - 1, 0 ) )
+		{
+			++NoRoom;
+			continue;
+		}
+
+		const BYTE* Packed = Bulk ? Bulk + Entry.Offset : PackedScratch;
+		if( !Bulk )
+			Level->DCLightmapData.ReadRange( Entry.Offset, PackedScratch, Entry.PackedSize );
+		if( Entry.Codec == 0 )
+			appMemcpy( Pixels, Packed, Entry.Size() );
+		else
+		{
+			uLongf OutputSize = Entry.Size();
+			if( uncompress( (BYTE*)Pixels, &OutputSize, Packed, Entry.PackedSize ) != Z_OK
+				|| OutputSize != (uLongf)Entry.Size() )
+				appErrorf( "Invalid preloaded cooked lightmap %i", i );
+		}
+		LightAtlasStore( &Slot, Entry.USize, Entry.VSize, Pixels );
+		FPreloadedLightmap& Resident = PreloadedLightmaps(i);
+		Resident.Page = Slot.AtlasPage;
+		Resident.X = Slot.AtlasX;
+		Resident.Y = Slot.AtlasY;
+		++Loaded;
+		LoadedPixels += Entry.USize * Entry.VSize;
+	}
+
+	free( Pixels );
+	if( PackedScratch ) appFree( PackedScratch );
+	if( Bulk ) free( Bulk );
+	debugf( NAME_Log, "DCLIGHTMAP preload map=%s tiles=%i/%i oversize=%i no_room=%i pages=%i pixels=%u free=%uKB bulk=%i",
+		Level->GetParent()->GetName(), Loaded, Count, Oversize, NoRoom,
+		AtlasPageCount, LoadedPixels, (unsigned)(PVRPoolAvailable() / 1024), Bulk != NULL );
+	// Static slots are pinned for this level. Dynamic tiles must never spend
+	// frame time scanning those full pages or displace their reservations.
+	AtlasDynamicFirstPage = AtlasPageCount;
+	// Keep one ready page for dynamic/mover lightmaps. Additional pages grow
+	// only if the runtime working set needs them; three idle pages cost 384 KB
+	// that can instead hold cooked textures during level preload.
+	while( AtlasPageCount < Min( AtlasPageMax, AtlasDynamicFirstPage + 1 )
+		&& PVRPoolAvailable() >= FreeReserve + AtlasPageDim * AtlasPageDim * sizeof(_WORD) )
+	{
+		const INT Page = AtlasPageCount;
+		FLightAtlasPage& Runtime = AtlasPages[Page];
+		Runtime.Tex = PVRPoolMalloc( AtlasPageDim * AtlasPageDim * sizeof(_WORD) );
+		if( Runtime.Tex )
+		{
+			Runtime.SizeBytes = AtlasPageDim * AtlasPageDim * sizeof(_WORD);
+			Runtime.Format = PVR_TXRFMT_RGB565;
+			appMemset( Runtime.Rows, 0, sizeof(Runtime.Rows) );
+			Runtime.SlotsUsed = 0;
+			VRAMUsed += AtlasPageDim * AtlasPageDim * sizeof(_WORD);
+			AtlasPageCount = Page + 1;
+			debugf( NAME_Log, "PVR: lightmap atlas page %i allocated phase=preload-dynamic-reserve (128 KB)", Page );
+		}
+	}
+	AtlasPreloadActive = false;
+#endif
+	unguard;
+}
+
+void UPVRRenderDevice::PreloadCookedAnimationFrames()
+{
+	guard(UPVRRenderDevice::PreloadCookedAnimationFrames);
+#if defined(PLATFORM_DREAMCAST)
+	TexturePreloadActive = true;
+	// The frame-specific cache keys already retain each uploaded image. Warm
+	// them while the loading screen is up. Keep a small VRAM floor for textures
+	// discovered during play; AllocateTexture can evict cold binds if needed.
+	const size_t FreeReserve = 256 * 1024;
+	// Attempt every loaded animation frame. Available VRAM, rather than a
+	// fixed 1-2MB quota, decides when the warm-up must fall back to streaming.
+	const DWORD MaxPreloadBytes = PVRPoolAvailable() > FreeReserve
+		? (DWORD)(PVRPoolAvailable() - FreeReserve) : 0;
+	DWORD PreloadedBytes = 0;
+	INT Animations = 0, Frames = 0, AlreadyResident = 0, Skipped = 0;
+	ResetTexture();
+	for( TObjectIterator<UTexture> It; It; ++It )
+	{
+		UTexture* Texture = *It;
+		if( Texture->Format != TEXF_EXT_DCANIM || Texture->Mips.Num() < 2 )
+			continue;
+		++Animations;
+		const BYTE SavedFrame = Texture->PrimeCurrent;
+		const DWORD SavedFlags = Texture->TextureFlags;
+		for( INT Frame = 0; Frame < Texture->Mips.Num(); ++Frame )
+		{
+			FMipmap& Mip = Texture->Mips(Frame);
+			const INT SourceBytes = Mip.DataArray.Num()
+				? Mip.DataArray.Num() : Mip.StreamData.Size();
+			if( SourceBytes < 32 )
+			{
+				++Skipped;
+				continue;
+			}
+			Texture->PrimeCurrent = Frame;
+			FTextureInfo Info;
+			Texture->GetInfo( Info, 0.0 );
+			FTexBind* Existing = BindMap.Find( Info.CacheID );
+			if( Existing && Existing->Tex )
+			{
+				++AlreadyResident;
+				continue;
+			}
+			// SourceBytes includes the DT header, so this is conservative relative
+			// to the payload actually allocated in VRAM by UploadTexture.
+			if( SourceBytes > (INT)(MaxPreloadBytes - PreloadedBytes)
+				|| PVRPoolAvailable() <= FreeReserve + (size_t)SourceBytes
+				|| !PVRPoolCanAlloc( SourceBytes ) )
+			{
+				++Skipped;
+				continue;
+			}
+			// SetTexture owns validation, upload and the frame-keyed binding.
+			// Reset between calls because BindMap::Add may relocate its entries.
+			ResetTexture();
+			SetTexture( Info, 0, 0.f );
+			FTexBind* Loaded = BindMap.Find( Info.CacheID );
+			if( Loaded && Loaded->Tex )
+			{
+				PreloadedBytes += Loaded->SizeBytes;
+				++Frames;
+			}
+		}
+		Texture->PrimeCurrent = SavedFrame;
+		Texture->TextureFlags = SavedFlags;
+	}
+	ResetTexture();
+	debugf( NAME_Log, "DCANIM preload animations=%i frames=%i resident=%i skipped=%i vram=%u/%uKB free=%uKB reserve=256KB",
+		Animations, Frames, AlreadyResident, Skipped, PreloadedBytes / 1024,
+		MaxPreloadBytes / 1024, (unsigned)(PVRPoolAvailable() / 1024) );
+	TexturePreloadActive = false;
+#endif
+	unguard;
+}
+
+void UPVRRenderDevice::PreloadCookedStaticTextures()
+{
+	guard(UPVRRenderDevice::PreloadCookedStaticTextures);
+#if defined(PLATFORM_DREAMCAST)
+	TexturePreloadActive = true;
+	// Warm every loaded, non-animated cooked DT once. This moves its disc read
+	// and VRAM upload under the loading screen; the normal cache path remains
+	// the fallback when VRAM cannot hold all textures.
+	const size_t FreeReserve = 64 * 1024;
+	INT Candidates = 0, LoadedCount = 0, AlreadyResident = 0, Skipped = 0;
+	INT PriorityLoaded = 0;
+	DWORD LoadedBytes = 0;
+	ResetTexture();
+	// These independently cooked effect frames appear late in object order,
+	// yet a single explosion can request the whole sequence in successive
+	// frames. Give them the first claim on VRAM, then visit all other textures.
+	for( INT Pass = 0; Pass < 2; ++Pass )
+	for( TObjectIterator<UTexture> It; It; ++It )
+	{
+		UTexture* Texture = *It;
+		if( Texture->Format != TEXF_EXT_DCTEX || Texture->Mips.Num() < 1 )
+			continue;
+		const UBOOL Priority = Texture->GetParent()
+			&& !appStricmp( Texture->GetParent()->GetName(), "Maineffect" );
+		if( Priority != (Pass == 0) )
+			continue;
+		++Candidates;
+		FMipmap& Mip = Texture->Mips(0);
+		const INT SourceBytes = Mip.DataArray.Num()
+			? Mip.DataArray.Num() : ( Mip.StreamData.Size() ? Mip.StreamData.Size() : Mip.DCDataSize );
+		if( SourceBytes < 32 )
+		{
+			++Skipped;
+			continue;
+		}
+		FTextureInfo Info;
+		Texture->GetInfo( Info, 0.0 );
+		FTexBind* Existing = BindMap.Find( Info.CacheID );
+		if( Existing && Existing->Tex )
+		{
+			++AlreadyResident;
+			continue;
+		}
+		if( PVRPoolAvailable() <= FreeReserve + (size_t)SourceBytes
+			|| !PVRPoolCanAlloc( SourceBytes ) )
+		{
+			++Skipped;
+			continue;
+		}
+		ResetTexture();
+		SetTexture( Info, 0, 0.f );
+		FTexBind* Loaded = BindMap.Find( Info.CacheID );
+		if( Loaded && Loaded->Tex )
+		{
+			LoadedBytes += Loaded->SizeBytes;
+			++LoadedCount;
+			if( Priority )
+				++PriorityLoaded;
+		}
+	}
+	ResetTexture();
+	debugf( NAME_Log, "DCTEX preload candidates=%i loaded=%i priority=%i resident=%i skipped=%i bytes=%uKB free=%uKB reserve=64KB",
+		Candidates, LoadedCount, PriorityLoaded, AlreadyResident, Skipped, LoadedBytes / 1024,
+		(unsigned)(PVRPoolAvailable() / 1024) );
+	TexturePreloadActive = false;
+#endif
+	unguard;
+}
+
 void UPVRRenderDevice::CaptureTexState( FTexState& Out ) const
 {
 	const FTexBind* Bind = TexInfo.CurrentBind;
@@ -1578,6 +2217,11 @@ void UPVRRenderDevice::CaptureTexState( FTexState& Out ) const
 		return;
 	}
 	Out.Tex       = ( Bind && Bind->Tex ) ? Bind->Tex : NULL;
+	// A reduced .DT VQ codebook is stored at the end of the hardware's fixed
+	// 2 KiB codebook address range. Keep Bind->Tex unadjusted for upload/free;
+	// only the address compiled into the polygon header is biased.
+	if( Out.Tex && Bind->DCCodebookBytes )
+		Out.Tex = (pvr_ptr_t)((BYTE*)Out.Tex - 2048 + Bind->DCCodebookBytes);
 	Out.Key       = TexInfo.CurrentCacheID;
 	Out.Format    = Bind ? Bind->DCFormat : 0;
 	Out.Width     = Bind ? Bind->DCWidth : 0;
@@ -1601,6 +2245,61 @@ void UPVRRenderDevice::SetTexture( FTextureInfo& Info, DWORD PolyFlags, FLOAT Pa
 	// Account for all the impact on scale normalization.
 	Tex.UMult = 1.f / (Info.UScale * static_cast<FLOAT>(Info.USize));
 	Tex.VMult = 1.f / (Info.VScale * static_cast<FLOAT>(Info.VSize));
+
+	// The cooked atlas directory is sorted, so this lookup stays logarithmic.
+	// Keeping thousands of static tiles out of BindMap is important: UE1's
+	// TMap searches that map linearly on every ordinary texture bind.
+	if( PreloadedLightmapLevel && Info.Format == TEXF_RGB565
+		&& (Info.CacheID & 0xff) == CID_StaticMap && Info.Mips[0]
+		&& Info.Mips[0]->DCExternalStream == &PreloadedLightmapLevel->DCLightmapData
+		&& (DWORD)(Info.CacheID >> 32) == (DWORD)PreloadedLightmapLevel->Model->GetIndex() )
+	{
+		const INT LightMap = (INT)((Info.CacheID >> 16) & 0xffff);
+		const INT Zone = (INT)((Info.CacheID >> 8) & 0xff);
+		const FDCLightmapEntry* Entry = PreloadedLightmapLevel->FindDCLightmap( LightMap, Zone );
+		if( Entry )
+		{
+			const INT Index = Entry - &PreloadedLightmapLevel->DCLightmaps(0);
+			const FPreloadedLightmap& Resident = PreloadedLightmaps(Index);
+			if( Resident.Page >= 0 )
+			{
+				PreloadedLightmapBind = { NULL, CID_StaticMap, 0, AtlasPages[Resident.Page].Format,
+					Entry->USize, Entry->VSize, 0, TextureFrame, INDEX_NONE, 0,
+					Resident.Page, Resident.X, Resident.Y };
+				Tex.CurrentCacheID = Info.CacheID;
+				Tex.CurrentBind = &PreloadedLightmapBind;
+				ApplyAtlasTransform( Tex.CurrentBind );
+				return;
+			}
+		}
+	}
+	if( PreloadedLightmapLevel && Info.Format == TEXF_RGB565
+		&& (Info.CacheID & 0xff) == CID_StaticMap && Info.Mips[0]
+		&& Info.Mips[0]->DCExternalStream == &PreloadedLightmapLevel->DCDynamicLightmapAtlasData
+		&& (DWORD)(Info.CacheID >> 32) == (DWORD)PreloadedLightmapLevel->Model->GetIndex() )
+	{
+		const INT LightMap = (INT)((Info.CacheID >> 16) & 0xffff);
+		const INT Zone = (INT)((Info.CacheID >> 8) & 0xff);
+		const INT Variant = Info.Mips[0]->DCExternalOffset;
+		const FDCDynamicLightmapEntry* E = PreloadedLightmapLevel->FindDCDynamicLightmap(LightMap,Zone,Variant);
+		const FDCLightmapEntry* Base = PreloadedLightmapLevel->FindDCLightmap(LightMap,Zone);
+		if( E && Base && E->Page < PreloadedLightmapLevel->DCDynamicPageResident.Num()
+			&& PreloadedLightmapLevel->DCDynamicPageResident(E->Page) )
+		{
+			const INT PageIndex = PreloadedLightmapLevel->DCLightmapPages.Num() + E->Page;
+			if( PageIndex < AtlasPageCount && AtlasPages[PageIndex].Tex )
+			{
+				PreloadedLightmapBind = { NULL, CID_StaticMap, 0, AtlasPages[PageIndex].Format,
+					Base->USize, Base->VSize, 0, TextureFrame, INDEX_NONE, 0,
+					PageIndex, E->X, E->Y };
+				Tex.CurrentCacheID = Info.CacheID;
+				Tex.CurrentBind = &PreloadedLightmapBind;
+				ApplyAtlasTransform(Tex.CurrentBind);
+				return;
+			}
+		}
+		appErrorf( "Cooked dynamic lightmap lost residency: %i:%i:%i", LightMap, Zone, Variant );
+	}
 
 	// Find in cache.
 	const QWORD NewCacheID = Info.CacheID;
@@ -1659,6 +2358,7 @@ void UPVRRenderDevice::SetTexture( FTextureInfo& Info, DWORD PolyFlags, FLOAT Pa
 	Tex.CurrentCacheID = NewCacheID;
 	Tex.CurrentBind = Bind;
 	Bind->LastUsedFrame = TextureFrame;
+	Bind->IsAnimation = Info.Texture && Info.Texture->Format == TEXF_EXT_DCANIM;
 
 	if( NewTexture || ( !Bind->Tex && !IsAtlased(Bind) )
 		|| RealtimeChanged || PaletteChanged || !BindPaletteValid )
@@ -2049,30 +2749,52 @@ void* UPVRRenderDevice::ConvertTextureMipBGRA7777Alpha( const FMipmap* Mip )
 pvr_ptr_t UPVRRenderDevice::AllocateTexture( INT Size )
 {
 	DC_FRAME_SCOPE(DCFS_Allocate);
-	pvr_ptr_t Result = pvr_mem_malloc( Size );
+	pvr_ptr_t Result = PVRPoolMalloc( Size );
 	if( Result )
 		return Result;
+	INT Evicted = 0;
+	UBOOL EvictedAnimation = 0;
 
-	// Evict in a single sweep. The previous implementation rescanned the whole
-	// bind map after every free, which is quadratic exactly when VRAM is under
-	// pressure and the frame can least afford it.
-	for( INT i = 0; i < BindMap.Size() && !Result; ++i )
+	// Evict least-recently-used static binds first. Animation frame preloading
+	// buys nothing if a later static texture can immediately evict those frames.
+	// The pool tests contiguous space, not just the total free-byte count.
+	for( INT Tier = 0; Tier < 2 && !Result; ++Tier )
 	{
-		FTexBind& Candidate = BindMap[i];
-		if( !Candidate.Tex || &Candidate == TexInfo.CurrentBind
-			|| Candidate.LastUsedFrame == TextureFrame )
-			continue;
-		pvr_mem_free( Candidate.Tex );
-		DCFrameCount(DCFC_VRAMEvict);
-		if( Candidate.SizeBytes > 0 && VRAMUsed >= (DWORD)Candidate.SizeBytes )
-			VRAMUsed -= (DWORD)Candidate.SizeBytes;
-		Candidate.Tex = NULL;
-		Candidate.SizeBytes = 0;
-		Result = pvr_mem_malloc( Size );
+		for( ;; )
+		{
+			INT Oldest = INDEX_NONE;
+			for( INT i = 0; i < BindMap.Size(); ++i )
+			{
+				const FTexBind& Candidate = BindMap[i];
+				if( !Candidate.Tex || &Candidate == TexInfo.CurrentBind
+					|| Candidate.LastUsedFrame == TextureFrame
+					|| (Candidate.IsAnimation ? 1 : 0) != Tier )
+					continue;
+				if( Oldest == INDEX_NONE || Candidate.LastUsedFrame < BindMap[Oldest].LastUsedFrame )
+					Oldest = i;
+			}
+			if( Oldest == INDEX_NONE ) break;
+			FTexBind& Candidate = BindMap[Oldest];
+			PVRPoolFree( Candidate.Tex );
+			++Evicted;
+			EvictedAnimation |= Candidate.IsAnimation;
+			DCFrameCount(DCFC_VRAMEvict);
+			if( Candidate.SizeBytes > 0 && VRAMUsed >= (DWORD)Candidate.SizeBytes )
+				VRAMUsed -= (DWORD)Candidate.SizeBytes;
+			Candidate.Tex = NULL;
+			Candidate.SizeBytes = 0;
+			Result = PVRPoolMalloc( Size );
+			if( Result ) break;
+		}
 	}
 
 	if( !Result )
-		appErrorf( "PVR frame working set exceeds VRAM: request=%i resident=%u", Size, VRAMUsed );
+		appErrorf( "PVR texture VRAM exhausted: phase=%s request=%i resident=%u free=%u largest=%u",
+			TexturePreloadActive ? "preload" : "gameplay", Size, VRAMUsed,
+			(unsigned)PVRPoolAvailable(), (unsigned)PVRPoolLargest() );
+	if( EvictedAnimation )
+		debugf( NAME_Warning, "PVRPOOL evicted animation frame request=%i count=%i free=%uKB largest=%uKB",
+			Size, Evicted, (unsigned)(PVRPoolAvailable()/1024), (unsigned)(PVRPoolLargest()/1024) );
 
 	// Freed VRAM may have been reused, so no cached header is trustworthy.
 	PVRInvalidateHeaders();
@@ -2102,9 +2824,14 @@ static inline DWORD PVRTwiddleIndex( DWORD x, DWORD y )
 // Reserve a SlotW x SlotH run of slots for this tile. Tiles are placed on a
 // slot grid rather than packed tightly: at 8x8 granularity the waste is at
 // most a few texels and it keeps every write 128-byte aligned.
-UBOOL UPVRRenderDevice::LightAtlasPlace( FTexBind* Bind, INT USize, INT VSize )
+UBOOL UPVRRenderDevice::LightAtlasPlace( FTexBind* Bind, INT USize, INT VSize, INT MaxPages, UBOOL Reclaim )
 {
 	DC_FRAME_SCOPE(DCFS_Place);
+	// The expanded array also holds immutable VQ variant pages. Preserve the
+	// old one-page mutable budget so a busy scene cannot allocate the rest of
+	// that array as 128-KiB runtime pages.
+	if( Reclaim )
+		MaxPages = Min(MaxPages, AtlasDynamicFirstPage + 1);
 	if( USize > AtlasMaxTile || VSize > AtlasMaxTile )
 	{
 		TextureCPUProfile.AtlasOversize++;
@@ -2117,26 +2844,29 @@ UBOOL UPVRRenderDevice::LightAtlasPlace( FTexBind* Bind, INT USize, INT VSize )
 
 	// First pass takes free space; if there is none, reclaim the slots held by
 	// tiles we have not drawn this frame and try once more.
-	for( INT Attempt = 0; Attempt < 2; ++Attempt )
+	for( INT Attempt = 0; Attempt < (Reclaim ? 2 : 1); ++Attempt )
 	{
 		if( Attempt && !LightAtlasReclaim( Bind ) )
 			break;
 
-		for( INT Page = 0; Page < AtlasPageMax; ++Page )
+		for( INT Page = Reclaim ? AtlasDynamicFirstPage : 0; Page < MaxPages; ++Page )
 		{
 			FLightAtlasPage& P = AtlasPages[Page];
 			if( !P.Tex )
 			{
 				// Grow the pool lazily: most maps never need the second page.
-				P.Tex = pvr_mem_malloc( AtlasPageDim * AtlasPageDim * sizeof(_WORD) );
+				P.Tex = PVRPoolMalloc( AtlasPageDim * AtlasPageDim * sizeof(_WORD) );
 				if( !P.Tex )
 					break;
+				P.SizeBytes = AtlasPageDim * AtlasPageDim * sizeof(_WORD);
+				P.Format = PVR_TXRFMT_RGB565;
 				appMemset( P.Rows, 0, sizeof(P.Rows) );
 				P.SlotsUsed = 0;
 				VRAMUsed += AtlasPageDim * AtlasPageDim * sizeof(_WORD);
 				AtlasPageCount = Max( AtlasPageCount, Page + 1 );
-				debugf( NAME_Log, "PVR: lightmap atlas page %i allocated (%i KB)",
-					Page, (INT)(AtlasPageDim * AtlasPageDim * sizeof(_WORD) / 1024) );
+				debugf( NAME_Log, "PVR: lightmap atlas page %i allocated phase=%s (%i KB)",
+					Page, AtlasPreloadActive ? "preload" : "gameplay",
+					(INT)(AtlasPageDim * AtlasPageDim * sizeof(_WORD) / 1024) );
 			}
 
 			// Tiles must sit on a multiple of their own size for the twiddled
@@ -2201,6 +2931,7 @@ void UPVRRenderDevice::LightAtlasStore(
 	check( Bind && Bind->AtlasPage >= 0 );
 	DC_FRAME_SCOPE(DCFS_Twiddle);
 	const FLightAtlasPage& P = AtlasPages[Bind->AtlasPage];
+	check( P.Format == PVR_TXRFMT_RGB565 );
 	const INT BlocksX = ( USize + AtlasSlotDim - 1 ) / AtlasSlotDim;
 	const INT BlocksY = ( VSize + AtlasSlotDim - 1 ) / AtlasSlotDim;
 
@@ -2249,16 +2980,19 @@ void UPVRRenderDevice::LightAtlasFlush()
 	{
 		if( AtlasPages[i].Tex )
 		{
-			pvr_mem_free( AtlasPages[i].Tex );
-			const DWORD Bytes = AtlasPageDim * AtlasPageDim * sizeof(_WORD);
+			PVRPoolFree( AtlasPages[i].Tex );
+			const DWORD Bytes = AtlasPages[i].SizeBytes;
 			if( VRAMUsed >= Bytes )
 				VRAMUsed -= Bytes;
 		}
 		AtlasPages[i].Tex = NULL;
+		AtlasPages[i].SizeBytes = 0;
+		AtlasPages[i].Format = 0;
 		appMemset( AtlasPages[i].Rows, 0, sizeof(AtlasPages[i].Rows) );
 		AtlasPages[i].SlotsUsed = 0;
 	}
 	AtlasPageCount = 0;
+	AtlasDynamicFirstPage = 0;
 }
 
 void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, UBOOL NewTexture, UBOOL Masked )
@@ -2283,18 +3017,34 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, UBOOL NewTexture, UBOO
 	// Dreamcast lazy streaming: load mip0 bytes on demand if not resident
 	BYTE* DCLoaded = nullptr;
 #if defined(PLATFORM_DREAMCAST)
+	const UBOOL IsDTRead = Info.Format == TEXF_EXT_DCTEX;
+	const char* DTReadSource = "resident";
+	INT DTReadBytes = 0;
+	DWORD DTReadCycles = 0;
+	const INT ReadStage = IsDTRead ? DCFS_ReadDT : DCFS_ReadTextureOther;
+	const INT ReadColdCounter = IsDTRead ? DCFC_ReadDTCold : DCFC_ReadOtherCold;
+	const INT ReadReloadCounter = IsDTRead ? DCFC_ReadDTReload : DCFC_ReadOtherReload;
+	const INT ReadBytesCounter = IsDTRead ? DCFC_ReadDTBytes : DCFC_ReadTextureOtherBytes;
 	if( !Mip0->DataPtr )
 	{
 		if( Mip0->StreamData.Size() )
 		{
+			const DWORD ReadStart = IsDTRead && !TexturePreloadActive ? appCycles() : 0;
 			DCLoaded = (BYTE*)appMalloc( Mip0->StreamData.Size(), "DatTexStream" );
 			{
 				DC_FRAME_SCOPE(DCFS_Read);
-				FDCFrameScope ReadDTScope(DCFS_ReadDT);
-				DCFrameCount(DCFC_ReadDTBytes, Mip0->StreamData.Size());
+				FDCFrameScope ReadTextureScope(ReadStage);
+				DCFrameCount(NewTexture ? ReadColdCounter : ReadReloadCounter);
+				DCFrameCount(ReadBytesCounter, Mip0->StreamData.Size());
 				Mip0->StreamData.Read( DCLoaded );
 			}
 			Mip0->DataPtr = DCLoaded;
+			if( ReadStart )
+			{
+				DTReadSource = "stream";
+				DTReadBytes = Mip0->StreamData.Size();
+				DTReadCycles = appCycles() - ReadStart;
+			}
 		}
 		else if( Info.Texture && Info.Texture->GetLinker() )
 		{
@@ -2302,12 +3052,30 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, UBOOL NewTexture, UBOO
 			FArchiveFileLoad* FL = (FArchiveFileLoad*)L;
 			if( appDCStreamActive() && Mip0->DCDataSize > 0 )
 			{
+				const DWORD ReadStart = IsDTRead && !TexturePreloadActive ? appCycles() : 0;
 				DCLoaded = (BYTE*)appMalloc( Mip0->DCDataSize, "DatTexFirstUse" );
-				Mip0->ReadDCData( *FL, DCLoaded );
+				{
+					DC_FRAME_SCOPE(DCFS_Read);
+					FDCFrameScope ReadTextureScope(ReadStage);
+					DCFrameCount(NewTexture ? ReadColdCounter : ReadReloadCounter);
+					DCFrameCount(ReadBytesCounter, Mip0->DCDataSize);
+					Mip0->ReadDCData( *FL, DCLoaded );
+				}
 				Mip0->DataPtr = DCLoaded;
+				if( ReadStart )
+				{
+					DTReadSource = "session";
+					DTReadBytes = Mip0->DCDataSize;
+					DTReadCycles = appCycles() - ReadStart;
+				}
 			}
 			else if( Mip0->DCDataSize > 0 && Mip0->DCDataOffset > 0 )
 			{
+				const DWORD ReadStart = IsDTRead && !TexturePreloadActive ? appCycles() : 0;
+				DC_FRAME_SCOPE(DCFS_Read);
+				FDCFrameScope ReadTextureScope(ReadStage);
+				DCFrameCount(NewTexture ? ReadColdCounter : ReadReloadCounter);
+				DCFrameCount(ReadBytesCounter, Mip0->DCDataSize);
 				FILE* F = appFopen( FL->Filename, "rb" );
 				if( F )
 				{
@@ -2319,6 +3087,12 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, UBOOL NewTexture, UBOO
 						if( Ok == 1 )
 						{
 							Mip0->DataPtr = DCLoaded;
+							if( ReadStart )
+							{
+								DTReadSource = "file";
+								DTReadBytes = Mip0->DCDataSize;
+								DTReadCycles = appCycles() - ReadStart;
+							}
 						}
 						else
 						{
@@ -2347,7 +3121,8 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, UBOOL NewTexture, UBOO
 		INT Width = 8 << ((Mode >> 3) & 7);
 		INT Height = 8 << (Mode & 7);
 		if( Header[0] != 0x78546344 || Header[1] != (DWORD)Size || Data[8] != 0
-			|| HeaderSize >= Size || ((Mode & 0x40000000) && Data[10] != 255)
+			|| HeaderSize >= Size
+			|| ((Mode & 0x40000000) && Size - HeaderSize < (Data[10] + 1) * 8)
 			|| ((Mode & 0x80000000) && Width != Height) )
 		{
 			appErrorf( "Unsupported or invalid DT texture header" );
@@ -2356,7 +3131,7 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, UBOOL NewTexture, UBOO
 		const INT PayloadSize = Size - HeaderSize;
 		if( Bind->Tex && Bind->SizeBytes != PayloadSize )
 		{
-			pvr_mem_free( Bind->Tex );
+			PVRPoolFree( Bind->Tex );
 			VRAMUsed -= Bind->SizeBytes;
 			Bind->Tex = NULL;
 			Bind->SizeBytes = 0;
@@ -2371,11 +3146,33 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, UBOOL NewTexture, UBOO
 		{
 			appErrorf( "DT VRAM allocation failed: %i bytes", Bind->SizeBytes );
 		}
+		#if defined(PLATFORM_DREAMCAST)
+		const DWORD UploadStart = !TexturePreloadActive ? appCycles() : 0;
+		#endif
 		pvr_txr_load( Data + HeaderSize, Bind->Tex, Bind->SizeBytes );
+		#if defined(PLATFORM_DREAMCAST)
+		if( !TexturePreloadActive )
+		{
+			const DWORD UploadCycles = appCycles() - UploadStart;
+			debugf( NAME_Log,
+				"DCDT runtime tex=%s kind=%s animframe=%i cache=%08x:%08x bind=%s read=%s/%i/%.2fms upload=%i/%.2fms vram=%p free=%uKB largest=%uKB",
+				Info.Texture ? Info.Texture->GetPathName() : "None",
+				Info.Texture && Info.Texture->Format == TEXF_EXT_DCANIM ? "anim" : "static",
+				Info.Texture ? (INT)Info.Texture->PrimeCurrent : -1,
+				(DWORD)(Info.CacheID >> 32), (DWORD)Info.CacheID,
+				NewTexture ? "cold" : "reload", DTReadSource, DTReadBytes,
+				DTReadCycles * GSecondsPerCycle * 1000.0,
+				Bind->SizeBytes, UploadCycles * GSecondsPerCycle * 1000.0,
+				Bind->Tex, (unsigned)(PVRPoolAvailable() / 1024),
+				(unsigned)(PVRPoolLargest() / 1024) );
+		}
+		#endif
 		Bind->DCFormat = Mode & 0x7e000000;
 		Bind->DCWidth = Width;
 		Bind->DCHeight = Height;
 		Bind->DCMipMapped = (Mode & 0x80000000) != 0;
+		Bind->DCCodebookBytes = (Mode & 0x40000000) && Data[10] != 255
+			? (Data[10] + 1) * 8 : 0;
 		Bind->PaletteBank = INDEX_NONE;
 		Bind->PaletteMasked = 0;
 	}
@@ -2400,6 +3197,7 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, UBOOL NewTexture, UBOO
 			{
 				DC_FRAME_SCOPE(DCFS_Read);
 				FDCFrameScope ReadLightmapScope(DCFS_ReadLightmap);
+				DCFrameCount(NewTexture ? DCFC_ReadLMCold : DCFC_ReadLMReload);
 				DCFrameCount(DCFC_ReadLightmapBytes, SizeBytes);
 				Mip0->DCExternalStream->ReadRange(Mip0->DCExternalOffset, Pixels, SizeBytes);
 			}
@@ -2411,6 +3209,7 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, UBOOL NewTexture, UBOO
 			{
 				DC_FRAME_SCOPE(DCFS_Read);
 				FDCFrameScope ReadLightmapScope(DCFS_ReadLightmap);
+				DCFrameCount(NewTexture ? DCFC_ReadLMCold : DCFC_ReadLMReload);
 				DCFrameCount(DCFC_ReadLightmapBytes, PackedSize);
 				Mip0->DCExternalStream->ReadRange(Mip0->DCExternalOffset, Packed, PackedSize);
 			}
@@ -2447,7 +3246,7 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, UBOOL NewTexture, UBOO
 		{
 			if( Bind->Tex )
 			{
-				pvr_mem_free( Bind->Tex );
+				PVRPoolFree( Bind->Tex );
 				if( Bind->SizeBytes > 0 && VRAMUsed >= (DWORD)Bind->SizeBytes )
 					VRAMUsed -= (DWORD)Bind->SizeBytes;
 				Bind->Tex = NULL;
@@ -2460,7 +3259,7 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, UBOOL NewTexture, UBOO
 		{
 			if( Bind->Tex && Bind->SizeBytes != SizeBytes )
 			{
-				pvr_mem_free( Bind->Tex );
+				PVRPoolFree( Bind->Tex );
 				VRAMUsed -= Bind->SizeBytes;
 				Bind->Tex = NULL;
 				Bind->SizeBytes = 0;
@@ -2488,7 +3287,7 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, UBOOL NewTexture, UBOO
 #endif
 		if( Bind->Tex )
 		{
-			pvr_mem_free( Bind->Tex );
+			PVRPoolFree( Bind->Tex );
 			if( Bind->SizeBytes > 0 && VRAMUsed >= (DWORD)Bind->SizeBytes )
 				VRAMUsed -= (DWORD)Bind->SizeBytes;
 			Bind->Tex = NULL;
@@ -2529,7 +3328,7 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, UBOOL NewTexture, UBOO
 			if( Bind->Tex && (Bind->SizeBytes != SizeBytes
 				|| (Bind->DCFormat & (7 << 27)) != PVR_TXRFMT_PAL8BPP) )
 			{
-				pvr_mem_free( Bind->Tex );
+				PVRPoolFree( Bind->Tex );
 				VRAMUsed -= Bind->SizeBytes;
 				Bind->Tex = NULL;
 				Bind->SizeBytes = 0;
@@ -2566,7 +3365,7 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, UBOOL NewTexture, UBOO
 			const INT SizeBytes = USize * VSize * 2;
 			if( Bind->Tex )
 			{
-				pvr_mem_free( Bind->Tex );
+				PVRPoolFree( Bind->Tex );
 				VRAMUsed -= Bind->SizeBytes;
 			}
 			Bind->Tex = AllocateTexture( SizeBytes );
@@ -2591,7 +3390,7 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, UBOOL NewTexture, UBOO
 		const INT SizeBytes = USize * VSize * 2;
 		if( Bind->Tex )
 		{
-			pvr_mem_free( Bind->Tex );
+			PVRPoolFree( Bind->Tex );
 			if( Bind->SizeBytes > 0 && VRAMUsed >= (DWORD)Bind->SizeBytes )
 				VRAMUsed -= (DWORD)Bind->SizeBytes;
 			Bind->Tex = NULL;
@@ -2619,7 +3418,7 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, UBOOL NewTexture, UBOO
 		const INT SizeBytes = Mip0->USize * Mip0->VSize * 2;
 		if( Bind->Tex && Bind->SizeBytes != SizeBytes )
 		{
-			pvr_mem_free( Bind->Tex );
+			PVRPoolFree( Bind->Tex );
 			if( Bind->SizeBytes > 0 && VRAMUsed >= (DWORD)Bind->SizeBytes )
 				VRAMUsed -= (DWORD)Bind->SizeBytes;
 			Bind->Tex = NULL;
@@ -2664,7 +3463,7 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, UBOOL NewTexture, UBOO
 		{
 			if( Bind->Tex )
 			{
-				pvr_mem_free( Bind->Tex );
+				PVRPoolFree( Bind->Tex );
 				if( Bind->SizeBytes > 0 && VRAMUsed >= (DWORD)Bind->SizeBytes )
 					VRAMUsed -= (DWORD)Bind->SizeBytes;
 				Bind->Tex = NULL;
@@ -2679,7 +3478,7 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, UBOOL NewTexture, UBOO
 		{
 			if( Bind->Tex && Bind->SizeBytes != SizeBytes )
 			{
-				pvr_mem_free( Bind->Tex );
+				PVRPoolFree( Bind->Tex );
 				if( Bind->SizeBytes > 0 && VRAMUsed >= (DWORD)Bind->SizeBytes )
 					VRAMUsed -= (DWORD)Bind->SizeBytes;
 				Bind->Tex = NULL;
@@ -2724,65 +3523,18 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, UBOOL NewTexture, UBOO
 
 void UPVRRenderDevice::PrintTextureCPUProfile( INT Frames )
 {
-	const DOUBLE ToMilliseconds = GSecondsPerCycle * 1000.0;
-	const DOUBLE TotalMilliseconds =
-		(TextureCPUProfile.PaletteCycles
-		+ TextureCPUProfile.P8TwiddleCycles
-		+ TextureCPUProfile.P8ConvertCycles
-		+ TextureCPUProfile.LightmapCycles) * ToMilliseconds;
-	debugf(
-		"DCTEXCPU frames=%d frame_ms=%.3f "
-		"palette=%u/%.3fms twiddle=%u/%u/%.3fms "
-		"p8_expand=%u/%u/%.3fms bank_fallback=%u generic_p8=%u "
-		"min8=%u/%u/%u lightmap=%u/%u/%.3fms dynamic=%u/%u "
-		"static=%u/%u/%u/%u/%u",
-		Frames, Frames ? TotalMilliseconds / Frames : 0.0,
-		TextureCPUProfile.PaletteCalls,
-		TextureCPUProfile.PaletteCycles * ToMilliseconds,
-		TextureCPUProfile.P8TwiddleCalls, TextureCPUProfile.P8TwiddlePixels,
-		TextureCPUProfile.P8TwiddleCycles * ToMilliseconds,
-		TextureCPUProfile.P8ConvertCalls, TextureCPUProfile.P8ConvertPixels,
-		TextureCPUProfile.P8ConvertCycles * ToMilliseconds,
-		TextureCPUProfile.PaletteBankFallbacks,
-		TextureCPUProfile.GenericP8Conversions,
-		TextureCPUProfile.MinSizeExpansions,
-		TextureCPUProfile.MinSizeSourcePixels,
-		TextureCPUProfile.MinSizeOutputPixels,
-		TextureCPUProfile.LightmapCalls, TextureCPUProfile.LightmapPixels,
-		TextureCPUProfile.LightmapCycles * ToMilliseconds,
-		TextureCPUProfile.DynamicLightmapCalls,
-		TextureCPUProfile.DynamicLightmapPixels,
-		TextureCPUProfile.StaticLightmapCalls,
-		TextureCPUProfile.StaticLightmapPixels,
-		TextureCPUProfile.StaticLightmapCold,
-		TextureCPUProfile.StaticLightmapReload,
-		TextureCPUProfile.StaticLightmapRetype );
-	debugf(
-		"DCLMATLAS cooked=%u/%u/%uKB/%.3fms atlas=%u/%u/%u pages=%i/%i "
-		"evict=%u reject=%u/%u",
-		TextureCPUProfile.CookedLightmapCold,
-		TextureCPUProfile.CookedLightmapReload,
-		TextureCPUProfile.CookedLightmapBytes / 1024,
-		TextureCPUProfile.CookedLightmapCycles * ToMilliseconds,
-		TextureCPUProfile.AtlasInserts,
-		TextureCPUProfile.AtlasUpdates,
-		TextureCPUProfile.AtlasBlocks,
-		AtlasPageCount,
-		AtlasPageCount ? AtlasPages[0].SlotsUsed : 0,
-		TextureCPUProfile.AtlasEvictions,
-		TextureCPUProfile.AtlasOversize,
-		TextureCPUProfile.AtlasNoSpace );
+	(void)Frames;
 	appMemset( &TextureCPUProfile, 0, sizeof(TextureCPUProfile) );
 }
 
 void UPVRRenderDevice::PrintMemStats() const
 {
-	// Report TA vertex buffer free as an approximate metric; detailed VRAM stats via pvr_mem_stats().
+	// The TA buffer and texture pool occupy different reserved VRAM regions.
 	const size_t End = PVR_GET(PVR_TA_VERTBUF_END);
 	const size_t Pos = PVR_GET(PVR_TA_VERTBUF_POS);
 	const size_t FreeTA = (End > Pos) ? (End - Pos) : 0;
 	debugf( "Free TA buffer = %u", (unsigned)FreeTA );
-	pvr_mem_stats();
+	PVRPoolStats();
 	malloc_stats();
 }
 

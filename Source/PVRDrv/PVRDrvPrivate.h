@@ -26,21 +26,29 @@ class DLL_EXPORT UPVRRenderDevice : public URenderDevice
 	static constexpr INT AtlasSlotDim  = MinTexSize;                 // 8
 	static constexpr INT AtlasSlots    = AtlasPageDim / AtlasSlotDim;// 32x32 grid
 	static constexpr INT AtlasMaxTile  = 64;   // wider/taller tiles stay private
-	static constexpr INT AtlasPageMax  = 2;    // 128KB each
+	static constexpr INT AtlasPageMax  = 40;   // static VQ + optional dynamic VQ + mutable runtime pages
 
 	struct FLightAtlasPage
 	{
 		pvr_ptr_t Tex;
+		DWORD SizeBytes;
+		DWORD Format;
 		DWORD     Rows[AtlasSlots];  // occupancy, one bit per slot column
 		INT       SlotsUsed;
 	};
 	FLightAtlasPage AtlasPages[AtlasPageMax];
 	INT AtlasPageCount;
+	INT AtlasDynamicFirstPage;
+	UBOOL AtlasPreloadActive;
+	UBOOL TexturePreloadActive;
 
 	// Options.
 	UBOOL NoFiltering;
 	UBOOL UseTriStrips;
 	UBOOL UseMeshOIX;
+	UBOOL UseVQDynamicLightmaps;
+	UBOOL UseHardwareMeshCull;
+	UBOOL MeshDrawScope;
 	UBOOL DistanceFog;
 	UBOOL Overbright;
 	UBOOL VolumetricFog;
@@ -61,8 +69,18 @@ class DLL_EXPORT UPVRRenderDevice : public URenderDevice
 		UBOOL PaletteMasked;
 		INT AtlasPage;
 		INT AtlasX, AtlasY;
+		_WORD DCCodebookBytes; // 0 for non-DT/full VQ; reduced DT codebook otherwise
+		UBOOL IsAnimation; // preserve warmed animation frames ahead of cold static binds
 	};
 	TMap<QWORD, FTexBind> BindMap;
+	struct FPreloadedLightmap
+	{
+		short Page;
+		BYTE X, Y;
+	};
+	ULevel* PreloadedLightmapLevel;
+	TArray<FPreloadedLightmap> PreloadedLightmaps;
+	FTexBind PreloadedLightmapBind;
 
 	static UBOOL IsAtlased( const FTexBind* Bind )
 	{
@@ -183,9 +201,14 @@ class DLL_EXPORT UPVRRenderDevice : public URenderDevice
 	virtual void Exit() override;
 	virtual void Flush() override;
 	virtual UBOOL Exec( const char* Cmd, FOutputDevice* Out ) override;
+	virtual void PreloadCookedAnimationFrames() override;
+	virtual void PreloadCookedStaticTextures() override;
+	virtual void PreloadCookedLightmaps( ULevel* Level ) override;
+	void PreloadCookedLightmapPages( ULevel* Level );
 	virtual void Lock( FPlane FlashScale, FPlane FlashFog, FPlane ScreenClear, DWORD RenderLockFlags, BYTE* InHitData, INT* InHitSize ) override;
 	virtual void Unlock( UBOOL Blit ) override;
 	virtual UBOOL UsesOrderedLists() const override { return 1; }
+	virtual UBOOL UsesHardwareMeshCulling() const override { return UseHardwareMeshCull; }
 	virtual void BeginRenderPass( INT Pass ) override;
 	virtual UBOOL WantsBspSurface( DWORD PolyFlags, INT Pass ) const override;
 	virtual void DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& Surface, FSurfaceFacet& Facet ) override;
@@ -215,7 +238,7 @@ class DLL_EXPORT UPVRRenderDevice : public URenderDevice
 	void UploadPalette( INT Bank, const FTextureInfo& Info, UBOOL Masked );
 	pvr_ptr_t AllocateTexture( INT Size );
 	void  ApplyAtlasTransform( const FTexBind* Bind );
-	UBOOL LightAtlasPlace( FTexBind* Bind, INT USize, INT VSize );
+	UBOOL LightAtlasPlace( FTexBind* Bind, INT USize, INT VSize, INT MaxPages = AtlasPageMax, UBOOL Reclaim = 1 );
 	INT   LightAtlasReclaim( const FTexBind* Keep );
 	void  LightAtlasStore( const FTexBind* Bind, INT USize, INT VSize, const _WORD* Pixels );
 	void  LightAtlasRelease( FTexBind* Bind );
@@ -232,7 +255,7 @@ class DLL_EXPORT UPVRRenderDevice : public URenderDevice
 	// Primitive emission.
 	pvr_list_t ListFor( DWORD PolyFlags ) const;
 	DWORD AdjustFlags( DWORD PolyFlags ) const;
-	void EmitHeader( pvr_list_t List, DWORD PolyFlags, const FTexState* Tex, UBOOL NoDepth );
+	void EmitHeader( pvr_list_t List, DWORD PolyFlags, const FTexState* Tex, UBOOL NoDepth, pvr_cull_mode_t Cull = PVR_CULLING_NONE );
 
 public:
 	// Queryors

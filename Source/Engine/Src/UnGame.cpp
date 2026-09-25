@@ -114,29 +114,19 @@ static void DCDiscardNonMoverPolys( ULevel* Level )
 	}
 }
 
-static void DCReleaseGameLinkers( const char* Phase )
+static void DCReleaseGameLinkers()
 {
 	if( GDCGameLinkersReleased )
 		return;
 
-	DWORD ReleasedTables = 0;
-	INT ReleasedLinkers = 0;
 	for( FObjectIterator It; It; ++It )
 	{
 		if( It->GetFlags() & (RF_NeedLoad | RF_NeedPostLoad) )
 			appErrorf( "DAT linker release found unfinished object: %s", It->GetFullName() );
 	}
-	for( TObjectIterator<ULinkerLoad> It; It; ++It )
-	{
-		ReleasedTables += It->NameMap.ArrayMax * sizeof(FName)
-			+ It->ImportMap.ArrayMax * sizeof(FObjectImport)
-			+ It->ExportMap.ArrayMax * sizeof(FObjectExport);
-		++ReleasedLinkers;
-	}
 	GObj.ResetLoaders( NULL );
 	appDCSetLinkerTablesReleased( 1 );
 	GDCGameLinkersReleased = 1;
-	debugf( "DCLINKER released phase=%s linkers=%d tables=%u", Phase, ReleasedLinkers, ReleasedTables );
 }
 #endif
 
@@ -149,7 +139,6 @@ enum
 };
 
 static UBOOL GDCSessionTravel = 0;
-static UBOOL GDCPlayProfilePending = 0;
 static char GDCSessionURL[DC_SESSION_URL_BYTES] = "";
 static char GDCSessionItems[DC_SESSION_ITEMS_BYTES] = "";
 
@@ -253,7 +242,6 @@ void UGameEngine::TickDCMemorySimulation()
 		return;
 	}
 
-	DCProfileMemory( "sim_pretravel" );
 	if( RouteIndex + 1 == ARRAY_COUNT(Route) )
 	{
 		debugf( "DCSIM complete maps=%d", ARRAY_COUNT(Route) );
@@ -501,6 +489,17 @@ void UGameEngine::Init()
 #endif
 		if( OpenRuntimeWindow )
 			Viewport->OpenWindow( NULL, 0, Client->ViewportX, Client->ViewportY, INDEX_NONE, INDEX_NONE );
+#if defined(PLATFORM_DREAMCAST)
+		// The initial Browse/LoadMap runs before this first viewport exists, so
+		// its level-load hook cannot preload anything. Warm the actual game map
+		// here, before the stream closes and before the first gameplay frame.
+		if( Viewport->RenDev )
+		{
+			Viewport->RenDev->PreloadCookedLightmaps( GLevel );
+			Viewport->RenDev->PreloadCookedAnimationFrames();
+			Viewport->RenDev->PreloadCookedStaticTextures();
+		}
+#endif
 		if( Audio )
 			Audio->SetViewport( Viewport );
 		if( GPendingLevel )
@@ -525,14 +524,14 @@ void UGameEngine::Init()
 	}
 	if( (!GLevel || !GLevel->NetDriver) && !GDCGameLinkersReleased )
 	{
-		DCReleaseGameLinkers( "engine_ready" );
+		DCReleaseGameLinkers();
 	}
 #elif defined(DC_RESOURCE_COOKER)
 	if( DCDirectSessionStartup()
 		&& (!GLevel || !GLevel->NetDriver)
 		&& !GDCGameLinkersReleased )
 	{
-		DCReleaseGameLinkers( "engine_ready" );
+		DCReleaseGameLinkers();
 	}
 #endif
 	debugf( NAME_Init, "Game engine initialized" );
@@ -836,7 +835,6 @@ ULevel* UGameEngine::LoadMap( const FURL& URL, UPendingLevel* Pending, char* Err
 	URL.String(Str);
 	debugf( NAME_Log, "LoadMap: %s", *Str );
 #if defined(PLATFORM_DREAMCAST)
-	DCProfileMemory( "load_begin" );
 	char DatPath[256];
 	char MapName[128];
 	appStrncpy( MapName, *URL.Map, ARRAY_COUNT(MapName) );
@@ -938,9 +936,6 @@ ULevel* UGameEngine::LoadMap( const FURL& URL, UPendingLevel* Pending, char* Err
 		guard(CleanupAfterExit);
 		Flush();
 		GObj.CollectGarbage( GSystem, RF_Intrinsic );
-#if defined(PLATFORM_DREAMCAST)
-		DCProfileMemory( "after_unload_gc" );
-#endif
 		unguard;
 	}
 	unguard;
@@ -1042,7 +1037,15 @@ ULevel* UGameEngine::LoadMap( const FURL& URL, UPendingLevel* Pending, char* Err
 		&& !Pending
 		&& !GLevel->NetDriver
 		&& appDCStreamActive() )
-		DCReleaseGameLinkers( "map_loaded" );
+		DCReleaseGameLinkers();
+#endif
+#if defined(PLATFORM_DREAMCAST)
+	DumpMemStatsDC("post-linkers");
+	// Reserve while the level model is still near the newest heap allocations.
+	// The tracker makes the same call later, but at that point GameInfo and
+	// BeginPlay have already fragmented the heap on large maps such as Dig.
+	DCReserveMoverBsp( GLevel );
+	DumpMemStatsDC("post-bsp-reserve");
 #endif
 
 	// Init collision.
@@ -1094,9 +1097,6 @@ ULevel* UGameEngine::LoadMap( const FURL& URL, UPendingLevel* Pending, char* Err
 	}
 	if( GLevel->IsServer() && !Info->Game )
 	{
-#if defined(PLATFORM_DREAMCAST)
-		DCProfileMemory( "gameinfo_pre" );
-#endif
 		// Get the GameInfo class.
 		UClass* GameClass=NULL;
 		if( !GameClassName[0] )
@@ -1111,9 +1111,6 @@ ULevel* UGameEngine::LoadMap( const FURL& URL, UPendingLevel* Pending, char* Err
 		debugf( NAME_Log, "Game class is '%s'", GameClass->GetName() );
 		Info->Game = (AGameInfo*)GLevel->SpawnActor( GameClass );
 		check(Info->Game!=NULL);
-#if defined(PLATFORM_DREAMCAST)
-		DCProfileMemory( "gameinfo_post" );
-#endif
 	}
 	unguard;
 	// Listen for clients.
@@ -1253,7 +1250,7 @@ ULevel* UGameEngine::LoadMap( const FURL& URL, UPendingLevel* Pending, char* Err
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
 	if( ( GEntry || DCDirectSessionStartup() )
 		&& !Pending && !GLevel->NetDriver && appDCStreamActive() )
-		DCReleaseGameLinkers( "level_peak" );
+		DCReleaseGameLinkers();
 #endif
 
 	// Client init.
@@ -1268,7 +1265,13 @@ ULevel* UGameEngine::LoadMap( const FURL& URL, UPendingLevel* Pending, char* Err
 			Client->Viewports(i)->Input->ResetInput();
 
 		// Init brush tracker.
+#if defined(PLATFORM_DREAMCAST)
+		DumpMemStatsDC("pre-movers");
+#endif
 		GLevel->BrushTracker = GNewBrushTracker( GLevel );
+#if defined(PLATFORM_DREAMCAST)
+		DumpMemStatsDC("post-movers");
+#endif
 
 		// Set up audio.
 		if( Audio && Client->Viewports.Num()>0 )
@@ -1279,16 +1282,25 @@ ULevel* UGameEngine::LoadMap( const FURL& URL, UPendingLevel* Pending, char* Err
 	// Init detail.
 	GLevel->DetailChange( Info->bHighDetailMode );
 
+#if defined(PLATFORM_DREAMCAST)
+	// PostLoad has captured the cooked frame slices and the final renderer
+	// flush is over. Warm their VRAM bindings before gameplay can tick them.
+	if( Client )
+		for( INT i=0; i<Client->Viewports.Num(); ++i )
+			if( Client->Viewports(i)->RenDev )
+			{
+				Client->Viewports(i)->RenDev->PreloadCookedLightmaps( GLevel );
+				Client->Viewports(i)->RenDev->PreloadCookedAnimationFrames();
+				Client->Viewports(i)->RenDev->PreloadCookedStaticTextures();
+			}
+#endif
+
 	// Remember the URL.
 	guard(RememberURL);
 	LastURL = URL;
 	unguard;
 
 	// Successfully started local level.
-#if defined(PLATFORM_DREAMCAST)
-	DCProfileMemory( "level_ready" );
-	GDCPlayProfilePending = 1;
-#endif
 	return GLevel;
 	unguard;
 }
@@ -1473,11 +1485,6 @@ void UGameEngine::Tick( FLOAT DeltaSeconds )
 #endif
 #if defined(PLATFORM_DREAMCAST)
 	TickDCMemorySimulation();
-	if( GDCPlayProfilePending )
-	{
-		GDCPlayProfilePending = 0;
-		DCProfileMemory( "play" );
-	}
 #endif
 	INT LocalTickCycles=0;
 	uclock(LocalTickCycles);
