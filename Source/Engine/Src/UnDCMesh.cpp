@@ -1,4 +1,5 @@
 #include "EnginePrivate.h"
+#include <zlib.h>
 
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
 
@@ -6,6 +7,154 @@ static const INT DCFrameTag = -0x44434631;
 static const INT DCFrameTemporalTag = -0x44434632;
 static const INT DCTopologyTag = -0x44435431;
 static const INT DCTopologyClusterTag = -0x44435432;
+static const INT DCTopologyNormalTag = -0x44435433;
+static const INT DCTopologyNormalZTag = -0x44435434;
+static const INT DCTopologyNormalQTag = -0x44435435;
+
+#if defined(DC_RESOURCE_COOKER)
+static _WORD DCPackMeshNormal( const FVector& Sum )
+{
+	const FLOAT Length2 = Sum.SizeSquared();
+	if( Length2 <= 0.000001f )
+		return 0xffff;
+	const FVector N = Sum * (1.f / appSqrt(Length2));
+	const FLOAT InvL1 = 1.f / (Abs(N.X) + Abs(N.Y) + Abs(N.Z));
+	FLOAT X = N.X * InvL1, Y = N.Y * InvL1;
+	if( N.Z < 0.f )
+	{
+		const FLOAT OldX = X;
+		X = (1.f - Abs(Y)) * (OldX < 0.f ? -1.f : 1.f);
+		Y = (1.f - Abs(OldX)) * (Y < 0.f ? -1.f : 1.f);
+	}
+	const INT BX = Clamp( appRound(X * 127.f) + 127, 0, 254 );
+	const INT BY = Clamp( appRound(Y * 127.f) + 127, 0, 254 );
+	return (_WORD)(BX | (BY << 8));
+}
+#endif
+
+static FVector DCUnpackMeshNormal( _WORD Packed )
+{
+	if( Packed == 0xffff )
+		return FVector(0,0,0);
+	FLOAT X = (FLOAT)((Packed & 255) - 127) * (1.f / 127.f);
+	FLOAT Y = (FLOAT)(((Packed >> 8) & 255) - 127) * (1.f / 127.f);
+	FLOAT Z = 1.f - Abs(X) - Abs(Y);
+	if( Z < 0.f )
+	{
+		const FLOAT OldX = X;
+		X = (1.f - Abs(Y)) * (OldX < 0.f ? -1.f : 1.f);
+		Y = (1.f - Abs(OldX)) * (Y < 0.f ? -1.f : 1.f);
+	}
+	return FVector(X,Y,Z);
+}
+
+#if defined(PLATFORM_DREAMCAST)
+enum { DCNormalCacheFrames = 128, DCNormalMaxVertices = 512, DCNormalReadFrames = 16 };
+struct FDCNormalFrame
+{
+	const UMesh* Mesh;
+	INT Frame;
+	DWORD Stamp;
+	_WORD Words[DCNormalMaxVertices];
+};
+static FDCNormalFrame GDCNormalFrames[DCNormalCacheFrames];
+static DWORD GDCNormalFrameStamp = 0;
+static _WORD GDCNormalReadScratch[DCNormalMaxVertices * DCNormalReadFrames];
+static BYTE GDCNormalPackedScratch[DCNormalMaxVertices * DCNormalReadFrames * 2 + 256];
+static BYTE GDCNormalQuantScratch[DCNormalMaxVertices * DCNormalReadFrames * 2];
+
+static _WORD DCExpandQuantizedNormal( const BYTE* Packed, INT Vertex )
+{
+	const INT Bit = Vertex * 10;
+	const INT Byte = Bit >> 3;
+	const INT Shift = Bit & 7;
+	const DWORD Code = ((DWORD)Packed[Byte] | ((DWORD)Packed[Byte+1] << 8)
+		| ((DWORD)Packed[Byte+2] << 16)) >> Shift;
+	const INT X = ((Code & 31) * 254 + 15) / 31;
+	const INT Y = (((Code >> 5) & 31) * 254 + 15) / 31;
+	return (_WORD)(X | (Y << 8));
+}
+
+static const _WORD* DCGetNormalFrame( const UMesh& Mesh, INT Frame )
+{
+	if( Mesh.DCNormalWords.Num() )
+		return &Mesh.DCNormalWords(Frame * Mesh.FrameVerts);
+	if( (!Mesh.DCNormalStreamData.Size() && !Mesh.DCNormalCompressed.Num())
+		|| Mesh.FrameVerts > DCNormalMaxVertices )
+		return NULL;
+	for( INT i = 0; i < DCNormalCacheFrames; ++i )
+		if( GDCNormalFrames[i].Mesh == &Mesh && GDCNormalFrames[i].Frame == Frame )
+		{
+			GDCNormalFrames[i].Stamp = ++GDCNormalFrameStamp;
+			return GDCNormalFrames[i].Words;
+		}
+	const INT First = Frame & ~(DCNormalReadFrames - 1);
+	const INT Count = Min( (INT)DCNormalReadFrames, Mesh.AnimFrames - First );
+	const INT BytesPerFrame = Mesh.FrameVerts * (INT)sizeof(_WORD);
+	if( Mesh.DCNormalBlockOffsets.Num() )
+	{
+		const INT Block = First / DCNormalReadFrames;
+		const INT Begin = Mesh.DCNormalBlockOffsets(Block);
+		const INT PackedSize = Mesh.DCNormalBlockOffsets(Block+1) - Begin;
+		if( PackedSize <= 0 || PackedSize > (INT)sizeof(GDCNormalPackedScratch) )
+			appErrorf( "Invalid cooked mesh normal block" );
+		if( Mesh.DCNormalStreamData.Size() )
+			Mesh.DCNormalStreamData.ReadRange( Begin, GDCNormalPackedScratch, PackedSize );
+		else
+			appMemcpy( GDCNormalPackedScratch, &Mesh.DCNormalCompressed(Begin), PackedSize );
+		const INT QuantFrameBytes = (Mesh.FrameVerts * 10 + 7) / 8;
+		const INT StoredFrameBytes = Mesh.DCQuantizedNormals ? QuantFrameBytes : BytesPerFrame;
+		BYTE* Output = Mesh.DCQuantizedNormals ? GDCNormalQuantScratch : (BYTE*)GDCNormalReadScratch;
+		uLongf RawSize = Count * StoredFrameBytes;
+		if( uncompress( Output, &RawSize,
+			GDCNormalPackedScratch, PackedSize ) != Z_OK || RawSize != (uLongf)(Count * StoredFrameBytes) )
+			appErrorf( "Cooked mesh normal block inflate failed" );
+	}
+	else
+		Mesh.DCNormalStreamData.ReadRange( First * BytesPerFrame,
+			GDCNormalReadScratch, Count * BytesPerFrame );
+	if( Mesh.DCNormalBlockOffsets.Num() )
+	{
+		const INT StoredFrameBytes = Mesh.DCQuantizedNormals
+			? (Mesh.FrameVerts * 10 + 7) / 8 : BytesPerFrame;
+		BYTE* Bytes = Mesh.DCQuantizedNormals ? GDCNormalQuantScratch
+			: (BYTE*)GDCNormalReadScratch;
+		for( INT j = 1; j < Count; ++j )
+			for( INT k = 0; k < StoredFrameBytes; ++k )
+				Bytes[j * StoredFrameBytes + k] += Bytes[(j-1) * StoredFrameBytes + k];
+		if( Mesh.DCQuantizedNormals )
+			for( INT j = 0; j < Count; ++j )
+				for( INT Vertex = 0; Vertex < Mesh.FrameVerts; ++Vertex )
+					GDCNormalReadScratch[j * Mesh.FrameVerts + Vertex]
+						= DCExpandQuantizedNormal( Bytes + j * StoredFrameBytes, Vertex );
+	}
+	const _WORD* Result = NULL;
+	for( INT j = 0; j < Count; ++j )
+	{
+		FDCNormalFrame* Slot = NULL;
+		for( INT i = 0; i < DCNormalCacheFrames; ++i )
+			if( GDCNormalFrames[i].Mesh == &Mesh && GDCNormalFrames[i].Frame == First + j )
+			{
+				Slot = &GDCNormalFrames[i];
+				break;
+			}
+		if( !Slot )
+		{
+			Slot = &GDCNormalFrames[0];
+			for( INT i = 1; i < DCNormalCacheFrames; ++i )
+				if( !GDCNormalFrames[i].Mesh || GDCNormalFrames[i].Stamp < Slot->Stamp )
+					Slot = &GDCNormalFrames[i];
+		}
+		appMemcpy( Slot->Words, GDCNormalReadScratch + j * Mesh.FrameVerts, BytesPerFrame );
+		Slot->Mesh = &Mesh;
+		Slot->Frame = First + j;
+		Slot->Stamp = ++GDCNormalFrameStamp;
+		if( Slot->Frame == Frame )
+			Result = Slot->Words;
+	}
+	return Result;
+}
+#endif
 
 static INT DCFrameWordCount( const UMesh& Mesh )
 {
@@ -396,18 +545,81 @@ void UMesh::SerializeDCVerts( FArchive& Ar )
 
 void UMesh::SerializeDCTopology( FArchive& Ar )
 {
+	if( Ar.IsLoading() )
+	{
+		DCNormalStreamData = FDCStreamSlice();
+#if defined(PLATFORM_DREAMCAST)
+		for( INT i = 0; i < DCNormalCacheFrames; ++i )
+			if( GDCNormalFrames[i].Mesh == this )
+				GDCNormalFrames[i].Mesh = NULL;
+#endif
+	}
 	if( !Ar.IsLoading() && !Ar.IsSaving() )
 	{
-		Ar << Tris << DCRuns << DCMaterials << DCIndices << DCUVs;
+		Ar << Tris << DCRuns << DCMaterials << DCIndices << DCUVs
+			<< DCNormalWords << DCNormalBlockOffsets << DCNormalCompressed;
 		return;
 	}
-	INT Count = DCRuns.Num() ? (DCClusteredRuns ? DCTopologyClusterTag : DCTopologyTag) : Tris.Num();
+	INT Count = DCRuns.Num() ? (DCNormalBlockOffsets.Num()
+		? (DCQuantizedNormals ? DCTopologyNormalQTag : DCTopologyNormalZTag)
+		: DCNormalWords.Num() ? DCTopologyNormalTag
+		: (DCClusteredRuns ? DCTopologyClusterTag : DCTopologyTag)) : Tris.Num();
 	Ar << AR_INDEX(Count);
-	if( Count == DCTopologyTag || Count == DCTopologyClusterTag )
+	if( Count == DCTopologyTag || Count == DCTopologyClusterTag
+		|| Count == DCTopologyNormalTag || Count == DCTopologyNormalZTag
+		|| Count == DCTopologyNormalQTag )
 	{
 		if( Ar.IsLoading() )
-			DCClusteredRuns = Count == DCTopologyClusterTag;
+		{
+			DCClusteredRuns = Count == DCTopologyClusterTag
+				|| Count == DCTopologyNormalTag || Count == DCTopologyNormalZTag
+				|| Count == DCTopologyNormalQTag;
+			DCQuantizedNormals = Count == DCTopologyNormalQTag;
+		}
 		Ar << DCRuns << DCMaterials << DCIndices << DCUVs;
+		if( Count == DCTopologyNormalTag || Count == DCTopologyNormalZTag
+			|| Count == DCTopologyNormalQTag )
+		{
+			if( Count == DCTopologyNormalZTag || Count == DCTopologyNormalQTag )
+				Ar << DCNormalBlockOffsets;
+#if defined(PLATFORM_DREAMCAST)
+			if( Ar.IsLoading() && appDCStreamActive() )
+			{
+				INT ItemCount = 0;
+				Ar << AR_INDEX(ItemCount);
+				FArchiveFileLoad& File = (FArchiveFileLoad&)Ar;
+				const INT ItemSize = Count == DCTopologyNormalTag ? (INT)sizeof(_WORD) : 1;
+				if( ItemCount <= 0 || ItemCount > 16 * 1024 * 1024
+					|| File.Tell() < 0 || File.Tell() > File.Eof
+					|| ItemCount > (File.Eof - File.Tell()) / ItemSize )
+					appErrorf( "Invalid deferred DAT mesh normal length" );
+				const INT ByteCount = ItemCount * ItemSize;
+				appDCStreamCapture( File.Filename, File.Tell(), ByteCount, DCNormalStreamData );
+				DCNormalWords.Empty();
+				DCNormalCompressed.Empty();
+				BYTE Scratch[2048];
+				for( INT Remaining = ByteCount; Remaining; )
+				{
+					const INT Bytes = Min( Remaining, (INT)sizeof(Scratch) );
+					File.Serialize( Scratch, Bytes );
+					Remaining -= Bytes;
+				}
+			}
+			else
+#endif
+			{
+				if( Count == DCTopologyNormalZTag || Count == DCTopologyNormalQTag )
+					Ar << DCNormalCompressed;
+				else
+					Ar << DCNormalWords;
+			}
+		}
+		else if( Ar.IsLoading() )
+		{
+			DCNormalWords.Empty();
+			DCNormalBlockOffsets.Empty();
+			DCNormalCompressed.Empty();
+		}
 	}
 	else
 	{
@@ -428,6 +640,25 @@ void UMesh::SerializeDCTopology( FArchive& Ar )
 
 void UMesh::ValidateDCMesh()
 {
+	if( DCNormalBlockOffsets.Num() )
+	{
+		const INT Blocks = (AnimFrames + 15) / 16;
+		const INT PackedSize = DCNormalStreamData.Size() ? DCNormalStreamData.Size()
+			: DCNormalCompressed.Num();
+		if( FrameVerts <= 0 || FrameVerts > 512 || AnimFrames <= 0
+			|| DCNormalBlockOffsets.Num() != Blocks + 1
+			|| DCNormalBlockOffsets(0) != 0
+			|| DCNormalBlockOffsets(Blocks) != PackedSize )
+			appErrorf( "Invalid cooked mesh normal block directory" );
+		for( INT i = 0; i < Blocks; ++i )
+			if( DCNormalBlockOffsets(i+1) <= DCNormalBlockOffsets(i) )
+				appErrorf( "Invalid cooked mesh normal block range" );
+	}
+	else if( (DCNormalWords.Num() || DCNormalStreamData.Size())
+		&& (FrameVerts <= 0 || AnimFrames <= 0
+		|| (QWORD)(DCNormalWords.Num() ? DCNormalWords.Num()
+			: DCNormalStreamData.Size() / (INT)sizeof(_WORD)) != (QWORD)FrameVerts * AnimFrames) )
+		appErrorf( "Invalid cooked mesh normal table: %s", GetPathName() );
 	if( DCFrameOffsets.Num() )
 	{
 		INT WordCount = DCFrameWordCount( *this );
@@ -516,6 +747,49 @@ void UMesh::ValidateDCMesh()
 	}
 }
 
+#if defined(PLATFORM_DREAMCAST)
+UBOOL UMesh::GetDCCookedNormals( FVector* Result, FCoords Coords, AActor* Owner ) const
+{
+	if( (!DCNormalWords.Num() && !DCNormalStreamData.Size()
+		&& !DCNormalCompressed.Num()) || !Owner
+		|| Owner->AnimFrame < 0.f || FrameVerts <= 0 || AnimFrames <= 0
+		|| FrameVerts > DCNormalMaxVertices )
+		return 0;
+	// The mesh's fixed, possibly nonuniform Scale is already included in the
+	// cooked normals. A positive DrawScale only changes length. Tweened poses
+	// depend on the previous actor pose, so use live face normals there.
+	const FLOAT DrawScale = Owner->bParticles ? 1.f : Owner->DrawScale;
+	if( DrawScale <= 0.f )
+		return 0;
+	FLOAT Alpha = 0.f;
+	INT Frame1 = 0, Frame2 = 0;
+	const FMeshAnimSeq* Seq = GetAnimSeq( Owner->AnimSequence );
+	if( Seq && Seq->NumFrames > 0 )
+	{
+		const FLOAT Frame = Max(Owner->AnimFrame,0.f) * Seq->NumFrames;
+		const INT Index = appFloor(Frame);
+		Alpha = Frame - Index;
+		Frame1 = Seq->StartFrame + Index % Seq->NumFrames;
+		Frame2 = Seq->StartFrame + (Index + 1) % Seq->NumFrames;
+	}
+	if( Frame1 < 0 || Frame2 < 0 || Frame1 >= AnimFrames || Frame2 >= AnimFrames )
+		return 0;
+	const _WORD* N1 = DCGetNormalFrame( *this, Frame1 );
+	const _WORD* N2 = Frame1 == Frame2 ? N1 : DCGetNormalFrame( *this, Frame2 );
+	if( !N1 || !N2 )
+		return 0;
+	Coords = Coords * (Owner->Location + Owner->PrePivot)
+		* Owner->Rotation * RotOrigin;
+	for( INT i = 0; i < FrameVerts; ++i )
+	{
+		const FVector A = DCUnpackMeshNormal(N1[i]);
+		const FVector B = DCUnpackMeshNormal(N2[i]);
+		Result[i] = (A + (B-A)*Alpha).TransformVectorBy(Coords);
+	}
+	return 1;
+}
+#endif
+
 FMeshTri* UMesh::GetDCTriangles( INT& Count )
 {
 	Count = Tris.Num();
@@ -559,7 +833,7 @@ FDCMeshTriangleCursor::FDCMeshTriangleCursor( const UMesh& InMesh )
 	: Mesh(InMesh), RunIndex(0), RunVertex(2), LastRunIndex(INDEX_NONE), LastRunVertex(INDEX_NONE)
 {}
 
-UBOOL FDCMeshTriangleCursor::Next( FMeshTri& Triangle )
+UBOOL FDCMeshTriangleCursor::Next( FMeshTri& Triangle, UBOOL IncludeUV )
 {
 	while( RunIndex < Mesh.DCRuns.Num() && RunVertex >= Mesh.DCRuns(RunIndex).Count )
 	{
@@ -586,11 +860,25 @@ UBOOL FDCMeshTriangleCursor::Next( FMeshTri& Triangle )
 	{
 		INT Index = Run.First + Order[Corner];
 		Triangle.iVertex[Corner] = Mesh.DCIndices(Index);
-		Triangle.Tex[Corner].U = Mesh.DCUVs(Index) & 255;
-		Triangle.Tex[Corner].V = Mesh.DCUVs(Index) >> 8;
 	}
+	if( IncludeUV )
+		LoadUV( Triangle, RunIndex, RunVertex );
 	++RunVertex;
 	return 1;
+}
+
+void FDCMeshTriangleCursor::LoadUV( FMeshTri& Triangle, INT RunIndex, INT Vertex ) const
+{
+	const FDCMeshRun& Run = Mesh.DCRuns(RunIndex);
+	INT Order[3] = { Vertex - 2, Vertex - 1, Vertex };
+	if( Vertex & 1 )
+		Exchange( Order[0], Order[1] );
+	for( INT Corner=0; Corner<3; ++Corner )
+	{
+		const _WORD UV = Mesh.DCUVs(Run.First + Order[Corner]);
+		Triangle.Tex[Corner].U = UV & 255;
+		Triangle.Tex[Corner].V = UV >> 8;
+	}
 }
 
 #if defined(DC_RESOURCE_COOKER)
@@ -726,6 +1014,88 @@ void UMesh::CookDCMesh()
 				appErrorf( "Mesh frame codec left trailing words" );
 			}
 		}
+	}
+	// The position frames stay in the DAT at runtime. Cook one compact normal
+	// per animation vertex now, while the original oriented triangles exist.
+	// Runtime keeps only a bounded frame cache rather than all animation normals.
+	if( FrameVerts >= 224 && Tris.Num() )
+	{
+		TArray<FVector> Points;
+		TArray<FVector> NormalSums;
+		Points.Add( FrameVerts );
+		NormalSums.Add( FrameVerts );
+		for( INT Frame = 0; Frame < AnimFrames; ++Frame )
+		{
+			FDCMeshFrameCursor Cursor( *this, Frame );
+			for( INT Vertex = 0; Vertex < FrameVerts; ++Vertex )
+				Points(Vertex) = Cursor.Next() * Scale;
+			appMemset( NormalSums.GetData(), 0, FrameVerts * sizeof(FVector) );
+			for( INT Triangle = 0; Triangle < Tris.Num(); ++Triangle )
+			{
+				const FMeshTri& Tri = Tris(Triangle);
+				const FVector Face = (Points(Tri.iVertex[0]) - Points(Tri.iVertex[1]))
+					^ (Points(Tri.iVertex[2]) - Points(Tri.iVertex[0]));
+				const FVector Unit = Face * (1.f / appSqrt(Face.SizeSquared() + 0.001f));
+				for( INT Corner = 0; Corner < 3; ++Corner )
+					NormalSums(Tri.iVertex[Corner]) += Unit;
+			}
+			for( INT Vertex = 0; Vertex < FrameVerts; ++Vertex )
+				DCNormalWords.AddItem( DCPackMeshNormal(NormalSums(Vertex)) );
+		}
+		for( INT First = 0; First < AnimFrames; First += 16 )
+		{
+			const INT Frames = Min( 16, AnimFrames - First );
+			const INT FrameBytes = (FrameVerts * 10 + 7) / 8;
+			const INT RawBytes = Frames * FrameBytes;
+			TArray<BYTE> Quantized;
+			Quantized.SetNum( RawBytes );
+			appMemset( &Quantized(0), 0, RawBytes );
+			for( INT j = 0; j < Frames; ++j )
+			{
+				BYTE* Dest = &Quantized(j * FrameBytes);
+				for( INT Vertex = 0; Vertex < FrameVerts; ++Vertex )
+				{
+					const _WORD Normal = DCNormalWords((First+j) * FrameVerts + Vertex);
+					const INT X = Min(31, ((Normal & 255) * 31 + 127) / 254);
+					const INT Y = Min(31, (((Normal >> 8) & 255) * 31 + 127) / 254);
+					const DWORD Code = X | (Y << 5);
+					const INT Bit = Vertex * 10;
+					const INT Byte = Bit >> 3;
+					const DWORD Shifted = Code << (Bit & 7);
+					Dest[Byte] |= Shifted & 255;
+					if( Byte + 1 < FrameBytes ) Dest[Byte+1] |= (Shifted >> 8) & 255;
+					if( Byte + 2 < FrameBytes ) Dest[Byte+2] |= (Shifted >> 16) & 255;
+				}
+			}
+			TArray<BYTE> Delta;
+			Delta.SetNum( RawBytes );
+			appMemcpy( &Delta(0), &Quantized(0), RawBytes );
+			for( INT j = Frames-1; j > 0; --j )
+				for( INT k = 0; k < FrameBytes; ++k )
+					Delta(j * FrameBytes + k) -= Delta((j-1) * FrameBytes + k);
+			uLongf PackedBytes = compressBound( RawBytes );
+			TArray<BYTE> Packed;
+			Packed.SetNum( PackedBytes );
+			if( compress2( &Packed(0), &PackedBytes, &Delta(0), RawBytes, Z_BEST_COMPRESSION ) != Z_OK )
+				appErrorf( "Mesh normal compression failed" );
+			TArray<BYTE> Verify;
+			Verify.SetNum( RawBytes );
+			uLongf VerifyBytes = RawBytes;
+			if( uncompress( &Verify(0), &VerifyBytes, &Packed(0), PackedBytes ) != Z_OK
+				|| VerifyBytes != (uLongf)RawBytes )
+				appErrorf( "Mesh normal compression roundtrip failed" );
+			for( INT j = 1; j < Frames; ++j )
+				for( INT k = 0; k < FrameBytes; ++k )
+					Verify(j * FrameBytes + k) += Verify((j-1) * FrameBytes + k);
+			if( appMemcmp( &Verify(0), &Quantized(0), RawBytes ) )
+				appErrorf( "Mesh normal delta roundtrip failed" );
+			DCNormalBlockOffsets.AddItem( DCNormalCompressed.Num() );
+			const INT Start = DCNormalCompressed.Add( PackedBytes );
+			appMemcpy( &DCNormalCompressed(Start), &Packed(0), PackedBytes );
+		}
+		DCNormalBlockOffsets.AddItem( DCNormalCompressed.Num() );
+		DCQuantizedNormals = 1;
+		DCNormalWords.Empty();
 	}
 	if( DCFrameOffsets.Num() )
 	{
@@ -927,9 +1297,11 @@ void UMesh::CookDCMesh()
 		VertLinks.Empty();
 	}
 	INT After = Verts.Num() * 4 + DCFrameWords.Num() * 2 + DCFrameOffsets.Num() * 4
-		+ DCRuns.Num() * 8 + DCMaterials.Num() * 8 + DCIndices.Num() * 4;
-	printf( "DCMESH %s frames=%i vertices=%i strips=%i indices=%i meshlets=%i raw=%i cooked=%i\n",
-		GetPathName(), AnimFrames, FrameVerts, DCRuns.Num(), DCIndices.Num(), MeshletCount, Before, After );
+		+ DCRuns.Num() * 8 + DCMaterials.Num() * 8 + DCIndices.Num() * 4
+		+ DCNormalBlockOffsets.Num() * 4 + DCNormalCompressed.Num();
+	printf( "DCMESH %s frames=%i vertices=%i strips=%i indices=%i meshlets=%i normals=%i raw=%i cooked=%i\n",
+		GetPathName(), AnimFrames, FrameVerts, DCRuns.Num(), DCIndices.Num(), MeshletCount,
+		DCNormalCompressed.Num(), Before, After );
 	unguard;
 }
 #endif

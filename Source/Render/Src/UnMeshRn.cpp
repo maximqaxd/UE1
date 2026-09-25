@@ -419,6 +419,7 @@ void URender::DrawMesh
 		Triangles = NULL;
 	}
 	FVector* DCVertexNormals = NULL;
+	UBOOL DCCookedNormals = 0;
 #endif
 	FVector Hack = FVector(0,-8,0);
 #if defined(PLATFORM_DREAMCAST)
@@ -450,6 +451,15 @@ void URender::DrawMesh
 	bWire = Frame->Viewport->IsOrtho() || Frame->Viewport->Actor->RendMap==REN_Wire;
 	Mesh->GetFrame( &Samples->Point, sizeof(Samples[0]), bWire ? GMath.UnitCoords : Coords, Owner );
 #if defined(PLATFORM_DREAMCAST)
+	if( Mesh->DCNormalWords.Num() || Mesh->DCNormalStreamData.Size()
+		|| Mesh->DCNormalCompressed.Num() )
+	{
+		DCVertexNormals = New<FVector>( GMem, Mesh->FrameVerts );
+		DCCookedNormals = Mesh->GetDCCookedNormals( DCVertexNormals,
+			bWire ? GMath.UnitCoords : Coords, Owner );
+		if( DCCookedNormals )
+			DCFrameCount( DCFC_MeshCookedNormals, Mesh->FrameVerts );
+	}
 	DCFrameLeave( DCFS_MeshFrame );
 #endif
 	STAT(uunclock(GStat.MeshGetFrameTime));
@@ -570,13 +580,17 @@ void URender::DrawMesh
 		guardSlow(Process);
 #if defined(PLATFORM_DREAMCAST)
 		DCFrameEnter( DCFS_MeshPrepare );
+		DCFrameEnter( DCFS_MeshPrepareSetup );
+		DCFrameCount( DCFC_MeshPrepareTris, TriangleCount );
 #endif
 		TriPool = New<FMeshTriSort>(GMem,TriangleCount);
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
 		if( Mesh->DCRuns.Num() )
 		{
-			DCVertexNormals = New<FVector>( GMem, Mesh->FrameVerts );
-			appMemset( DCVertexNormals, 0, Mesh->FrameVerts * sizeof(FVector) );
+			if( !DCVertexNormals )
+				DCVertexNormals = New<FVector>( GMem, Mesh->FrameVerts );
+			if( !DCCookedNormals )
+				appMemset( DCVertexNormals, 0, Mesh->FrameVerts * sizeof(FVector) );
 		}
 		else
 #endif
@@ -590,6 +604,200 @@ void URender::DrawMesh
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
 		FDCMeshTriangleCursor DCTriangleCursor( *Mesh );
 #endif
+#if defined(PLATFORM_DREAMCAST)
+		DCFrameLeave( DCFS_MeshPrepareSetup );
+		// Batch whole phases so timer granularity cannot be amplified by
+		// extrapolating individual microsecond-long triangle samples.
+		if( Mesh->DCRuns.Num() && DCCookedNormals )
+		{
+			// Cooked strips need only three indices for visibility. Do not
+			// expand their UVs or copy a full FMeshTri unless drawing falls back.
+			_WORD BlockIndices[64][3];
+			INT BlockRun[64], BlockVertex[64];
+			INT RunIndex = 0, RunVertex = 2;
+			for( INT Base=0; Base<TriangleCount; Base+=64 )
+			{
+				const INT BlockCount = Min( 64, TriangleCount-Base );
+				DCFrameCount( DCFC_MeshPrepareBlocks );
+				DCFrameEnter( DCFS_MeshPrepareDecode );
+				for( INT j=0; j<BlockCount; ++j )
+				{
+					while( RunIndex < Mesh->DCRuns.Num() && RunVertex >= Mesh->DCRuns(RunIndex).Count )
+					{
+						++RunIndex;
+						RunVertex = 2;
+					}
+					if( RunIndex >= Mesh->DCRuns.Num() )
+						appErrorf( "Cooked mesh strip ended early" );
+					const FDCMeshRun& Run = Mesh->DCRuns(RunIndex);
+					const _WORD* Indices = (_WORD*)Mesh->DCIndices.GetData() + Run.First;
+					// One prefetch per index cache line, ahead of the sequential walk.
+					if( (RunVertex & 15) == 2 && RunVertex + 14 < Run.Count )
+						SHZ_PREFETCH( Indices + RunVertex + 14 );
+					const INT First = RunVertex - 2;
+					BlockIndices[j][0] = Indices[First + ((RunVertex & 1) ? 1 : 0)];
+					BlockIndices[j][1] = Indices[First + ((RunVertex & 1) ? 0 : 1)];
+					BlockIndices[j][2] = Indices[First + 2];
+					BlockRun[j] = RunIndex;
+					BlockVertex[j] = RunVertex++;
+				}
+				DCFrameLeave( DCFS_MeshPrepareDecode );
+
+				DCFrameEnter( DCFS_MeshPrepareVisible );
+				INT CachedRun = INDEX_NONE;
+				DWORD CachedFlags = 0;
+				DWORD CachedPolyFlags = 0;
+				INT CachedTexture = 0;
+				DWORD OutcodeRejects = 0, FacingTests = 0, BackfaceRejects = 0, HardwareCullFaces = 0;
+				for( INT j=0; j<BlockCount; ++j )
+				{
+					FTransform& V1 = Samples[BlockIndices[j][0]];
+					FTransform& V2 = Samples[BlockIndices[j][1]];
+					FTransform& V3 = Samples[BlockIndices[j][2]];
+					if( V1.Flags & V2.Flags & V3.Flags )
+					{
+						++OutcodeRejects;
+						continue;
+					}
+					if( CachedRun != BlockRun[j] )
+					{
+						CachedRun = BlockRun[j];
+						const FDCMeshMaterial& Material = Mesh->DCMaterials(Mesh->DCRuns(CachedRun).Material);
+						CachedFlags = Material.Flags;
+						CachedPolyFlags = ExtraFlags | CachedFlags;
+						CachedTexture = Material.Texture;
+					}
+					if( (CachedPolyFlags & (PF_TwoSided|PF_Flat|PF_Invisible)) == PF_Flat )
+					{
+						const UBOOL HardwareCull = Frame->Viewport->RenDev->UsesHardwareMeshCulling()
+							&& !Frame->Viewport->RenDev->SpanBased && Frame->Mirror == 1.f
+							&& Frame->NearClip.W == 0.f
+							&& !(CachedPolyFlags & (PF_Environment|PF_Unlit))
+							&& !(V1.Flags | V2.Flags | V3.Flags);
+						if( HardwareCull )
+							++HardwareCullFaces;
+						else
+						{
+							++FacingTests;
+							const FVector FaceNormal = (V1.Point-V2.Point) ^ (V3.Point-V1.Point);
+							if( !(Frame->Mirror * -(FaceNormal | V1.Point) > 0.0f) )
+							{
+								++BackfaceRejects;
+								continue;
+							}
+						}
+					}
+					TriTop->Tri.iVertex[0] = BlockIndices[j][0];
+					TriTop->Tri.iVertex[1] = BlockIndices[j][1];
+					TriTop->Tri.iVertex[2] = BlockIndices[j][2];
+					TriTop->Tri.PolyFlags = CachedFlags;
+					TriTop->Tri.TextureIndex = CachedTexture;
+					TriTop->StripRun = BlockRun[j];
+					TriTop->StripVert = BlockVertex[j];
+					if( Frame->Viewport->RenDev->SpanBased )
+						TriTop->Key = NotWeaponHeuristic
+							? appRound( V1.Point.Z + V2.Point.Z + V3.Point.Z )
+							: appRound( FDistSquared(V1.Point,Hack)*FDistSquared(V2.Point,Hack)*FDistSquared(V3.Point,Hack) );
+					++VisibleTriangles;
+					++TriTop;
+				}
+				DCFrameCount( DCFC_MeshVisOutcodeReject, OutcodeRejects );
+				DCFrameCount( DCFC_MeshVisFacingTest, FacingTests );
+				DCFrameCount( DCFC_MeshVisBackfaceReject, BackfaceRejects );
+				DCFrameCount( DCFC_MeshVisHardwareCull, HardwareCullFaces );
+				DCFrameLeave( DCFS_MeshPrepareVisible );
+			}
+		}
+		else
+		{
+		FMeshTri BlockTri[64];
+		FLOAT BlockFacing[64];
+		INT BlockRun[64], BlockVertex[64];
+		for( INT Base=0; Base<TriangleCount; Base+=64 )
+		{
+			const INT BlockCount = Min( 64, TriangleCount-Base );
+			DCFrameCount( DCFC_MeshPrepareBlocks );
+			DCFrameEnter( DCFS_MeshPrepareDecode );
+			for( INT j=0; j<BlockCount; ++j )
+			{
+				if( Mesh->DCRuns.Num() )
+				{
+					if( !DCTriangleCursor.Next(BlockTri[j], 0) )
+						appErrorf( "Cooked mesh strip ended early" );
+					BlockRun[j] = DCTriangleCursor.LastRun();
+					BlockVertex[j] = DCTriangleCursor.LastVertex();
+				}
+				else
+				{
+					BlockTri[j] = Triangles[Base+j];
+					BlockRun[j] = BlockVertex[j] = INDEX_NONE;
+				}
+			}
+			DCFrameLeave( DCFS_MeshPrepareDecode );
+
+			DCFrameEnter( DCFS_MeshPrepareNormal );
+			for( INT j=0; j<BlockCount; ++j )
+			{
+				const FMeshTri& Tri = BlockTri[j];
+				FTransform& V1 = Samples[Tri.iVertex[0]];
+				FTransform& V2 = Samples[Tri.iVertex[1]];
+				FTransform& V3 = Samples[Tri.iVertex[2]];
+				FVector FaceNormal = (V1.Point-V2.Point) ^ (V3.Point-V1.Point);
+				// Only flat one-sided faces need a facing value, and only after
+				// the cheap triangle outcode has passed.
+				if( !(V1.Flags & V2.Flags & V3.Flags)
+					&& ((ExtraFlags | Tri.PolyFlags) & (PF_TwoSided|PF_Flat|PF_Invisible)) == PF_Flat )
+					BlockFacing[j] = -(FaceNormal | V1.Point);
+				if( !DCCookedNormals )
+				{
+					FaceNormal *= DivSqrtApprox(FaceNormal.SizeSquared()+0.001);
+					if( DCVertexNormals )
+					{
+						for( INT Corner=0; Corner<3; ++Corner )
+							DCVertexNormals[Tri.iVertex[Corner]] += FaceNormal;
+					}
+					else
+						TriNormals[Base+j] = FaceNormal;
+				}
+			}
+			DCFrameLeave( DCFS_MeshPrepareNormal );
+
+			DCFrameEnter( DCFS_MeshPrepareVisible );
+			for( INT j=0; j<BlockCount; ++j )
+			{
+				FMeshTri& Tri = BlockTri[j];
+				FTransform& V1 = Samples[Tri.iVertex[0]];
+				FTransform& V2 = Samples[Tri.iVertex[1]];
+				FTransform& V3 = Samples[Tri.iVertex[2]];
+				const DWORD PolyFlags = ExtraFlags | Tri.PolyFlags;
+				const UBOOL HardwareCull = Frame->Viewport->RenDev->UsesHardwareMeshCulling()
+					&& !Frame->Viewport->RenDev->SpanBased && Frame->Mirror == 1.f
+					&& Frame->NearClip.W == 0.f
+					&& !(PolyFlags & (PF_Environment|PF_Unlit))
+					&& !(V1.Flags | V2.Flags | V3.Flags);
+				if( !(V1.Flags & V2.Flags & V3.Flags)
+					&& ((PolyFlags & (PF_TwoSided|PF_Flat|PF_Invisible)) != PF_Flat
+						|| HardwareCull || Frame->Mirror*BlockFacing[j] > 0.0f) )
+				{
+					if( HardwareCull && (PolyFlags & (PF_TwoSided|PF_Flat|PF_Invisible)) == PF_Flat )
+						DCFrameCount( DCFC_MeshVisHardwareCull );
+					if( BlockRun[j] != INDEX_NONE )
+						DCTriangleCursor.LoadUV( Tri, BlockRun[j], BlockVertex[j] );
+					TriTop->Tri = Tri;
+					TriTop->StripRun = BlockRun[j];
+					TriTop->StripVert = BlockVertex[j];
+					if( Frame->Viewport->RenDev->SpanBased )
+						TriTop->Key = NotWeaponHeuristic
+							? appRound( V1.Point.Z + V2.Point.Z + V3.Point.Z )
+							: appRound( FDistSquared(V1.Point,Hack)*FDistSquared(V2.Point,Hack)*FDistSquared(V3.Point,Hack) );
+					++VisibleTriangles;
+					++TriTop;
+				}
+			}
+			DCFrameLeave( DCFS_MeshPrepareVisible );
+		}
+		}
+#else
 		for( INT i=0; i<TriangleCount; i++ )
 		{
 			FMeshTri DecodedTri;
@@ -659,6 +867,7 @@ void URender::DrawMesh
 				}
 			}
 		}
+#endif
 		STAT(uunclock(GStat.MeshProcessTime));
 #if defined(PLATFORM_DREAMCAST)
 		DCFrameLeave( DCFS_MeshPrepare );
@@ -727,7 +936,75 @@ void URender::DrawMesh
 		guardSlow(Light);
 #if defined(PLATFORM_DREAMCAST)
 		DCFrameEnter( DCFS_MeshVertexLight );
-#endif
+		// Gather each visible mesh vertex once. Whole-pass timings keep the
+		// light/fog/projection breakdown out of the microsecond sampling trap.
+		DCFrameEnter( DCFS_MeshVertexCollect );
+		INT* VisibleVerts = New<INT>( GMem, Mesh->FrameVerts );
+		INT UniqueVerts = 0;
+		for( INT i=0; i<VisibleTriangles; ++i )
+		{
+			const FMeshTri& Tri = TriPool[i].Tri;
+			for( INT j=0; j<3; ++j )
+			{
+				const INT iVert = Tri.iVertex[j];
+				if( Samples[iVert].Light.R == -1 )
+				{
+					Samples[iVert].Light.R = -2;
+					VisibleVerts[UniqueVerts++] = iVert;
+				}
+			}
+		}
+		DCFrameCount( DCFC_MeshVertexUnique, UniqueVerts );
+		DCFrameLeave( DCFS_MeshVertexCollect );
+
+		DCFrameEnter( DCFS_MeshVertexNormal );
+		for( INT i=0; i<UniqueVerts; ++i )
+		{
+			const INT iVert = VisibleVerts[i];
+			FTransSample& Vert = Samples[iVert];
+			FVector Norm(0,0,0);
+			if( DCVertexNormals )
+				Norm = DCVertexNormals[iVert];
+			else
+			{
+				FMeshVertConnect& Connect = Mesh->Connects(iVert);
+				for( INT k=0; k<Connect.NumVertTriangles; ++k )
+					Norm += TriNormals[Mesh->VertLinks(Connect.TriangleListOffset + k)];
+			}
+			Vert.Normal = FPlane( Vert.Point, Norm * DivSqrtApprox(Norm.SizeSquared()) );
+			if( Fatten )
+			{
+				Vert.Point += Vert.Normal * Fatness;
+				Vert.ComputeOutcode( Frame );
+			}
+		}
+		DCFrameLeave( DCFS_MeshVertexNormal );
+
+		DCFrameEnter( DCFS_MeshVertexLightCall );
+		for( INT i=0; i<UniqueVerts; ++i )
+		{
+			FTransSample& Vert = Samples[VisibleVerts[i]];
+			Vert.Light = GLightManager->Light( Vert, ExtraFlags );
+		}
+		DCFrameLeave( DCFS_MeshVertexLightCall );
+
+		DCFrameEnter( DCFS_MeshVertexFog );
+		for( INT i=0; i<UniqueVerts; ++i )
+		{
+			FTransSample& Vert = Samples[VisibleVerts[i]];
+			Vert.Fog = GLightManager->Fog( Vert, ExtraFlags );
+		}
+		DCFrameLeave( DCFS_MeshVertexFog );
+
+		DCFrameEnter( DCFS_MeshVertexProject );
+		for( INT i=0; i<UniqueVerts; ++i )
+		{
+			FTransSample& Vert = Samples[VisibleVerts[i]];
+			if( !Vert.Flags )
+				Vert.Project( Frame );
+		}
+		DCFrameLeave( DCFS_MeshVertexProject );
+#else
 		for( INT i=0; i<VisibleTriangles; i++ )
 		{
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
@@ -774,6 +1051,7 @@ void URender::DrawMesh
 				}
 			}
 		}
+#endif
 #if defined(PLATFORM_DREAMCAST)
 		DCFrameLeave( DCFS_MeshVertexLight );
 #endif
@@ -815,8 +1093,8 @@ void URender::DrawMesh
 				UseStrips = 0;
 			}
 		}
-		if( UseStrips )
-			Frame->Viewport->RenDev->BeginCookedMesh();
+		Frame->Viewport->RenDev->BeginCookedMesh();
+		FDCMeshTriangleCursor DCDrawCursor( *Mesh );
 #endif
 
 		for( INT i=0; i<VisibleTriangles; i++ )
@@ -871,6 +1149,8 @@ void URender::DrawMesh
 			{
 #if defined(PLATFORM_DREAMCAST)
 				DCFrameCount( DCFC_MeshFallbackTris );
+				if( Mesh->DCRuns.Num() && DCCookedNormals && TriPool[i].StripRun != INDEX_NONE )
+					DCDrawCursor.LoadUV( Tri, TriPool[i].StripRun, TriPool[i].StripVert );
 #endif
 				// Get texture.
 				DWORD PolyFlags = Tri.PolyFlags | ExtraFlags;
@@ -923,8 +1203,7 @@ void URender::DrawMesh
 			}
 		}
 #if defined(PLATFORM_DREAMCAST)
-		if( UseStrips )
-			Frame->Viewport->RenDev->EndCookedMesh();
+		Frame->Viewport->RenDev->EndCookedMesh();
 #endif
 		GLightManager->FinishActor();
 #if defined(PLATFORM_DREAMCAST)

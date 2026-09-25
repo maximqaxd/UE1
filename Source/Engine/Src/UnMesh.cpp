@@ -55,6 +55,7 @@ UMesh::UMesh()
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
 	DCTemporalFrames = 0;
 	DCClusteredRuns = 0;
+	DCQuantizedNormals = 0;
 #endif
 
 	// Flags.
@@ -246,7 +247,9 @@ void UMesh::GetFrame
 		// Interpolate two frames.
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
 		FDCMeshFrameCursor Frame1( *this, iFrameOffset1 / FrameVerts );
-		FDCMeshFrameCursor Frame2( *this, iFrameOffset2 / FrameVerts );
+		// Do not decode a second cooked frame for an exact keyframe.
+		FDCMeshFrameCursor Frame2 = Alpha == 0.0f
+			? Frame1 : FDCMeshFrameCursor( *this, iFrameOffset2 / FrameVerts );
 #else
 		FMeshVert* MeshVertex1 = &Verts( iFrameOffset1 );
 		FMeshVert* MeshVertex2 = &Verts( iFrameOffset2 );
@@ -260,12 +263,14 @@ void UMesh::GetFrame
 		{
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
 			FVector V1 = Frame1.Next();
-			FVector V2 = Frame2.Next();
+			// Exact keyframes need no second stream walk or interpolation. This is
+			// common for static decorations and paused death poses.
+			FVector V2 = Alpha == 0.0f ? V1 : Frame2.Next();
 #else
 			FVector V1( MeshVertex1[i].X, MeshVertex1[i].Y, MeshVertex1[i].Z );
 			FVector V2( MeshVertex2[i].X, MeshVertex2[i].Y, MeshVertex2[i].Z );
 #endif
-			CachedVerts[i] = V1 + (V2-V1)*Alpha;
+			CachedVerts[i] = Alpha == 0.0f ? V1 : V1 + (V2-V1)*Alpha;
 #if defined(PLATFORM_DREAMCAST)
 			*ResultVerts = DCTransformMeshVert( CachedVerts[i] );
 #else

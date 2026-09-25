@@ -179,12 +179,21 @@ class ENGINE_API UMesh : public UPrimitive
 	TArray<FDCMeshMaterial>  DCMaterials;
 	TArray<_WORD>            DCIndices;
 	TArray<_WORD>            DCUVs;
+	// Octahedral local-space vertex normals, one word per animation vertex.
+	TArray<_WORD>            DCNormalWords;
+	FDCStreamSlice           DCNormalStreamData;
+	TArray<INT>              DCNormalBlockOffsets;
+	TArray<BYTE>             DCNormalCompressed;
 	UBOOL                    DCTemporalFrames;
 	UBOOL                    DCClusteredRuns;
+	UBOOL                    DCQuantizedNormals;
 	void SerializeDCVerts( FArchive& Ar );
 	void SerializeDCTopology( FArchive& Ar );
 	void ValidateDCMesh();
 	FMeshTri* GetDCTriangles( INT& Count );
+#if defined(PLATFORM_DREAMCAST)
+	UBOOL GetDCCookedNormals( FVector* Result, FCoords Coords, AActor* Owner ) const;
+#endif
 #if defined(DC_RESOURCE_COOKER)
 	void CookDCMesh();
 #endif
@@ -291,7 +300,10 @@ class ENGINE_API FDCMeshTriangleCursor
 {
 public:
 	FDCMeshTriangleCursor( const UMesh& InMesh );
-	UBOOL Next( FMeshTri& Triangle );
+	UBOOL Next( FMeshTri& Triangle, UBOOL IncludeUV = 1 );
+	// Geometry-only iteration avoids decoding UVs for triangles rejected
+	// before drawing. The caller may fill them after visibility is known.
+	void LoadUV( FMeshTri& Triangle, INT Run, INT Vertex ) const;
 
 	// Where the triangle most recently returned by Next() came from, so a
 	// renderer that can consume strips directly is able to stitch consecutive
