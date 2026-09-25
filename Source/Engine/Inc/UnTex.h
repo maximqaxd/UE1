@@ -15,10 +15,6 @@
 
 enum{NUM_PAL_COLORS=256};	// Number of colors in a standard palette.
 
-#if defined(PLATFORM_DREAMCAST)
-ENGINE_API void appDCDumpProceduralTextureProfile( INT Frames );
-#endif
-
 /*-----------------------------------------------------------------------------
 	UPalette.
 -----------------------------------------------------------------------------*/

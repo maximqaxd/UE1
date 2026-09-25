@@ -590,8 +590,6 @@ void appDCStreamFinish()
 		appErrorf( "Dependency stream not fully consumed: records=%u/%u position=%u/%u",
 			DCStreamRecords, DCStreamRecordCount, DCStreamPosition, DCStreamSize );
 	}
-	debugf( "DCSTREAM VERIFIED bytes=%u records=%u loose_package_opens=0 physical_body_seeks=0",
-		DCStreamBytes, DCStreamRecords );
 	// Keep strict mode active until the caller explicitly closes the stream.
 }
 #endif

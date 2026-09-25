@@ -341,13 +341,11 @@ void RestartEngineSession()
 {
 	guard(RestartEngineSession);
 	debugf( "DCSESSION teardown_begin" );
-	DCProfileMemory( "session_before_teardown" );
 	GObj.RestartNativeCore( 1 );
 	GMem.Exit();
 	GDynMem.Exit();
 	GSceneMem.Exit();
 	GCache.Exit( 1 );
-	DCProfileMemory( "session_after_teardown" );
 	debugf( "DCSESSION teardown_complete" );
 	unguard;
 }

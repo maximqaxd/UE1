@@ -842,10 +842,9 @@ AUTOREGISTER_INTRINSIC( UObject, EX_ByteToString, execByteToString );
 void UObject::execIntToByte( FFrame& Stack, BYTE*& Result )
 {
 	guardSlow(UObject::execIntToByte);
-	BYTE Buffer[MAX_CONST_SIZE];
-	Result = Buffer;
-	Stack.Step( Stack.Object, Result );
-	*(BYTE*)Result = *(INT*)Result;
+	BYTE Buffer[MAX_CONST_SIZE], *Addr=Buffer;
+	Stack.Step( Stack.Object, Addr );
+	*(BYTE*)Result = *(INT*)Addr;
 	unguardexecSlow;
 }
 AUTOREGISTER_INTRINSIC( UObject, EX_IntToByte, execIntToByte );

@@ -306,9 +306,9 @@ CORE_API void* appLargeMemset( void* Dest, int C, INT Count );
 CORE_API void* appLargeMemcpy( void* Dest, const void* Src, INT Count );
 
 #ifdef PLATFORM_DREAMCAST
-#define appMemmove memmove
-#define appMemset memset
-#define appMemcpy memcpy
+CORE_API void* appMemmove( void* Dest, const void* Src, INT Count );
+CORE_API void  appMemset( void* Dest, int C, INT Count );
+CORE_API void* appMemcpy( void* Dest, const void* Src, INT Count );
 #else
 CORE_API void* appMemmove( void* Dest, const void* Src, INT Count );
 CORE_API void  appMemset( void* Dest, int C, INT Count );

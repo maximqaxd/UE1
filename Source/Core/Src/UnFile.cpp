@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <malloc.h>
 
 #ifdef PLATFORM_WIN32
@@ -966,13 +967,98 @@ CORE_API char* appStrupr( char* String )
 CORE_API void* appLargeMemset( void* Dest, int C, INT Count )
 {
 	// LARGE Count: larger than 64.
+#if defined(PLATFORM_DREAMCAST)
+	appMemset( Dest, C, Count );
+	return Dest;
+#else
 	return memset( Dest, C, Count );
+#endif
 }
 
 CORE_API void* appLargeMemcpy( void* Dest, const void* Src, INT Count )
 {
+#if defined(PLATFORM_DREAMCAST)
+	return appMemcpy( Dest, Src, Count );
+#else
 	return memcpy( Dest, Src, Count );
+#endif
 }
+
+#if defined(PLATFORM_DREAMCAST)
+static UBOOL DCCachedRamRange( uintptr_t Address, size_t Bytes )
+{
+	const uintptr_t RamBase = 0x8c000000u;
+	const size_t RamSize = 0x01000000u;
+	return Bytes <= RamSize && Address >= RamBase
+		&& Address - RamBase <= RamSize - Bytes;
+}
+
+CORE_API void* appMemmove( void* Dest, const void* Src, INT Count )
+{
+	check( Count >= 0 );
+	if( Count == 0 || Dest == Src )
+		return Dest;
+
+	const size_t Bytes = (size_t)Count;
+	if( Bytes >= 128
+		&& DCCachedRamRange( (uintptr_t)Dest, Bytes )
+		&& DCCachedRamRange( (uintptr_t)Src, Bytes ) )
+		return shz_memmove( Dest, Src, Bytes );
+
+	return memmove( Dest, Src, Bytes );
+}
+
+CORE_API void appMemset( void* Dest, int C, INT Count )
+{
+	check( Count >= 0 );
+	if( Count == 0 )
+		return;
+
+	const size_t Bytes = (size_t)Count;
+	const uintptr_t Address = (uintptr_t)Dest;
+	if( Bytes >= 128 && DCCachedRamRange( Address, Bytes ) )
+	{
+		const size_t Prefix = (8 - (Address & 7)) & 7;
+		const size_t Middle = (Bytes - Prefix) & ~(size_t)7;
+		if( Middle >= 128 )
+		{
+			BYTE* Output = (BYTE*)Dest;
+			const BYTE Fill = (BYTE)C;
+			const uint64_t Pattern = UINT64_C(0x0101010101010101) * Fill;
+			if( Prefix )
+				memset( Output, Fill, Prefix );
+			shz_memset8( Output + Prefix, Pattern, Middle );
+			const size_t Tail = Bytes - Prefix - Middle;
+			if( Tail )
+				memset( Output + Prefix + Middle, Fill, Tail );
+			return;
+		}
+	}
+	memset( Dest, C, Bytes );
+}
+
+CORE_API void* appMemcpy( void* Dest, const void* Src, INT Count )
+{
+	check( Count >= 0 );
+	if( Count == 0 || Dest == Src )
+		return Dest;
+
+	const uintptr_t D = (uintptr_t)Dest;
+	const uintptr_t S = (uintptr_t)Src;
+	const size_t Bytes = (size_t)Count;
+
+	// A few UE1 array operations copy overlapping ranges despite the name.
+	if( (D >= S ? D - S : S - D) < Bytes )
+		return appMemmove( Dest, Src, Count );
+
+	if( Bytes >= 128
+		&& DCCachedRamRange( D, Bytes )
+		&& DCCachedRamRange( S, Bytes ) )
+		return shz_memcpy( Dest, Src, Bytes );
+
+	return memcpy( Dest, Src, Bytes );
+}
+#endif
 
 #ifndef PLATFORM_DREAMCAST
 

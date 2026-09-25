@@ -8,10 +8,6 @@
 
 #include "CorePrivate.h" 
 
-#if defined(PLATFORM_DREAMCAST)
-#include <malloc.h>
-#endif
-
 /*-----------------------------------------------------------------------------
 	Globals.
 -----------------------------------------------------------------------------*/
@@ -29,32 +25,6 @@ CORE_API FDCLinkerIndexCallback GDCLinkerIndexCallback = NULL;
 // recycled object slots differ between the host cooker and the static DC build.
 static TArray<UObject*> GDCLoadedObjects;
 
-#if defined(PLATFORM_DREAMCAST)
-static DWORD GDCEndLoadReportedHeap = 0;
-
-static void DCProfileEndLoad( const char* Phase, INT Index, UObject* Object )
-{
-	struct mallinfo Heap = mallinfo();
-	DWORD Used = Heap.uordblks;
-	if( appStrcmp(Phase, "preload") == 0 && Used < GDCEndLoadReportedHeap + 262144 )
-	{
-		return;
-	}
-	GDCEndLoadReportedHeap = Used;
-	debugf(
-		"DCENDLOAD phase=%s index=%d queue=%d queue_capacity=%d heap=%u arena_free=%u blocks=%d class=%s object=%s",
-		Phase,
-		Index,
-		GDCLoadedObjects.Num(),
-		GDCLoadedObjects.ArrayMax,
-		Used,
-		(DWORD)Heap.fordblks,
-		Heap.ordblks,
-		Object ? Object->GetClass()->GetName() : "None",
-		Object ? Object->GetName() : "None" );
-}
-#endif
-
 CORE_API void appDCQueueLoadedObject( UObject* Object )
 {
 	GDCLoadedObjects.AddItem( Object );
@@ -69,84 +39,6 @@ CORE_API void appDCSetLinkerTablesReleased( UBOOL Released )
 	GDCLinkerTablesReleased = Released;
 }
 
-CORE_API void appDCProfileObjects( const char* Phase, UBOOL Detailed )
-{
-	DWORD Objects = 0;
-	DWORD Bodies = 0;
-	DWORD ScriptUsed = 0;
-	DWORD ScriptCapacity = 0;
-	DWORD Defaults = 0;
-	DWORD LinkerTables = 0;
-
-	for( FObjectIterator It; It; ++It )
-	{
-		++Objects;
-		Bodies += It->GetClass()->GetPropertiesSize();
-	}
-	for( TObjectIterator<UStruct> It; It; ++It )
-	{
-		ScriptUsed += It->Script.Num();
-		ScriptCapacity += It->Script.ArrayMax;
-	}
-	for( TObjectIterator<UClass> It; It; ++It )
-	{
-		Defaults += It->Defaults.ArrayMax;
-	}
-	for( TObjectIterator<ULinker> It; It; ++It )
-	{
-		DWORD Tables = It->NameMap.ArrayMax * sizeof(FName)
-			+ It->ImportMap.ArrayMax * sizeof(FObjectImport)
-			+ It->ExportMap.ArrayMax * sizeof(FObjectExport);
-		LinkerTables += Tables;
-		if( Detailed )
-		{
-			debugf( "DCLINKER phase=%s package=%s tables_capacity=%u names=%d imports=%d exports=%d",
-				Phase, It->LinkerRoot ? It->LinkerRoot->GetName() : "None", Tables,
-				It->NameMap.Num(), It->ImportMap.Num(), It->ExportMap.Num() );
-		}
-	}
-	debugf( "DCOBJECTS phase=%s count=%u body_bytes_est=%u script_used=%u script_capacity=%u"
-		" defaults_capacity=%u linker_tables_capacity=%u",
-		Phase, Objects, Bodies, ScriptUsed, ScriptCapacity, Defaults, LinkerTables );
-
-	// Detailed attribution is only emitted at load boundaries, not every tick.
-	// No scratch arrays or retained UObject pointers are needed by the profiler.
-	if( Detailed )
-	{
-		for( TObjectIterator<UPackage> Package; Package; ++Package )
-		{
-			if( Package->GetParent() )
-			{
-				continue;
-			}
-			DWORD Count = 0;
-			DWORD PackageBodies = 0;
-			DWORD PackageScript = 0;
-			DWORD PackageDefaults = 0;
-			for( FObjectIterator It; It; ++It )
-			{
-				UObject* Root = *It;
-				while( Root->GetParent() )
-				{
-					Root = Root->GetParent();
-				}
-				if( Root != *Package )
-				{
-					continue;
-				}
-				++Count;
-				PackageBodies += It->GetClass()->GetPropertiesSize();
-				UStruct* Struct = Cast<UStruct>( *It );
-				UClass* Class = Cast<UClass>( *It );
-				PackageScript += Struct ? Struct->Script.ArrayMax : 0;
-				PackageDefaults += Class ? Class->Defaults.ArrayMax : 0;
-			}
-			debugf( "DCPACKAGE phase=%s package=%s objects=%u body_bytes_est=%u"
-				" script_capacity=%u defaults_capacity=%u",
-				Phase, Package->GetName(), Count, PackageBodies, PackageScript, PackageDefaults );
-		}
-	}
-}
 #endif
 
 /*-----------------------------------------------------------------------------
@@ -2185,10 +2077,6 @@ void FObjectManager::EndLoad()
 			// UTDC EndLoad (8c16c640): drain the growing export queue. Preload
 			// can append dependencies, so neither cache Num() nor keep references
 			// to array elements across a call that may reallocate it.
-#if defined(PLATFORM_DREAMCAST)
-			GDCEndLoadReportedHeap = 0;
-			DCProfileEndLoad( "begin", 0, NULL );
-#endif
 			for( INT i = 0; i < GDCLoadedObjects.Num(); ++i )
 			{
 				UObject* Object = GDCLoadedObjects(i);
@@ -2196,14 +2084,8 @@ void FObjectManager::EndLoad()
 				{
 					check(Object->GetLinker());
 					Object->GetLinker()->Preload( Object );
-#if defined(PLATFORM_DREAMCAST)
-					DCProfileEndLoad( "preload", i, Object );
-#endif
 				}
 			}
-#if defined(PLATFORM_DREAMCAST)
-			DCProfileEndLoad( "preload_done", GDCLoadedObjects.Num(), NULL );
-#endif
 #else
 			UBOOL Preloaded;
 			do
@@ -2230,9 +2112,6 @@ void FObjectManager::EndLoad()
 			{
 				GDCLoadedObjects(i)->ConditionalPostLoad();
 			}
-#if defined(PLATFORM_DREAMCAST)
-			DCProfileEndLoad( "postload_done", GDCLoadedObjects.Num(), NULL );
-#endif
 			GDCLoadedObjects.Empty();
 #if defined(DC_RESOURCE_COOKER)
 			// Detect exports omitted from the queue, not just matching read CRCs.

@@ -114,7 +114,8 @@ static void DCLoadingDrawBackground()
 			_WORD* Dest = vram_s + ScreenY * ScreenWidth + OffsetX;
 			if( Scale == 1 )
 			{
-				appMemcpy( Dest, Row, DrawWidth * sizeof(_WORD) );
+				// vram_s is P2 VRAM (0xa5000000), not ordinary cached RAM.
+				memcpy( Dest, Row, DrawWidth * sizeof(_WORD) );
 			}
 			else
 			{

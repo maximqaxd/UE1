@@ -307,19 +307,15 @@ int FMovingBrushTracker::SurfIsDynamic( INT iSurf )
 //
 // Grow one model database to hold Extra more records, if it does not already.
 //
-static void DCGrowDb( UDatabase* Res, INT Extra, const char* Name )
+static void DCGrowDb( UDatabase* Res, INT Extra )
 {
 	if( !Res )
 		return;
 	const INT Needed = Res->GetNum() + Extra;
 	if( Res->GetMax() >= Needed )
 		return;
-	const INT Record   = Res->GetClass()->ClassRecordSize;
-	const INT OldBytes = Res->GetMax() * Record;
 	Res->SetMax( Needed );
 	Res->Realloc();
-	debugf( "DCBSPGROW array=%s num=%i extra=%i old_bytes=%i new_bytes=%i",
-		Name, Res->GetNum(), Extra, OldBytes, Needed * Record );
 }
 
 //
@@ -366,11 +362,11 @@ ENGINE_API void DCReserveMoverBsp( ULevel* Level )
 		appErrorf( "Missing/invalid measured mover budget for %s", Map );
 
 	// SetupActorBrush allocates one surface and three vectors per mover poly.
-	DCGrowDb( Level->Model->Nodes,   Nodes,                "nodes"   );
-	DCGrowDb( Level->Model->Points,  Points,               "points"  );
-	DCGrowDb( Level->Model->Verts,   Verts,                "verts"   );
-	DCGrowDb( Level->Model->Surfs,   NumMoverPolys + 32,   "surfs"   );
-	DCGrowDb( Level->Model->Vectors, 3*NumMoverPolys + 96, "vectors" );
+	DCGrowDb( Level->Model->Nodes,   Nodes );
+	DCGrowDb( Level->Model->Points,  Points );
+	DCGrowDb( Level->Model->Verts,   Verts );
+	DCGrowDb( Level->Model->Surfs,   NumMoverPolys + 32 );
+	DCGrowDb( Level->Model->Vectors, 3*NumMoverPolys + 96 );
 	unguard;
 }
 #endif
@@ -1551,7 +1547,7 @@ void FMovingBrushTracker::UpdateBrushes( AActor** Actors, int Num )
 		// Update specified actor brushes.
 		Group = 1;
 		NumGroupActors = Min(Num,(int)MAX_MOVING_BRUSH_ACTORS);
-		appMemcpy( GroupActors, Actors, Num * sizeof(AActor *) );
+		appMemcpy( GroupActors, Actors, NumGroupActors * sizeof(AActor *) );
 	}
 
 	// Init touch actors so that they can be added back later.

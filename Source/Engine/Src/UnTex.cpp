@@ -9,97 +9,6 @@
 #include "EnginePrivate.h"
 #include "UnRender.h"
 
-#if defined(PLATFORM_DREAMCAST)
-struct FDCProceduralTextureStat
-{
-	DWORD Calls;
-	DWORD Pixels;
-	DWORD Cycles;
-};
-
-struct FDCProceduralTextureItem
-{
-	char Name[96];
-	FDCProceduralTextureStat Stat;
-};
-
-static FDCProceduralTextureStat GDCFireTextureStat;
-static FDCProceduralTextureStat GDCWaterTextureStat;
-static FDCProceduralTextureStat GDCWaveTextureStat;
-static FDCProceduralTextureStat GDCOtherTextureStat;
-static FDCProceduralTextureItem GDCProceduralTextureItems[12];
-
-static FDCProceduralTextureStat& DCProceduralTextureStat( const UTexture* Texture )
-{
-	const char* ClassName = Texture->GetClass()->GetName();
-	if( !appStricmp(ClassName, "FireTexture") )
-		return GDCFireTextureStat;
-	if( !appStricmp(ClassName, "WaterTexture") || !appStricmp(ClassName, "WetTexture") )
-		return GDCWaterTextureStat;
-	if( !appStricmp(ClassName, "WaveTexture") )
-		return GDCWaveTextureStat;
-	return GDCOtherTextureStat;
-}
-
-static FDCProceduralTextureStat* DCProceduralTextureItemStat( const UTexture* Texture )
-{
-	const char* Name = Texture->GetPathName();
-	for( INT Index = 0; Index < ARRAY_COUNT(GDCProceduralTextureItems); ++Index )
-	{
-		FDCProceduralTextureItem& Item = GDCProceduralTextureItems[Index];
-		if( Item.Name[0] && !appStricmp(Item.Name, Name) )
-		{
-			return &Item.Stat;
-		}
-	}
-
-	for( INT Index = 0; Index < ARRAY_COUNT(GDCProceduralTextureItems); ++Index )
-	{
-		FDCProceduralTextureItem& Item = GDCProceduralTextureItems[Index];
-		if( !Item.Name[0] )
-		{
-			appStrncpy( Item.Name, Name, ARRAY_COUNT(Item.Name) );
-			return &Item.Stat;
-		}
-	}
-	return NULL;
-}
-
-void appDCDumpProceduralTextureProfile( INT Frames )
-{
-	debugf(
-		"DCPROCTEX frames=%d "
-		"fire=%u/%u/%.3fms water=%u/%u/%.3fms "
-		"wave=%u/%u/%.3fms other=%u/%u/%.3fms",
-		Frames,
-		GDCFireTextureStat.Calls, GDCFireTextureStat.Pixels,
-		GDCFireTextureStat.Cycles * GSecondsPerCycle * 1000.0,
-		GDCWaterTextureStat.Calls, GDCWaterTextureStat.Pixels,
-		GDCWaterTextureStat.Cycles * GSecondsPerCycle * 1000.0,
-		GDCWaveTextureStat.Calls, GDCWaveTextureStat.Pixels,
-		GDCWaveTextureStat.Cycles * GSecondsPerCycle * 1000.0,
-		GDCOtherTextureStat.Calls, GDCOtherTextureStat.Pixels,
-		GDCOtherTextureStat.Cycles * GSecondsPerCycle * 1000.0 );
-	for( INT Index = 0; Index < ARRAY_COUNT(GDCProceduralTextureItems); ++Index )
-	{
-		const FDCProceduralTextureItem& Item = GDCProceduralTextureItems[Index];
-		if( Item.Name[0] )
-		{
-			debugf(
-				"DCPROCTEXITEM name=%s calls=%u pixels=%u time=%.3fms",
-				Item.Name, Item.Stat.Calls, Item.Stat.Pixels,
-				Item.Stat.Cycles * GSecondsPerCycle * 1000.0 );
-		}
-	}
-
-	appMemset( &GDCFireTextureStat, 0, sizeof(GDCFireTextureStat) );
-	appMemset( &GDCWaterTextureStat, 0, sizeof(GDCWaterTextureStat) );
-	appMemset( &GDCWaveTextureStat, 0, sizeof(GDCWaveTextureStat) );
-	appMemset( &GDCOtherTextureStat, 0, sizeof(GDCOtherTextureStat) );
-	appMemset( GDCProceduralTextureItems, 0, sizeof(GDCProceduralTextureItems) );
-}
-#endif
-
 /*-----------------------------------------------------------------------------
 	UBitmap.
 -----------------------------------------------------------------------------*/
@@ -182,33 +91,7 @@ void UTexture::Update( DOUBLE CurrentTime )
 
 	if( CurrentTime != LastUpdateTime )
 	{
-#if defined(PLATFORM_DREAMCAST)
-		FDCProceduralTextureStat* Stat = NULL;
-		FDCProceduralTextureStat* ItemStat = NULL;
-		DWORD StartCycles = 0;
-		if( Format == TEXF_P8 && (TextureFlags & TF_Parametric) )
-		{
-			Stat = &DCProceduralTextureStat( this );
-			ItemStat = DCProceduralTextureItemStat( this );
-			StartCycles = appCycles();
-		}
-#endif
 		Tick( CurrentTime - LastUpdateTime);
-#if defined(PLATFORM_DREAMCAST)
-		if( Stat && (TextureFlags & TF_RealtimeChanged) )
-		{
-			const DWORD ElapsedCycles = appCycles() - StartCycles;
-			Stat->Cycles += ElapsedCycles;
-			Stat->Calls++;
-			Stat->Pixels += Mips.Num() ? Mips(0).USize * Mips(0).VSize : 0;
-			if( ItemStat )
-			{
-				ItemStat->Cycles += ElapsedCycles;
-				ItemStat->Calls++;
-				ItemStat->Pixels += Mips.Num() ? Mips(0).USize * Mips(0).VSize : 0;
-			}
-		}
-#endif
 		LastUpdateTime = CurrentTime;
 	}
 
