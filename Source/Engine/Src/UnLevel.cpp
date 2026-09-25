@@ -198,6 +198,13 @@ void ULevel::LoadDCLightmaps()
 
 	DCLightmaps.Empty();
 	DCLightmapData = FDCStreamSlice();
+	DCLightmapPlacements.Empty();
+	DCLightmapPages.Empty();
+	DCLightmapAtlasData = FDCStreamSlice();
+	DCDynamicLightmaps.Empty();
+	DCDynamicLightmapPages.Empty();
+	DCDynamicLightmapAtlasData = FDCStreamSlice();
+	DCDynamicPageResident.Empty();
 
 #if defined(DC_RESOURCE_COOKER)
 	if( ParseParam(appCmdLine(), "BAKEDCLIGHTMAPS") )
@@ -211,19 +218,41 @@ void ULevel::LoadDCLightmaps()
 
 	DWORD Header[4];
 	if( !appDCReadDependencyFile(Filename, 0, Header, sizeof(Header))
-		|| Header[0] != DCLightmapMagic || Header[1] != 3
+		|| Header[0] != DCLightmapMagic || (Header[1] != 3 && Header[1] != 4)
 		|| Header[2] > 65536 || Header[3] > 16 * 1024 * 1024 )
 	{
 		appErrorf( "Invalid DC lightmap header: %s", Filename );
 	}
 
+	const UBOOL HasAtlas = Header[1] == 4;
+	DWORD PageHeader[2] = { 0, 0 };
+	if( HasAtlas && (!appDCReadDependencyFile(Filename, sizeof(Header), PageHeader, sizeof(PageHeader))
+		|| PageHeader[0] > 15 || PageHeader[1] > 16 * 1024 * 1024) )
+		appErrorf( "Invalid DC lightmap atlas header: %s", Filename );
+	const INT HeaderSize = HasAtlas ? 24 : 16;
 	const INT Count = Header[2];
 	const INT DirectorySize = Count * sizeof(FDCLightmapEntry);
 	DCLightmaps.SetNum( Count );
 	if( Count && !appDCReadDependencyFile(
-		Filename, sizeof(Header), &DCLightmaps(0), DirectorySize) )
+		Filename, HeaderSize, &DCLightmaps(0), DirectorySize) )
 	{
 		appErrorf( "Invalid DC lightmap directory: %s", Filename );
+	}
+	INT PayloadOffset = HeaderSize + DirectorySize;
+	if( HasAtlas )
+	{
+		DCLightmapPlacements.SetNum( Count );
+		const INT PlacementBytes = Count * sizeof(FDCLightmapPlacement);
+		if( Count && !appDCReadDependencyFile(Filename, PayloadOffset,
+			&DCLightmapPlacements(0), PlacementBytes) )
+			appErrorf( "Invalid DC lightmap placement table: %s", Filename );
+		PayloadOffset += PlacementBytes;
+		DCLightmapPages.SetNum( PageHeader[0] );
+		const INT PageDirectoryBytes = PageHeader[0] * sizeof(FDCLightmapPage);
+		if( PageHeader[0] && !appDCReadDependencyFile(Filename, PayloadOffset,
+			&DCLightmapPages(0), PageDirectoryBytes) )
+			appErrorf( "Invalid DC lightmap page table: %s", Filename );
+		PayloadOffset += PageDirectoryBytes;
 	}
 
 	for( INT i = 0; i < Count; ++i )
@@ -237,20 +266,96 @@ void ULevel::LoadDCLightmaps()
 		{
 			appErrorf( "Invalid DC lightmap entry %i: %s", i, Filename );
 		}
+		if( HasAtlas )
+		{
+			const FDCLightmapPlacement& Placement = DCLightmapPlacements(i);
+			if( (Placement.Page != 255 && Placement.Page >= PageHeader[0])
+				|| Placement.X >= 32 || Placement.Y >= 32
+				|| (Placement.Page != 255
+					&& (Placement.X + (Entry.USize + 7) / 8 > 32
+						|| Placement.Y + (Entry.VSize + 7) / 8 > 32))
+				|| (i && CompareDCLightmaps(&DCLightmaps(i-1), &Entry) >= 0) )
+				appErrorf( "Invalid DC lightmap atlas placement %i: %s", i, Filename );
+		}
 	}
-	if( Count > 1 )
+	if( !HasAtlas && Count > 1 )
 	{
 		appQsort( &DCLightmaps(0), Count, sizeof(FDCLightmapEntry), CompareDCLightmaps );
 	}
 
 	if( Header[3] && !appDCCaptureDependencyFile(
-		Filename, sizeof(Header) + DirectorySize, Header[3], DCLightmapData) )
+		Filename, PayloadOffset, Header[3], DCLightmapData) )
 	{
 		appErrorf( "Invalid DC lightmap payload: %s", Filename );
 	}
+	if( HasAtlas )
+	{
+		for( INT i=0; i<DCLightmapPages.Num(); ++i )
+		{
+			const FDCLightmapPage& Page = DCLightmapPages(i);
+			if( Page.Offset > PageHeader[1] || Page.Size < 32
+				|| Page.Size > PageHeader[1] - Page.Offset )
+				appErrorf( "Invalid DC lightmap atlas page %i: %s", i, Filename );
+		}
+		if( PageHeader[1] && !appDCCaptureDependencyFile(Filename,
+			PayloadOffset + Header[3], PageHeader[1], DCLightmapAtlasData) )
+			appErrorf( "Invalid DC lightmap atlas payload: %s", Filename );
+	}
 
-	debugf( "DCLIGHTMAP loaded map=%s entries=%i streamed=%u",
-		GetParent()->GetName(), Count, Header[3] );
+	char DynamicFilename[256];
+	snprintf( DynamicFilename, sizeof(DynamicFilename), "../Maps/%s.ddm", GetParent()->GetName() );
+	if( (appDCStreamActive() ? appDCStreamFileSize(DynamicFilename)
+		: appFSize(DynamicFilename)) > 0 )
+	{
+		DWORD DynamicHeader[6];
+		if( !appDCReadDependencyFile(DynamicFilename, 0, DynamicHeader, sizeof(DynamicHeader))
+			|| DynamicHeader[0] != 0x314d4444 || DynamicHeader[1] != 1
+			|| DynamicHeader[2] > 65536 || DynamicHeader[3] > 24
+			|| DynamicHeader[4] > 16*1024*1024 )
+			appErrorf( "Invalid DC dynamic lightmap header: %s", DynamicFilename );
+		DCDynamicLightmaps.SetNum( DynamicHeader[2] );
+		DCDynamicLightmapPages.SetNum( DynamicHeader[3] );
+		DCDynamicPageResident.SetNum( DynamicHeader[3] );
+		if( DCDynamicPageResident.Num() )
+			appMemset( &DCDynamicPageResident(0), 0, DCDynamicPageResident.Num() );
+		const INT EntryOffset = sizeof(DynamicHeader);
+		const INT PageOffset = EntryOffset + DCDynamicLightmaps.Num()*sizeof(FDCDynamicLightmapEntry);
+		const INT DataOffset = PageOffset + DCDynamicLightmapPages.Num()*sizeof(FDCLightmapPage);
+		if( (DCDynamicLightmaps.Num() && !appDCReadDependencyFile(DynamicFilename,
+			EntryOffset, &DCDynamicLightmaps(0), DCDynamicLightmaps.Num()*sizeof(FDCDynamicLightmapEntry)))
+			|| (DCDynamicLightmapPages.Num() && !appDCReadDependencyFile(DynamicFilename,
+			PageOffset, &DCDynamicLightmapPages(0), DCDynamicLightmapPages.Num()*sizeof(FDCLightmapPage))) )
+			appErrorf( "Invalid DC dynamic lightmap directory: %s", DynamicFilename );
+		for( INT i=0; i<DCDynamicLightmaps.Num(); ++i )
+		{
+			const FDCDynamicLightmapEntry& E = DCDynamicLightmaps(i);
+			const FDCLightmapEntry* Base = FindDCLightmap(E.LightMap, E.Zone);
+			if( !Base || E.Variant >= 8 || E.Page >= DCDynamicLightmapPages.Num()
+				|| E.Type >= LT_MAX || E.Reserved >= LE_MAX
+				|| E.X >= 32 || E.Y >= 32
+				|| E.X + (Base->USize+7)/8 > 32 || E.Y + (Base->VSize+7)/8 > 32
+				|| (i && (DCDynamicLightmaps(i-1).LightMap > E.LightMap
+					|| (DCDynamicLightmaps(i-1).LightMap == E.LightMap
+						&& (DCDynamicLightmaps(i-1).Zone > E.Zone
+							|| (DCDynamicLightmaps(i-1).Zone == E.Zone
+								&& DCDynamicLightmaps(i-1).Variant >= E.Variant))))) )
+				appErrorf( "Invalid DC dynamic lightmap entry %i: %s", i, DynamicFilename );
+		}
+		for( INT i=0; i<DCDynamicLightmapPages.Num(); ++i )
+			if( DCDynamicLightmapPages(i).Offset > DynamicHeader[4]
+				|| DCDynamicLightmapPages(i).Size < 32
+				|| DCDynamicLightmapPages(i).Size > DynamicHeader[4] - DCDynamicLightmapPages(i).Offset )
+				appErrorf( "Invalid DC dynamic lightmap page %i: %s", i, DynamicFilename );
+		if( DynamicHeader[4] && !appDCCaptureDependencyFile(DynamicFilename,
+			DataOffset, DynamicHeader[4], DCDynamicLightmapAtlasData) )
+			appErrorf( "Invalid DC dynamic lightmap payload: %s", DynamicFilename );
+		debugf( "DCDYNLIGHT loaded map=%s variants=%d pages=%d bytes=%u",
+			GetParent()->GetName(), DCDynamicLightmaps.Num(),
+			DCDynamicLightmapPages.Num(), (unsigned)DynamicHeader[4] );
+	}
+
+	debugf( "DCLIGHTMAP loaded map=%s entries=%i streamed=%u pages=%i page_bytes=%u",
+		GetParent()->GetName(), Count, Header[3], DCLightmapPages.Num(), PageHeader[1] );
 	unguard;
 }
 
@@ -276,6 +381,26 @@ const FDCLightmapEntry* ULevel::FindDCLightmap( INT LightMap, INT Zone ) const
 		&& DCLightmaps(Low).LightMap == LightMap
 		&& DCLightmaps(Low).Zone == Zone
 		? &DCLightmaps(Low) : NULL;
+}
+
+const FDCDynamicLightmapEntry* ULevel::FindDCDynamicLightmap( INT LightMap, INT Zone, INT Variant ) const
+{
+	INT Low = 0, High = DCDynamicLightmaps.Num();
+	while( Low < High )
+	{
+		const INT Middle = Low + (High-Low)/2;
+		const FDCDynamicLightmapEntry& E = DCDynamicLightmaps(Middle);
+		if( E.LightMap < LightMap || (E.LightMap == LightMap
+			&& (E.Zone < Zone || (E.Zone == Zone && E.Variant < Variant))))
+			Low = Middle + 1;
+		else
+			High = Middle;
+	}
+	return Low < DCDynamicLightmaps.Num()
+		&& DCDynamicLightmaps(Low).LightMap == LightMap
+		&& DCDynamicLightmaps(Low).Zone == Zone
+		&& DCDynamicLightmaps(Low).Variant == Variant
+		? &DCDynamicLightmaps(Low) : NULL;
 }
 
 #endif

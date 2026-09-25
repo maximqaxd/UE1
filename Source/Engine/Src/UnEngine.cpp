@@ -8,6 +8,9 @@
 
 #include "EnginePrivate.h"
 #include "UnRender.h"
+#if defined(PLATFORM_DREAMCAST)
+#include <malloc.h>
+#endif
 
 /*-----------------------------------------------------------------------------
 	Object class implementation.
@@ -180,74 +183,121 @@ void UEngine::Serialize( FArchive& Ar )
 
 #if defined (PLATFORM_DREAMCAST)
 // ----------------------------------------------------------------------------
-// Dreamcast memory stats dump
+// Capacity-based Dreamcast memory audit.  Stream slices describe disc data,
+// not resident buffers, so deliberately do not count their Length here.
 // ----------------------------------------------------------------------------
 extern "C" DWORD PVR_GetVRAMUsed();
+ENGINE_API UBOOL GDCUseVQDynamicLightmaps = 0;
 void DumpMemStatsDC( const char* Tag )
 {
 	guard(DumpMemStatsDC);
-	// Model arrays
-	DWORD SizeVectors=0, SizePoints=0, SizeNodes=0, SizeSurfs=0, SizeVerts=0;
-	ULevel* Level = NULL;
-	for( FObjectIterator ItLvl; ItLvl; ++ItLvl )
-	{
-		if( ItLvl->IsA( ULevel::StaticClass ) )
-		{
-			Level = (ULevel*)(UObject*)*ItLvl;
-			break;
-		}
-	}
-	if( Level && Level->Model )
-	{
-		if( Level->Model->Vectors ) SizeVectors = (DWORD)( Level->Model->Vectors->Num() * Level->Model->Vectors->GetClass()->ClassRecordSize );
-		if( Level->Model->Points  ) SizePoints  = (DWORD)( Level->Model->Points ->Num() * Level->Model->Points ->GetClass()->ClassRecordSize );
-		if( Level->Model->Nodes   ) SizeNodes   = (DWORD)( Level->Model->Nodes  ->Num() * Level->Model->Nodes  ->GetClass()->ClassRecordSize );
-		if( Level->Model->Surfs   ) SizeSurfs   = (DWORD)( Level->Model->Surfs  ->Num() * Level->Model->Surfs  ->GetClass()->ClassRecordSize );
-		if( Level->Model->Verts   ) SizeVerts   = (DWORD)( Level->Model->Verts  ->Num() * Level->Model->Verts  ->GetClass()->ClassRecordSize );
-	}
-
-	// Texture counts and CPU-resident bytes
-	INT TexCount = 0;
-	DWORD TexCPUBytes = 0;
+	DWORD BspUsed=0, BspCapacity=0, PolyCapacity=0, ModelAux=0, MeshArrays=0;
+	DWORD TextureArrays=0, SoundArrays=0, ScriptArrays=0, DefaultArrays=0;
+	DWORD ObjectBodies=0, LevelArrays=0;
+	INT ObjectCount=0, MeshCount=0, TextureCount=0;
 	for( FObjectIterator It; It; ++It )
 	{
+		UObject* Obj = (UObject*)*It;
+		++ObjectCount;
+		ObjectBodies += Obj->GetClass()->ClassRecordSize;
+		if( Obj->IsA( UBspNodes::StaticClass ) )
+		{
+			UBspNodes* Db = (UBspNodes*)Obj;
+			BspUsed += Db->Num() * sizeof(FBspNode);
+			BspCapacity += Db->Max() * sizeof(FBspNode);
+		}
+		else if( Obj->IsA( UBspSurfs::StaticClass ) )
+		{
+			UBspSurfs* Db = (UBspSurfs*)Obj;
+			BspUsed += Db->Num() * sizeof(FBspSurf);
+			BspCapacity += Db->Max() * sizeof(FBspSurf);
+		}
+		else if( Obj->IsA( UVerts::StaticClass ) )
+		{
+			UVerts* Db = (UVerts*)Obj;
+			BspUsed += Db->Num() * sizeof(FVert);
+			BspCapacity += Db->Max() * sizeof(FVert);
+		}
+		else if( Obj->IsA( UVectors::StaticClass ) )
+		{
+			UVectors* Db = (UVectors*)Obj;
+			BspUsed += Db->Num() * sizeof(FVector);
+			BspCapacity += Db->Max() * sizeof(FVector);
+		}
+		if( Obj->IsA( UPolys::StaticClass ) )
+			PolyCapacity += ((UPolys*)Obj)->Max() * sizeof(FPoly);
+		if( Obj->IsA( UModel::StaticClass ) )
+		{
+			UModel* Model = (UModel*)Obj;
+			ModelAux += Model->LightMap.ArrayMax * sizeof(FLightMapIndex)
+				+ Model->LightBits.ArrayMax + Model->LightBlockOffsets.ArrayMax * sizeof(INT)
+				+ Model->Bounds.ArrayMax * sizeof(FBox)
+				+ Model->LeafHulls.ArrayMax * sizeof(INT)
+				+ Model->Leaves.ArrayMax * sizeof(FLeaf)
+				+ Model->Lights.ArrayMax * sizeof(AActor*);
+		}
+		if( Obj->IsA( UMesh::StaticClass ) )
+		{
+			UMesh* Mesh = (UMesh*)Obj;
+			++MeshCount;
+			MeshArrays += Mesh->Verts.ArrayMax * sizeof(FMeshVert)
+				+ Mesh->Tris.ArrayMax * sizeof(FMeshTri)
+				+ Mesh->AnimSeqs.ArrayMax * sizeof(FMeshAnimSeq)
+				+ Mesh->Connects.ArrayMax * sizeof(FMeshVertConnect)
+				+ Mesh->BoundingBoxes.ArrayMax * sizeof(FBox)
+				+ Mesh->BoundingSpheres.ArrayMax * sizeof(FSphere)
+				+ Mesh->VertLinks.ArrayMax * sizeof(INT)
+				+ Mesh->Textures.ArrayMax * sizeof(UTexture*)
+				+ Mesh->DCFrameWords.ArrayMax * sizeof(_WORD)
+				+ Mesh->DCFrameOffsets.ArrayMax * sizeof(INT)
+				+ Mesh->DCRuns.ArrayMax * sizeof(FDCMeshRun)
+				+ Mesh->DCMaterials.ArrayMax * sizeof(FDCMeshMaterial)
+				+ Mesh->DCIndices.ArrayMax * sizeof(_WORD)
+				+ Mesh->DCUVs.ArrayMax * sizeof(_WORD)
+				+ Mesh->DCNormalWords.ArrayMax * sizeof(_WORD)
+				+ Mesh->DCNormalBlockOffsets.ArrayMax * sizeof(INT)
+				+ Mesh->DCNormalCompressed.ArrayMax;
+		}
 		if( It->IsA( UTexture::StaticClass ) )
 		{
 			UTexture* T = (UTexture*)(UObject*)*It;
+			TextureArrays += T->Mips.ArrayMax * sizeof(FMipmap);
 			for( INT i=0; i<T->Mips.Num(); ++i )
-				TexCPUBytes += (DWORD)T->Mips(i).DataArray.Num();
-			++TexCount;
+				TextureArrays += T->Mips(i).DataArray.ArrayMax;
+			++TextureCount;
 		}
-	}
-
-	// VRAM used 
-	DWORD TexVRAMBytes = PVR_GetVRAMUsed();
-
-	// Audio on/off: check if any audio subsystem exists
-	UBOOL bAudio = 0;
-	for( FObjectIterator ItAud; ItAud; ++ItAud )
-	{
-		if( ItAud->IsA( UAudioSubsystem::StaticClass ) )
+		if( Obj->IsA( USound::StaticClass ) )
+			SoundArrays += ((USound*)Obj)->Data.ArrayMax;
+		if( Obj->IsA( UStruct::StaticClass ) )
+			ScriptArrays += ((UStruct*)Obj)->Script.ArrayMax;
+		if( Obj->IsA( UClass::StaticClass ) )
+			DefaultArrays += ((UClass*)Obj)->Defaults.ArrayMax;
+		if( Obj->IsA( ULevel::StaticClass ) )
 		{
-			bAudio = 1;
-			break;
+			ULevel* L = (ULevel*)Obj;
+			LevelArrays += L->Max() * sizeof(AActor*)
+				+ L->ReachSpecs.ArrayMax * sizeof(FReachSpec)
+				+ L->DCLightmaps.ArrayMax * sizeof(FDCLightmapEntry)
+				+ L->DCLightmapPlacements.ArrayMax * sizeof(FDCLightmapPlacement)
+				+ L->DCLightmapPages.ArrayMax * sizeof(FDCLightmapPage);
+			LevelArrays += L->DCDynamicLightmaps.ArrayMax * sizeof(FDCDynamicLightmapEntry)
+				+ L->DCDynamicLightmapPages.ArrayMax * sizeof(FDCLightmapPage)
+				+ L->DCDynamicPageResident.ArrayMax;
 		}
 	}
-
-	// Collision hash presence
-	const UBOOL bCollision = (Level && Level->Hash)!=NULL;
-
-	// Cache stats
-	char CacheLine[256]="";
-	GCache.Status( CacheLine );
-
-	debugf( NAME_Log, "MemStats [%s]: Model Vectors=%u, Points=%u, Nodes=%u, Surfs=%u, Verts=%u",
-		Tag ? Tag : "", (unsigned)SizeVectors, (unsigned)SizePoints, (unsigned)SizeNodes, (unsigned)SizeSurfs, (unsigned)SizeVerts );
-	debugf( NAME_Log, "MemStats [%s]: Textures count=%d, CPU bytes=%u, VRAM est=%u",
-		Tag ? Tag : "", TexCount, (unsigned)TexCPUBytes, (unsigned)TexVRAMBytes );
-	debugf( NAME_Log, "MemStats [%s]: Audio=%s, CollisionHash=%s",
-		Tag ? Tag : "", bAudio ? "On" : "Off", bCollision ? "Present" : "None" );
-	debugf( NAME_Log, "MemStats [%s]: Cache: %s", Tag ? Tag : "", CacheLine );
+	struct mallinfo Heap = mallinfo();
+	INT ScratchAllocated=0, ScratchPooled=0, ScratchChunks=0;
+	FMemStack::GetDCMemoryStats( ScratchAllocated, ScratchPooled, ScratchChunks );
+	debugf( "DCMEM phase=%s heap=%d free=%d objects=%d bodies=%u bsp=%u/%u polys=%u model_aux=%u level=%u mesh=%d/%u decode=%u",
+		Tag ? Tag : "manual", Heap.uordblks, Heap.fordblks, ObjectCount,
+		(unsigned)ObjectBodies, (unsigned)BspUsed, (unsigned)BspCapacity,
+		(unsigned)PolyCapacity, (unsigned)ModelAux, (unsigned)LevelArrays, MeshCount, (unsigned)MeshArrays,
+		(unsigned)GetDCMeshDecodeCacheBytes() );
+	debugf( "DCMEMDATA phase=%s textures=%d/%u sounds=%u scripts=%u defaults=%u cache=%d names=%d scratch=%d/%d/%d vram=%u",
+		Tag ? Tag : "manual", TextureCount, (unsigned)TextureArrays,
+		(unsigned)SoundArrays, (unsigned)ScriptArrays, (unsigned)DefaultArrays,
+		GCache.GetDCAllocatedBytes(), FName::GetDCTableBytes(),
+		ScratchAllocated, ScratchPooled, ScratchChunks, (unsigned)PVR_GetVRAMUsed() );
 
 	unguard;
 }
@@ -264,6 +314,13 @@ UBOOL UEngine::Exec( const char* Cmd, FOutputDevice* Out )
 {
 	guard(UEngine::Exec);
 	const char* Str = Cmd;
+#if defined(PLATFORM_DREAMCAST)
+	if( ParseCommand(&Str,"DCMEM") )
+	{
+		DumpMemStatsDC("manual");
+		return 1;
+	}
+#endif
 
 	// See if any other subsystems claim the command.
 	if( GObj.Exec					(Cmd,Out) ) return 1;

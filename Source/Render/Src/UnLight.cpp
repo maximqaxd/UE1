@@ -538,35 +538,53 @@ FPlane FLightManager::Light( FTransSample& Vert, DWORD PolyFlags )
 #if defined(PLATFORM_DREAMCAST)
 		// 1/PointSquared does not depend on the light, so it leaves the loop.
 		const FLOAT RPointSquared = ( PointSquared > 0.f ) ? shz_invf_fsrra( PointSquared ) : 0.f;
+		// The mesh fatness path can move Point after Normal.W was built, so
+		// Normal.W is not necessarily Normal dot Point. Keep the original
+		// reflection plane while sharing one XMTRX load across this vertex's lights.
+		const FLOAT NormalPoint = shz_dot8f( Vert.Normal.X, Vert.Normal.Y, Vert.Normal.Z, 0.f,
+		                                    Vert.Point.X, Vert.Point.Y, Vert.Point.Z, 0.f );
+		const shz_vec4_t DiffuseRow = shz_vec4_init( Vert.Normal.X, Vert.Normal.Y, Vert.Normal.Z, -NormalPoint );
+		const shz_vec4_t SpecularRow = shz_vec4_init( Vert.Point.X, Vert.Point.Y, Vert.Point.Z, -PointSquared );
+		const shz_vec4_t UnusedRow = shz_vec4_init( 0.f, 0.f, 0.f, 0.f );
+		shz_xmtrx_load_rows_3x4( &DiffuseRow, &SpecularRow, &UnusedRow );
+		DWORD LightPairs = 0, RadiusRejects = 0, LightEvaluations = 0;
 		for( FLightInfo* Light=FirstLight; Light<LastLight; Light++ )
 		{
 			if( Light->Opt != ALO_NotLight )
 			{
+				++LightPairs;
 				// Diffuse lighting.
 				const FVector LightVector = Light->Location - Vert.Point;
 				const FLOAT LightSquared  = shz_dot8f( LightVector.X, LightVector.Y, LightVector.Z, 0.f,
 				                                       LightVector.X, LightVector.Y, LightVector.Z, 0.f );
+				// Outside the radial falloff, this light cannot contribute. Reject
+				// before FSRRA, diffuse and specular math.
+				const FLOAT Radius = Max( 1.f, Light->Radius );
+				if( LightSquared >= Radius * Radius )
+				{
+					++RadiusRejects;
+					continue;
+				}
 				if( LightSquared <= 0.f )
 					continue;
+				++LightEvaluations;
 
 				// One FSRRA yields 1/|L|, which removes both the square root
 				// and the division that followed it: the normalised dot is
 				// dot * RLightSize, and |L| itself is LightSquared * RLightSize.
 				const FLOAT RLightSize = shz_inv_sqrtf_fsrra( LightSquared );
 				const FLOAT LightSize  = LightSquared * RLightSize;
-				const FLOAT NDotL      = shz_dot8f( LightVector.X, LightVector.Y, LightVector.Z, 0.f,
-				                                    Vert.Normal.X, Vert.Normal.Y, Vert.Normal.Z, 0.f );
-				FLOAT G = Square( 1.0f + NDotL * RLightSize ) - 1.5f;
+				// One FTRV supplies N dot (Light-Point) and
+				// Point dot (Light-Point) for both lighting terms.
+				const shz_vec4_t Terms = shz_xmtrx_transform_vec4(
+					shz_vec4_init( Light->Location.X, Light->Location.Y, Light->Location.Z, 1.f ) );
+				FLOAT G = Square( 1.0f + Terms.x * RLightSize ) - 1.5f;
 				if( G < 0.0f )
 					G = 0.0f;
 
-				// Specular lighting. MirrorByPlane expanded so the plane dot
-				// and the mirrored dot are both FIPR.
-				const FLOAT PlaneDot = shz_dot8f( Light->Location.X, Light->Location.Y, Light->Location.Z, -1.f,
-				                                  Vert.Normal.X, Vert.Normal.Y, Vert.Normal.Z, Vert.Normal.W );
-				const FVector Mirrored = Light->Location - Vert.Normal * (2.0f * PlaneDot);
-				const FLOAT Specular = shz_dot8f( Mirrored.X, Mirrored.Y, Mirrored.Z, 0.f,
-				                                  Vert.Point.X, Vert.Point.Y, Vert.Point.Z, 0.f ) - PointSquared;
+				// MirrorByPlane uses the pre-fatness plane offset (Normal.W).
+				const FLOAT PlaneDot = Terms.x + NormalPoint - Vert.Normal.W;
+				const FLOAT Specular = Terms.y - 2.0f * PlaneDot * NormalPoint;
 				if( Specular > 0.0f )
 					G += 6.0f * Square(Specular) * ( RLightSize * RLightSize ) * RPointSquared;
 
@@ -578,6 +596,7 @@ FPlane FLightManager::Light( FTransSample& Vert, DWORD PolyFlags )
 					Color += Light->FloatColor * G;
 			}
 		}
+		DCFrameMeshLightStats( LightPairs, RadiusRejects, LightEvaluations );
 #else
 		for( FLightInfo* Light=FirstLight; Light<LastLight; Light++ )
 		{
@@ -1873,6 +1892,86 @@ void FLightManager::SetupForSurf
 	unguard;
 
 #if defined(PLATFORM_DREAMCAST)
+	// Precomputed VQ states cover one stationary scalar or periodic light.
+	// Every unsupported or changed light still takes the exact BGRA path.
+	if( GDCUseVQDynamicLightmaps && !Mover && DynamicLights == 1 && !MovingLights
+		&& !StaticLightingChanged && Level->DCDynamicLightmaps.Num() )
+	{
+		AActor* ScalarLight = NULL;
+		for( FLightInfo* Info=FirstLight; Info<LastLight; ++Info )
+			if( Info->Opt == ALO_DynamicLight )
+				ScalarLight = Info->Actor;
+		if( ScalarLight && ScalarLight->bStatic && !ScalarLight->bDynamicLight
+			&& !ScalarLight->bLightChanged )
+		{
+			INT Variant = INDEX_NONE;
+			if( ScalarLight->LightEffect == LE_None
+				&& (ScalarLight->LightType == LT_Pulse || ScalarLight->LightType == LT_SubtlePulse
+					|| ScalarLight->LightType == LT_Blink || ScalarLight->LightType == LT_Strobe
+					|| ScalarLight->LightType == LT_Flicker) )
+			{
+				const FLOAT Minimum = ScalarLight->LightType == LT_Pulse ? 0.2f
+					: ScalarLight->LightType == LT_SubtlePulse ? 0.8f : 0.f;
+				const INT Levels = (ScalarLight->LightType == LT_Blink
+					|| ScalarLight->LightType == LT_Strobe) ? 2 : 8;
+				FLOAT Factor = 1.f;
+				FPlane UnusedColor;
+				GRender->GlobalLighting( (Frame->Viewport->Actor->ShowFlags & SHOW_PlayerCtrl)!=0,
+					ScalarLight, Factor, UnusedColor );
+				Variant = Clamp(appRound((Factor-Minimum)*(Levels-1)/(1.f-Minimum)),0,Levels-1);
+			}
+			else if( ScalarLight->LightType == LT_Steady )
+			{
+				FLOAT Period = 0.f;
+				if( ScalarLight->LightEffect == LE_Searchlight && ScalarLight->LightPeriod )
+					Period = 8.f * PI * ScalarLight->LightPeriod / 35.f;
+				else if( ScalarLight->LightEffect == LE_SlowWave )
+					Period = 65536.f / (35.f * 1024.f);
+				else if( ScalarLight->LightEffect == LE_FastWave )
+					Period = 65536.f / (35.f * 2048.f);
+				else if( ScalarLight->LightEffect == LE_Rotor )
+					Period = 2.f * PI / 3.5f;
+				if( Period > 0.f )
+				{
+					FLOAT Phase = appFmod(Level->GetLevelInfo()->TimeSeconds,Period) / Period;
+					if( Phase < 0.f ) Phase += 1.f;
+					Variant = appFloor(Phase*8.f+0.5f) & 7;
+				}
+			}
+			if( Variant == INDEX_NONE )
+				goto SkipCookedDynamicLightmap;
+			const FDCDynamicLightmapEntry* E = Level->FindDCDynamicLightmap(iLightMap,ZoneID,Variant);
+			const FDCLightmapEntry* Base = Level->FindDCLightmap(iLightMap,ZoneID);
+			if( E && Base && E->Page < Level->DCDynamicPageResident.Num()
+				&& Level->DCDynamicPageResident(E->Page)
+				&& E->LightHash == appStrihash(ScalarLight->GetFullName())
+				&& E->Brightness == ScalarLight->LightBrightness
+				&& E->Hue == ScalarLight->LightHue
+				&& E->Saturation == ScalarLight->LightSaturation
+				&& E->Type == ScalarLight->LightType
+				&& E->Reserved == ScalarLight->LightEffect )
+			{
+				DC_FRAME_COUNT(DCFC_LightVQDynamic);
+				static FColor White(255,255,255,255);
+				LightMip.USize = Base->USize;
+				LightMip.VSize = Base->VSize;
+				LightMip.UBits = FLogTwo(Base->USize);
+				LightMip.VBits = FLogTwo(Base->VSize);
+				LightMip.DataPtr = NULL;
+				LightMip.DataArray.Empty();
+				LightMip.DCExternalStream = &Level->DCDynamicLightmapAtlasData;
+				LightMip.DCExternalOffset = Variant;
+				LightMip.DCExternalSize = 0;
+				LightMip.DCExternalPackedSize = 0;
+				LightMip.DCExternalCodec = 0;
+				LightMap.Format = TEXF_RGB565;
+				LightMap.MaxColor = &White;
+				STAT(uunclock(GStat.IllumTime));
+				return;
+			}
+		}
+	}
+	SkipCookedDynamicLightmap:;
 	// Host-cooked static world lightmaps are already RGB565. Keep dynamic and
 	// moving lights on the original BGRA merge path so gameplay lighting stays
 	// exact, while static surfaces can be uploaded from DAT without SH-4 pixel
@@ -1917,6 +2016,14 @@ void FLightManager::SetupForSurf
 	if( !Stream || StaticLightingChanged )
 	{
 		DC_FRAME_COUNT(DCFC_LightStaticBuild);
+#if defined(PLATFORM_DREAMCAST)
+		if( Mover )
+			DC_FRAME_COUNT(DCFC_LightStaticMoverBuild);
+		else if( Level->FindDCLightmap( iLightMap, ZoneID ) )
+			DC_FRAME_COUNT(DCFC_LightStaticCookedBypassed);
+		else
+			DC_FRAME_COUNT(DCFC_LightStaticNoCooked);
+#endif
 		if( !Stream )
 			DC_FRAME_COUNT(DCFC_LightStaticMiss);
 		else
@@ -2012,7 +2119,7 @@ void FLightManager::SetupForSurf
 			if( !Stream || *(DOUBLE*)Stream != DynamicLightTime )
 			{
 #if defined(PLATFORM_DREAMCAST)
-				DCFrameCount(Stream ? DCFC_LightDynamicExpired : DCFC_LightDynamicMiss);
+				DC_FRAME_COUNT(Stream ? DCFC_LightDynamicExpired : DCFC_LightDynamicMiss);
 #endif
 				if( !Stream )
 				{
@@ -2033,6 +2140,9 @@ void FLightManager::SetupForSurf
 			}
 		}
 		DC_FRAME_SCOPE(DCFS_LightDynamicBuild);
+#if defined(PLATFORM_DREAMCAST)
+		DCFrameCount(DCFC_LightDynamicPixels, LightMap.UClamp * LightMap.VClamp);
+#endif
 		*LightMap.MaxColor = FColor(255,255,255,255);
 
 		// Copy the static lighting.
@@ -2050,7 +2160,8 @@ void FLightManager::SetupForSurf
 		for( FLightInfo* Info=FirstLight; Info<LastLight; Info++ )
 		{
 			if( Info->Opt==ALO_DynamicLight || Info->Opt==ALO_MovingLight )
-			{	
+			{
+				DC_FRAME_COUNT(DCFC_LightDynamicLights);
 				// Set up.
 				BYTE* ShadowMap;
 				Info->ComputeFromActor( LightMap, Frame, 1 );

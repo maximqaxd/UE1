@@ -134,6 +134,30 @@ struct FDCLightmapEntry
 	INT Size() const { return USize * VSize * (INT)sizeof(_WORD); }
 };
 static_assert( sizeof(FDCLightmapEntry) == 16, "Unexpected DC lightmap directory layout" );
+
+struct FDCLightmapPlacement
+{
+	BYTE Page; // 255: not atlased; use the individual cooked tile
+	BYTE X, Y; // 8x8 atlas slots
+	BYTE Reserved;
+};
+static_assert( sizeof(FDCLightmapPlacement) == 4, "Unexpected DC lightmap placement layout" );
+
+struct FDCLightmapPage
+{
+	DWORD Offset;
+	DWORD Size; // complete .DT image, including its header
+};
+static_assert( sizeof(FDCLightmapPage) == 8, "Unexpected DC lightmap page layout" );
+
+struct FDCDynamicLightmapEntry
+{
+	_WORD LightMap;
+	BYTE Zone, Variant, Page, X, Y, Brightness;
+	DWORD LightHash;
+	BYTE Hue, Saturation, Type, Reserved;
+};
+static_assert( sizeof(FDCDynamicLightmapEntry) == 16, "Unexpected DC dynamic lightmap layout" );
 #endif
 
 //
@@ -158,6 +182,13 @@ class ENGINE_API ULevel : public ULevelBase
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
 	TArray<FDCLightmapEntry> DCLightmaps;
 	FDCStreamSlice          DCLightmapData;
+	TArray<FDCLightmapPlacement> DCLightmapPlacements;
+	TArray<FDCLightmapPage> DCLightmapPages;
+	FDCStreamSlice          DCLightmapAtlasData;
+	TArray<FDCDynamicLightmapEntry> DCDynamicLightmaps;
+	TArray<FDCLightmapPage> DCDynamicLightmapPages;
+	FDCStreamSlice          DCDynamicLightmapAtlasData;
+	TArray<BYTE>            DCDynamicPageResident;
 #endif
 
 	// Only valid in memory.
@@ -220,6 +251,7 @@ class ENGINE_API ULevel : public ULevelBase
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
 	void LoadDCLightmaps();
 	const FDCLightmapEntry* FindDCLightmap( INT LightMap, INT Zone ) const;
+	const FDCDynamicLightmapEntry* FindDCDynamicLightmap( INT LightMap, INT Zone, INT Variant ) const;
 #endif
 
 	// FNetworkNotify interface.

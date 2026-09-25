@@ -558,7 +558,21 @@ UBOOL URender::Exec(const char *Cmd,FOutputDevice *Out)
 
 		TArray<FDCLightmapEntry> Entries;
 		TArray<BYTE> Payload;
+		struct FDCDynamicRawEntry
+		{
+			FDCLightmapEntry Tile;
+			DWORD LightHash;
+			BYTE Brightness, Hue, Saturation, Type;
+			DWORD Effect;
+		};
+		static_assert( sizeof(FDCDynamicRawEntry) == 28, "Unexpected dynamic lightmap raw entry" );
+		TArray<FDCDynamicRawEntry> DynamicEntries;
+		TArray<BYTE> DynamicPayload;
 		UModel* Model = Level->Model;
+		INT DynamicSurfaces = 0, SingleBlinkSurfaces = 0, SingleScalarSurfaces = 0;
+		DWORD ScalarPixels = 0;
+		INT SingleMergeSurfaces = 0, MultiDynamicSurfaces = 0;
+		INT SpatialDynamicSurfaces = 0, MovingActorSurfaces = 0;
 		for( INT iNode = 0; iNode < Model->Nodes->Num(); ++iNode )
 		{
 			const FBspNode& Node = Model->Nodes->Element(iNode);
@@ -582,6 +596,73 @@ UBOOL URender::Exec(const char *Cmd,FOutputDevice *Out)
 				}
 				if( Exists )
 					continue;
+
+				// A VQ page is immutable. Count surfaces for which a finite
+				// offline variant could replace the runtime lightmap. This uses
+				// the BSP's baked light list; runtime SurfLights can still force
+				// the ordinary dynamic path.
+				const FLightMapIndex& Index = Model->LightMap(Surf.iLightMap);
+				INT DynamicCount = 0;
+				UBOOL BlinkOnly = 0, ScalarOnly = 0, MergeEffect = 0;
+				AActor* ScalarLight = NULL;
+				INT VariantCount = 0;
+				FLOAT SpatialPeriod = 0.f;
+				UBOOL SpatialDynamic = 0, MovingActor = 0;
+				if( Index.iLightActors != INDEX_NONE )
+					for( INT i = Index.iLightActors; i < Model->Lights.Num() && Model->Lights(i); ++i )
+					{
+						AActor* Light = Model->Lights(i);
+						if( Light->LightType == LT_None || !Light->LightBrightness )
+							continue;
+						const UBOOL EffectSpatial = Light->LightEffect == LE_Searchlight
+							|| Light->LightEffect == LE_SlowWave || Light->LightEffect == LE_FastWave
+							|| Light->LightEffect == LE_CloudCast || Light->LightEffect == LE_Shock
+							|| Light->LightEffect == LE_Disco || Light->LightEffect == LE_Interference
+							|| Light->LightEffect == LE_Rotor;
+						const UBOOL EffectMerge = Light->LightEffect == LE_TorchWaver
+							|| Light->LightEffect == LE_FireWaver || Light->LightEffect == LE_WateryShimmer;
+						const UBOOL Dynamic = Light->bDynamicLight
+							|| !(Light->bStatic || Light->bNoDelete)
+							|| Light->LightType != LT_Steady || EffectSpatial || EffectMerge;
+						if( !Dynamic )
+							continue;
+						++DynamicCount;
+						BlinkOnly = Light->LightType == LT_Blink
+							&& Light->LightEffect == LE_None
+							&& !Light->bDynamicLight && (Light->bStatic || Light->bNoDelete);
+						ScalarOnly = (Light->LightType == LT_Pulse || Light->LightType == LT_SubtlePulse
+							|| Light->LightType == LT_Blink || Light->LightType == LT_Strobe
+							|| Light->LightType == LT_Flicker)
+							&& Light->LightEffect == LE_None && Light->bStatic && !Light->bDynamicLight;
+						SpatialPeriod = 0.f;
+						if( Light->LightType == LT_Steady && Light->bStatic && !Light->bDynamicLight )
+						{
+							if( Light->LightEffect == LE_Searchlight && Light->LightPeriod )
+								SpatialPeriod = 8.f * PI * Light->LightPeriod / 35.f;
+							else if( Light->LightEffect == LE_SlowWave )
+								SpatialPeriod = 65536.f / (35.f * 1024.f);
+							else if( Light->LightEffect == LE_FastWave )
+								SpatialPeriod = 65536.f / (35.f * 2048.f);
+							else if( Light->LightEffect == LE_Rotor )
+								SpatialPeriod = 2.f * PI / 3.5f;
+						}
+						ScalarLight = (ScalarOnly || SpatialPeriod > 0.f) ? Light : NULL;
+						VariantCount = ScalarOnly && (Light->LightType == LT_Blink
+							|| Light->LightType == LT_Strobe) ? 2 : 8;
+						SpatialDynamic |= EffectSpatial;
+						MergeEffect |= EffectMerge;
+						MovingActor |= Light->bDynamicLight || !(Light->bStatic || Light->bNoDelete);
+					}
+				if( DynamicCount )
+				{
+					++DynamicSurfaces;
+					SingleBlinkSurfaces += DynamicCount == 1 && BlinkOnly;
+					SingleScalarSurfaces += DynamicCount == 1 && ScalarOnly;
+					SingleMergeSurfaces += DynamicCount == 1 && MergeEffect;
+					MultiDynamicSurfaces += DynamicCount > 1;
+					SpatialDynamicSurfaces += SpatialDynamic;
+					MovingActorSurfaces += MovingActor;
+				}
 
 				FBspDrawList Draw;
 				appMemset( &Draw, 0, sizeof(Draw) );
@@ -620,6 +701,8 @@ UBOOL URender::Exec(const char *Cmd,FOutputDevice *Out)
 					appErrorf( "DC lightmap dimensions exceed compact format" );
 				Entry.USize = (_WORD)USize;
 				Entry.VSize = (_WORD)VSize;
+				if( DynamicCount == 1 && ScalarLight )
+					ScalarPixels += USize * VSize;
 				TArray<BYTE> Raw;
 				Raw.SetNum( Entry.Size() );
 				_WORD* Dest = (_WORD*)&Raw(0);
@@ -649,6 +732,69 @@ UBOOL URender::Exec(const char *Cmd,FOutputDevice *Out)
 				appMemcpy( &Payload(Start), Stored, Entry.PackedSize );
 				Entries.AddItem( Entry );
 				GLightManager->FinishSurf();
+
+				// Cook only one stationary scalar light. Each finished RGB565 tile
+				// is a complete lightmap, so runtime can bind a VQ page directly
+				// without rebuilding/merging or uploading a mutable lightmap.
+				if( DynamicCount == 1 && ScalarLight
+					&& USize <= 64 && VSize <= 64 )
+				{
+					const BYTE SavedBrightness = ScalarLight->LightBrightness;
+					const DOUBLE SavedTime = Viewport->CurrentTime;
+					ALevelInfo* LevelInfo = Level->GetLevelInfo();
+					const FLOAT SavedLevelTime = LevelInfo->TimeSeconds;
+					const DWORD SavedShowFlags = Viewport->Actor->ShowFlags;
+					const UBOOL SavedLightChanged = ScalarLight->bLightChanged;
+					Viewport->Actor->ShowFlags &= ~SHOW_PlayerCtrl;
+					const FLOAT Minimum = ScalarLight->LightType == LT_Pulse ? 0.2f
+						: ScalarLight->LightType == LT_SubtlePulse ? 0.8f : 0.f;
+					for( INT Variant=0; Variant<VariantCount; ++Variant )
+					{
+						const FLOAT Factor = SpatialPeriod > 0.f ? 1.f
+							: Minimum + (1.f - Minimum) * Variant / (VariantCount - 1);
+						ScalarLight->LightBrightness = Factor > 0.f
+							? Max( 1, appRound(SavedBrightness * Factor) ) : 0;
+						ScalarLight->bLightChanged = 1;
+						Viewport->CurrentTime = SavedTime + Variant + 1;
+						if( SpatialPeriod > 0.f )
+							LevelInfo->TimeSeconds = SpatialPeriod * Variant / VariantCount;
+						FTextureInfo* VariantMap = NULL;
+						FTextureInfo* VariantFog = NULL;
+						GLightManager->SetupForSurf(
+							&Frame, MapCoords, &Draw, VariantMap, VariantFog, NULL, 0 );
+						if( VariantMap && VariantMap->Mips[0] && VariantMap->Mips[0]->DataPtr )
+						{
+							FDCDynamicRawEntry VariantEntry;
+							appMemset( &VariantEntry, 0, sizeof(VariantEntry) );
+							VariantEntry.Tile = Entry;
+							VariantEntry.Tile.Codec = Variant;
+							VariantEntry.Tile.Offset = DynamicPayload.Num();
+							VariantEntry.Tile.PackedSize = Entry.Size();
+							VariantEntry.LightHash = appStrihash(ScalarLight->GetFullName());
+							VariantEntry.Brightness = SavedBrightness;
+							VariantEntry.Hue = ScalarLight->LightHue;
+							VariantEntry.Saturation = ScalarLight->LightSaturation;
+							VariantEntry.Type = ScalarLight->LightType;
+							VariantEntry.Effect = ScalarLight->LightEffect;
+							const INT Start = DynamicPayload.Add(Entry.Size());
+							_WORD* Out = (_WORD*)&DynamicPayload(Start);
+							const FColor* In = (const FColor*)VariantMap->Mips[0]->DataPtr;
+							const INT VariantUSize = VariantMap->Mips[0]->USize;
+							const INT VariantVSize = VariantMap->Mips[0]->VSize;
+							for( INT V=0; V<VSize; ++V )
+								for( INT U=0; U<USize; ++U )
+									Out[V*USize+U] = In[(V*VariantVSize/VSize)*VariantUSize
+										+ U*VariantUSize/USize].BGRA7777ToRGB565();
+							DynamicEntries.AddItem(VariantEntry);
+						}
+						GLightManager->FinishSurf();
+					}
+					ScalarLight->LightBrightness = SavedBrightness;
+					ScalarLight->bLightChanged = SavedLightChanged;
+					Viewport->CurrentTime = SavedTime;
+					LevelInfo->TimeSeconds = SavedLevelTime;
+					Viewport->Actor->ShowFlags = SavedShowFlags;
+				}
 			}
 		}
 
@@ -663,8 +809,25 @@ UBOOL URender::Exec(const char *Cmd,FOutputDevice *Out)
 			appErrorf( "Cannot write DC lightmap file: %s", DCLightmapPath );
 		}
 		appFclose( File );
+		char DynamicPath[1060];
+		snprintf( DynamicPath, sizeof(DynamicPath), "%s.dyn", DCLightmapPath );
+		FILE* DynamicFile = appFopen( DynamicPath, "wb" );
+		if( !DynamicFile )
+			appErrorf( "Cannot create dynamic lightmap file: %s", DynamicPath );
+		DWORD DynamicHeader[4] = { 0x31594e44, 2, (DWORD)DynamicEntries.Num(), (DWORD)DynamicPayload.Num() };
+		if( appFwrite(DynamicHeader, 1, sizeof(DynamicHeader), DynamicFile) != sizeof(DynamicHeader)
+			|| (DynamicEntries.Num() && appFwrite(&DynamicEntries(0), sizeof(FDCDynamicRawEntry), DynamicEntries.Num(), DynamicFile) != DynamicEntries.Num())
+			|| (DynamicPayload.Num() && appFwrite(&DynamicPayload(0), 1, DynamicPayload.Num(), DynamicFile) != DynamicPayload.Num()) )
+			appErrorf( "Cannot write dynamic lightmap file: %s", DynamicPath );
+		appFclose( DynamicFile );
 		debugf( "DCLIGHTMAP cooked map=%s entries=%i bytes=%i",
 			Level->GetParent()->GetName(), Entries.Num(), Payload.Num() );
+		debugf( "DCDYNLIGHT cooked map=%s variants=%d pixels=%d",
+			Level->GetParent()->GetName(), DynamicEntries.Num(), DynamicPayload.Num()/2 );
+		debugf( "DCDYNLIGHT audit map=%s surfaces=%d blink_one=%d scalar_one=%d scalar_pixels=%u merge_one=%d multi=%d spatial=%d moving=%d",
+			Level->GetParent()->GetName(), DynamicSurfaces, SingleBlinkSurfaces,
+			SingleScalarSurfaces, (unsigned)ScalarPixels, SingleMergeSurfaces, MultiDynamicSurfaces,
+			SpatialDynamicSurfaces, MovingActorSurfaces );
 		return 1;
 	}
 	if( ParseCommand(&Cmd, "DCCACHECHECK") )
@@ -722,13 +885,14 @@ UBOOL URender::Exec(const char *Cmd,FOutputDevice *Out)
 //
 // FVector::TransformPointBy is three dot products against an FCoords after
 // subtracting its origin. Expressed as a 4x4 that is a single FTRV, so the
-// matrix is loaded once per Bsp node and every vertex of that node reuses it.
+// matrix is loaded once per OccludeBsp scene frame and every cached-point miss
+// reuses it. Mesh and vertex-light XMTRX users run after this occlusion pass.
 //
 // Row i is (Axis_i, -Origin.Axis_i), which is what makes M*(V,1) reproduce
 // (V - Origin) dotted with each axis.
 //
-// XMTRX is a single global bank. Nothing else touches it during OccludeBsp,
-// but reloading per node rather than per frame keeps that assumption local.
+// XMTRX is a single global bank. Keep this load at the OccludeBsp boundary;
+// calling a new XMTRX user inside that traversal would require reloading it.
 //
 static void DCLoadPipeCoords( const FCoords& C )
 {
@@ -748,7 +912,7 @@ static void DCLoadPipeCoords( const FCoords& C )
 static void Pipe( FTransform& Result, const FSceneNode* Frame, const FVector& InVector )
 {
 #if defined(PLATFORM_DREAMCAST)
-	// Requires DCLoadPipeCoords( Frame->Coords ) to have run for this node.
+	// Requires DCLoadPipeCoords( Frame->Coords ) at OccludeBsp entry.
 	shz_vec3_t In;
 	In.x = InVector.X; In.y = InVector.Y; In.z = InVector.Z;
 	const shz_vec3_t Out = shz_xmtrx_transform_point3( In );
@@ -844,7 +1008,7 @@ INT URender::ClipBspSurf( INT iNode, FTransform**& Result )
 	{
 		DC_FRAME_SCOPE(DCFS_Transform);
 #if defined(PLATFORM_DREAMCAST)
-		DCLoadPipeCoords( GFrame->Coords );
+		// XMTRX was loaded once at OccludeBsp entry.
 #endif
 		for( INT i=0; i<NumPts; i++ )
 		{
@@ -1571,7 +1735,7 @@ void Traverse( FSceneNode* Frame, INT iNode )
 	{
 		Plane = _Nodes+iPlane;
 #if defined(PLATFORM_DREAMCAST)
-		DCLoadPipeCoords( Frame->Coords );
+		UBOOL MatrixLoaded = 0;
 #endif
 		for( INT i=0; i<Plane->NumVertices; i++ )
 		{
@@ -1579,6 +1743,11 @@ void Traverse( FSceneNode* Frame, INT iNode )
 #if defined(PLATFORM_DREAMCAST)
 			if( URender::PointCacheStamps[pPoint] != URender::PointCacheGeneration )
 			{
+				if( !MatrixLoaded )
+				{
+					DCLoadPipeCoords( Frame->Coords );
+					MatrixLoaded = 1;
+				}
 				URender::PointCacheStamps[pPoint] = URender::PointCacheGeneration;
 				URender::PointCache[pPoint] = New<FTransform>( URender::VectorMem );
 				Pipe( *URender::PointCache[pPoint], Frame, Model->Points->Element(pPoint) );
@@ -1746,6 +1915,13 @@ void URender::OccludeBsp( FSceneNode* Frame )
 		return;
 	}
 
+#if defined(PLATFORM_DREAMCAST)
+	// ClipBspSurf is called only from this traversal. Dynamic filtering,
+	// portal-frame creation and span work do not touch XMTRX; actor meshes
+	// and lighting are submitted after OccludeBsp returns.
+	DCLoadPipeCoords( Frame->Coords );
+#endif
+
 	// Init zone span buffers.
 	INT i;
 	for( i=0; i<UBspNodes::MAX_ZONES; i++ )
@@ -1785,6 +1961,7 @@ void URender::OccludeBsp( FSceneNode* Frame )
 			&&	((Node->NodeFlags&NF_BoxOccluded) || !((iNode^GFrameStamp)&15)) )
 			{
 				// Use bounding box rejection.
+				DC_FRAME_SCOPE(DCFS_BSPBound);
 				Node->NodeFlags &= ~NF_BoxOccluded;
 				FScreenBounds Results;
 				if( !BoundVisible(Frame,&Model->Bounds(Node->iRenderBound),iViewZone?NULL:&ZoneSpanBuffer[0],Results) )
@@ -1924,6 +2101,7 @@ void URender::OccludeBsp( FSceneNode* Frame )
 				Merge = NULL;
 				if( Mergeable )
 				{
+					DC_FRAME_SCOPE(DCFS_BSPMergeSearch);
 					AZoneInfo* ZoneActor = Frame->Level->GetZoneActor(Node->iZone[IsFront]);
 					for( Merge=AllPolyDrawLists[Node->iSurf]; Merge; Merge=Merge->SurfNext )
 						if( Merge->Zone==ZoneActor )
@@ -2121,6 +2299,7 @@ void URender::OccludeBsp( FSceneNode* Frame )
 				{
 					// Draw it.
 					DrawIt:
+					DC_FRAME_SCOPE(DCFS_BSPDrawList);
 
 					// Handle volumetrics.
 					static FVector VolCross[32];
