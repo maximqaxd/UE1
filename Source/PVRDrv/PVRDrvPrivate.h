@@ -49,6 +49,9 @@ class DLL_EXPORT UPVRRenderDevice : public URenderDevice
 	UBOOL UseVQDynamicLightmaps;
 	UBOOL UseHardwareMeshCull;
 	UBOOL MeshDrawScope;
+	FSceneNode* MeshBatchFrame;
+	FTextureInfo* MeshBatchTexture;
+	DWORD MeshBatchFlags;
 	UBOOL DistanceFog;
 	UBOOL Overbright;
 	UBOOL VolumetricFog;
@@ -211,10 +214,12 @@ class DLL_EXPORT UPVRRenderDevice : public URenderDevice
 	virtual UBOOL UsesHardwareMeshCulling() const override { return UseHardwareMeshCull; }
 	virtual void BeginRenderPass( INT Pass ) override;
 	virtual UBOOL WantsBspSurface( DWORD PolyFlags, INT Pass ) const override;
+	virtual UBOOL WantsMeshFlags( DWORD PolyFlags ) const override;
 	virtual void DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& Surface, FSurfaceFacet& Facet ) override;
 	virtual void DrawGouraudPolygon( FSceneNode* Frame, FTextureInfo& Texture, FTransTexture** Pts, INT NumPts, DWORD PolyFlags, FSpanBuffer* SpanBuffer ) override;
 	virtual void DrawGouraudTriStrip( FSceneNode* Frame, FTextureInfo& Texture, FTransTexture** Pts, INT NumPts, DWORD PolyFlags, FSpanBuffer* SpanBuffer ) override;
 	virtual void BeginCookedMesh() override;
+	virtual UBOOL DrawIndexedMeshStrip( FSceneNode* Frame, FTextureInfo& Texture, const FTransTexture* Samples, const _WORD* Indices, const _WORD* UVs, INT Count, UBOOL OddStart, DWORD PolyFlags ) override;
 	virtual void EndCookedMesh() override;
 	virtual UBOOL DrawCookedMeshStrip( FSceneNode* Frame, FTextureInfo& Texture, FTransTexture** Pts, INT NumPts, DWORD PolyFlags, FSpanBuffer* SpanBuffer, INT MeshletId ) override;
 	virtual void DrawTile( FSceneNode* Frame, FTextureInfo& Texture, FLOAT X, FLOAT Y, FLOAT XL, FLOAT YL, FLOAT U, FLOAT V, FLOAT UL, FLOAT VL, FSpanBuffer* Span, FLOAT Z, FPlane Light, FPlane Fog, DWORD PolyFlags ) override;

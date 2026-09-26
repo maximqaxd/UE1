@@ -770,6 +770,13 @@ UBOOL UPVRRenderDevice::Exec( const char* Cmd, FOutputDevice* Out )
 		Out->Logf( "Mesh PVR backface culling %s", UseHardwareMeshCull ? "on" : "off" );
 		return true;
 	}
+	if( ParseCommand(&Cmd, "DCMESHOPT") )
+	{
+		GDCMeshOptimize = (*Cmd=='0' || *Cmd=='1') ? *Cmd=='1' : !GDCMeshOptimize;
+		DCFrameProfileReset();
+		Out->Logf("Mesh pass/pose reuse %s", GDCMeshOptimize ? "on" : "off");
+		return true;
+	}
 	if( ParseCommand(&Cmd, "DCLIGHTRATE") )
 	{
 		const INT Requested = appAtoi(Cmd);
@@ -860,6 +867,11 @@ UBOOL UPVRRenderDevice::WantsBspSurface( DWORD PolyFlags, INT Pass ) const
 	if( PolyFlags & (PF_Translucent|PF_Modulated|PF_Highlighted) )
 		return 0;
 	return Pass == ((PolyFlags & PF_Masked) ? 1 : 0);
+}
+
+UBOOL UPVRRenderDevice::WantsMeshFlags( DWORD PolyFlags ) const
+{
+	return GPVRCurrentPass < 0 || ListFor(PolyFlags) == GPVRDirectList;
 }
 
 void UPVRRenderDevice::Unlock( UBOOL Blit )
@@ -1434,6 +1446,8 @@ void UPVRRenderDevice::DrawGouraudTriStrip( FSceneNode* Frame, FTextureInfo& Tex
 void UPVRRenderDevice::BeginCookedMesh()
 {
 	PVRMeshOIXLeave();
+	MeshBatchFrame = NULL;
+	MeshBatchTexture = NULL;
 	MeshDrawScope = true;
 	GPVRMeshlet = INDEX_NONE;
 	GPVRMeshScratchCount = 0;
@@ -1442,7 +1456,55 @@ void UPVRRenderDevice::BeginCookedMesh()
 void UPVRRenderDevice::EndCookedMesh()
 {
 	PVRMeshOIXLeave();
+	MeshBatchFrame = NULL;
+	MeshBatchTexture = NULL;
 	MeshDrawScope = false;
+}
+
+UBOOL UPVRRenderDevice::DrawIndexedMeshStrip( FSceneNode* Frame, FTextureInfo& Texture,
+	const FTransTexture* Samples, const _WORD* Indices, const _WORD* UVs,
+	INT Count, UBOOL OddStart, DWORD PolyFlags )
+{
+	if( !MeshDrawScope || GPVRMeshOIXSupported || Count < 3
+		|| (PolyFlags & (PF_Environment|PF_Unlit|PF_Invisible)) )
+		return 0;
+	const DWORD Flags = AdjustFlags(PolyFlags);
+	const pvr_list_t List = ListFor(Flags);
+	if( List != GPVRDirectList ) return 1;
+	// Validate the complete range before emitting anything; fallback is atomic.
+	for( INT i=0; i<Count; ++i )
+		if( Samples[Indices[i]].Flags || Samples[Indices[i]].Point.Z < PVR_NEAR_Z ) return 0;
+	if( MeshBatchFrame != Frame || MeshBatchTexture != &Texture || MeshBatchFlags != PolyFlags )
+	{
+		SetSceneNode(Frame);
+		SetTexture(Texture,PolyFlags & PF_Masked,0.f);
+		MeshBatchFrame=Frame; MeshBatchTexture=&Texture; MeshBatchFlags=PolyFlags;
+	}
+	FTexState Tex;
+	CaptureTexState(Tex);
+	const pvr_cull_mode_t Cull = UseHardwareMeshCull && Frame->Mirror==1.f
+		&& Frame->NearClip.W==0.f && (Flags & (PF_TwoSided|PF_Flat))==PF_Flat
+		? PVR_CULLING_CCW : PVR_CULLING_NONE;
+	if( !PVRBeginDraw(List,32+(Count+OddStart)*32) ) return 1;
+	EmitHeader(List,Flags,&Tex,0,Cull);
+	// Match the legacy two-stage UV scale without changing seam ownership.
+	const FLOAT UScale=Texture.UScale*Texture.USize/256.0;
+	const FLOAT VScale=Texture.VScale*Texture.VSize/256.0;
+	for( INT i=-INT(OddStart); i<Count; ++i )
+	{
+		const INT Corner=Max(i,0);
+		const FTransTexture& P=Samples[Indices[Corner]];
+		const DWORD UV=UVs[Corner];
+		pvr_vertex_t* V=(pvr_vertex_t*)PVRAlloc32(List);
+		V->flags=i==Count-1 ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
+		V->x=P.ScreenX; V->y=P.ScreenY; V->z=P.RZ;
+		V->u=((UV&255)*UScale)*TexInfo.UMult;
+		V->v=((UV>>8)*VScale)*TexInfo.VMult;
+		V->argb=(PolyFlags & PF_Modulated) ? 0xffffffffu : PVRPackLight(P.Light);
+		V->oargb=0;
+		PVRCommit32(List,V);
+	}
+	return 1;
 }
 
 UBOOL UPVRRenderDevice::DrawCookedMeshStrip( FSceneNode* Frame, FTextureInfo& Texture,
@@ -1679,6 +1741,7 @@ void UPVRRenderDevice::ClearZ( FSceneNode* Frame )
 
 void UPVRRenderDevice::SetSceneNode( FSceneNode* Frame )
 {
+	MeshBatchFrame = NULL;
 	guard(UPVRRenderDevice::SetSceneNode);
 
 	check(Viewport);
@@ -2235,6 +2298,7 @@ void UPVRRenderDevice::CaptureTexState( FTexState& Out ) const
 
 void UPVRRenderDevice::SetTexture( FTextureInfo& Info, DWORD PolyFlags, FLOAT PanBias )
 {
+	MeshBatchTexture = NULL;
 	guard(UPVRRenderDevice::SetTexture);
 
 	// Set panning.

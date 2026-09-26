@@ -20,6 +20,19 @@ static UTexture*    Textures[16];
 static FTextureInfo TextureInfo[16];
 static FTextureInfo EnvironmentInfo;
 static FVector      GUnlitColor;
+#if defined(PLATFORM_DREAMCAST)
+struct FDCMeshView
+{
+	const TArray<FDCMeshRun>* Runs;
+	const TArray<_WORD>* Indices;
+	const TArray<_WORD>* UVs;
+	const TArray<FBox>* Bounds;
+	UBOOL Lod;
+	FDCMeshView(UMesh* M, UBOOL L) : Runs(L ? &M->DCLodRuns : &M->DCRuns),
+		Indices(L ? &M->DCLodIndices : &M->DCIndices), UVs(L ? &M->DCLodUVs : &M->DCUVs),
+		Bounds(L ? &M->DCLodBounds : &M->DCMeshletBounds), Lod(L) {}
+};
+#endif
 
 /*------------------------------------------------------------------------------
 	Environment mapping.
@@ -298,9 +311,8 @@ void RenderSubsurface
 //
 // Hand one contiguous span of a cooked strip run to the render device as a
 // strip.  Returns 0 when the span cannot be stripped -- a vertex sits outside
-// the frustum and needs clipping, or one mesh vertex would have to carry two
-// different UVs within the same strip -- in which case the caller falls back
-// to submitting the span's triangles individually.
+// the frustum and needs clipping. Corner-local copies preserve UV seams without
+// repeating transforms or lighting, and odd restarts retain their winding.
 //
 static UBOOL EmitMeshStrip
 (
@@ -314,41 +326,43 @@ static UBOOL EmitMeshStrip
 	INT					FirstSlot,
 	INT					LastSlot,
 	FTransTexture**		Pts,
-	DWORD*				Stamp,
-	DWORD				StripId
+	FTransTexture*		Corners,
+	const TArray<_WORD>* Indices=NULL, const TArray<_WORD>* UVs=NULL
 )
 {
 	guardSlow(EmitMeshStrip);
+
+	// The PVR fast path consumes immutable samples and separate corner UVs.
+	// Returning false leaves clipping, OIX and unusual materials on the old path.
+	const _WORD* NativeIndices = Indices ? &(*Indices)(Run.First+FirstSlot) : &Mesh->DCIndices(Run.First+FirstSlot);
+	const _WORD* NativeUVs = UVs ? &(*UVs)(Run.First+FirstSlot) : &Mesh->DCUVs(Run.First+FirstSlot);
+	if( Frame->Viewport->RenDev->DrawIndexedMeshStrip(Frame,Info,Samples,NativeIndices,NativeUVs,
+		LastSlot-FirstSlot+1,FirstSlot&1,PolyFlags) )
+		return 1;
 
 	INT Num = 0;
 	for( INT Slot=FirstSlot; Slot<=LastSlot; Slot++ )
 	{
 		const INT   Index = Run.First + Slot;
-		const INT   iVert = Mesh->DCIndices(Index);
-		const DWORD UV    = Mesh->DCUVs(Index);
-		FTransTexture& V  = Samples[iVert];
+		const INT   iVert = Indices ? (*Indices)(Index) : Mesh->DCIndices(Index);
+		const DWORD UV    = UVs ? (*UVs)(Index) : Mesh->DCUVs(Index);
+		FTransTexture& V  = Corners[Slot-FirstSlot];
+		V = Samples[iVert];
 
 		// Anything with an outcode still needs RenderSubsurface's clipper.
 		if( V.Flags )
 			return 0;
 
-		if( (Stamp[iVert] >> 16) == StripId )
-		{
-			// Already placed in this strip; it can only be reused if the
-			// cooker gave it the same texture coordinates.
-			if( (Stamp[iVert] & 0xFFFF) != UV )
-				return 0;
-		}
-		else
-		{
-			Stamp[iVert] = (StripId << 16) | UV;
-			V.U = (UV & 255) * UScale;
-			V.V = (UV >> 8)  * VScale;
-		}
+		// Position/lighting are shared; texture coordinates belong to corners.
+		V.U = (UV & 255) * UScale;
+		V.V = (UV >> 8)  * VScale;
 
 		if( PolyFlags & PF_Unlit )
 			V.Light = GUnlitColor;
 
+		// A restarted odd strip needs one degenerate vertex to retain winding.
+		if( Slot == FirstSlot && (FirstSlot & 1) )
+			Pts[Num++] = &V;
 		Pts[Num++] = &V;
 	}
 
@@ -380,6 +394,203 @@ struct FMeshTriSort
 #endif
 	INT Key;
 };
+#if defined(PLATFORM_DREAMCAST)
+extern INT GFrameStamp;
+extern INT GDCOrderedWorldPass;
+struct FDCVisibleRange { INT Run, First, Last; };
+
+static BYTE DCBoxOutcode(FSceneNode* Frame, const FBox& Box, const FCoords& Coords,
+	const FVector& Origin, BYTE& Any)
+{
+	BYTE All=255; Any=0;
+	for( INT c=0; c<8; ++c )
+	{
+		FTransform V;
+		V.Point=(FVector(c&1 ? Box.Max.X : Box.Min.X,c&2 ? Box.Max.Y : Box.Min.Y,
+			c&4 ? Box.Max.Z : Box.Min.Z)-Origin).TransformPointBy(Coords);
+		V.ComputeOutcode(Frame);
+		BYTE Code=V.Flags;
+		if( Frame->NearClip.W!=0.f && Frame->NearClip.PlaneDot(V.Point)<0.f ) Code|=128;
+		All&=Code; Any|=Code;
+	}
+	return All;
+}
+
+static BYTE* DCSelectMeshlets(FSceneNode* Frame, UMesh* Mesh, AActor* Owner,
+	FCoords Coords, BYTE*& Meshlets, const FDCMeshView& View)
+{
+	if( !GDCMeshOptimize || !View.Bounds->Num() || Owner->bParticles
+		|| Owner->AnimFrame<0.f || Owner->DrawScale<=0.f || Owner->Fatness!=128
+		|| Mesh->FrameVerts>512 || Frame->Viewport->IsOrtho()
+		|| Frame->Viewport->Actor->RendMap==REN_Wire ) return NULL;
+	Coords=Coords*(Owner->Location+Owner->PrePivot)*Owner->Rotation*Mesh->RotOrigin
+		*FScale(Mesh->Scale*Owner->DrawScale,0.f,SHEER_None);
+	FBox All(0);
+	for( INT m=0; m<View.Bounds->Num(); ++m ) All+=(*View.Bounds)(m);
+	BYTE Any;
+	DCBoxOutcode(Frame,All,Coords,Mesh->Origin,Any);
+	if( !Any && !View.Lod ) return NULL;
+	const UBOOL Inside=Any==0;
+	Meshlets=New<BYTE>(GMem,View.Bounds->Num());
+	BYTE* Vertices=New<BYTE>(GMem,Mesh->FrameVerts);
+	appMemset(Vertices,0,Mesh->FrameVerts);
+	INT Rejected=0;
+	for( INT m=0; m<View.Bounds->Num(); ++m )
+	{
+		Meshlets[m]=Inside || DCBoxOutcode(Frame,(*View.Bounds)(m),Coords,Mesh->Origin,Any)==0;
+		Rejected+=!Meshlets[m];
+	}
+	DCFrameCount(DCFC_MeshletReject,Rejected);
+	if( !Rejected && !View.Lod ) { Meshlets=NULL; return NULL; }
+	for( INT r=0; r<View.Runs->Num(); ++r )
+		if( Meshlets[(*View.Runs)(r).Reserved] )
+			for( INT v=0; v<(*View.Runs)(r).Count; ++v ) Vertices[(*View.Indices)((*View.Runs)(r).First+v)]=1;
+	return Vertices;
+}
+
+static UBOOL DCSelectLOD(FSceneNode* Frame, UMesh* Mesh, AActor* Owner, FCoords Coords)
+{
+	if(!GDCMeshOptimize || !Mesh->DCLodRuns.Num() || Owner->bParticles || Owner->AnimFrame<0.f
+		|| Owner->Fatness!=128 || Owner->DrawScale<=0.f || Owner->Owner==Frame->Viewport->Actor
+		|| Frame->Recursion || Frame->Viewport->IsOrtho() || Frame->Viewport->Actor->RendMap!=REN_DynLight) return 0;
+	struct FChoice { AActor* Owner; UMesh* Mesh; FSceneNode* Frame; INT Stamp; UBOOL Lod; };
+	static FChoice Choices[128];
+	INT Slot=0;
+	for(INT i=0;i<128;++i)
+	{
+		if(Choices[i].Owner==Owner && Choices[i].Mesh==Mesh) { Slot=i; break; }
+		if(Choices[i].Stamp<Choices[Slot].Stamp) Slot=i;
+	}
+	FChoice& C=Choices[Slot];
+	if(C.Owner==Owner && C.Mesh==Mesh && C.Frame==Frame && C.Stamp==GFrameStamp) return C.Lod;
+	const UBOOL Previous=C.Owner==Owner && C.Mesh==Mesh && C.Stamp==GFrameStamp-1 && C.Lod;
+	Coords=Coords*(Owner->Location+Owner->PrePivot)*Owner->Rotation*Mesh->RotOrigin
+		*FScale(Mesh->Scale*Owner->DrawScale,0.f,SHEER_None);
+	FLOAT MinX=1.e20f,MinY=1.e20f,MaxX=-1.e20f,MaxY=-1.e20f;
+	UBOOL Safe=1; const FBox& B=Mesh->BoundingBox;
+	for(INT i=0;i<8;++i)
+	{
+		FTransform V;
+		V.Point=(FVector(i&1 ? B.Max.X:B.Min.X,i&2 ? B.Max.Y:B.Min.Y,i&4 ? B.Max.Z:B.Min.Z)-Mesh->Origin).TransformPointBy(Coords);
+		if(V.Point.Z<=1.f) { Safe=0; break; }
+		V.Project(Frame); MinX=Min(MinX,V.ScreenX); MaxX=Max(MaxX,V.ScreenX);
+		MinY=Min(MinY,V.ScreenY); MaxY=Max(MaxY,V.ScreenY);
+	}
+	C.Owner=Owner; C.Mesh=Mesh; C.Frame=Frame; C.Stamp=GFrameStamp;
+	C.Lod=Safe && Max(MaxX-MinX,MaxY-MinY)<(Previous ? 80.f:64.f);
+	return C.Lod;
+}
+
+static INT DCBuildVisibleRanges(FSceneNode* Frame, UMesh* Mesh, FTransTexture* Samples,
+	DWORD ExtraFlags, FDCVisibleRange* Ranges, INT& NumRanges, const BYTE* Meshlets, const FDCMeshView& View)
+{
+	DC_FRAME_SCOPE(DCFS_MeshPrepareVisible);
+	INT Visible=0;
+	DWORD Out=0, Face=0, Back=0, HW=0;
+	for( INT r=0; r<View.Runs->Num(); ++r )
+	{
+		const FDCMeshRun& Run=(*View.Runs)(r);
+		if( Meshlets && !Meshlets[Run.Reserved] ) continue;
+		const DWORD Flags=Mesh->DCMaterials(Run.Material).Flags | ExtraFlags;
+		const _WORD* Indices=&(*View.Indices)(Run.First);
+		for( INT v=2; v<Run.Count; ++v )
+		{
+			FTransTexture& A=Samples[Indices[v-2+((v&1)?1:0)]];
+			FTransTexture& B=Samples[Indices[v-2+((v&1)?0:1)]];
+			FTransTexture& C=Samples[Indices[v]];
+			if( A.Flags & B.Flags & C.Flags ) { ++Out; continue; }
+			if( (Flags & (PF_TwoSided|PF_Flat|PF_Invisible))==PF_Flat )
+			{
+				if( Frame->Viewport->RenDev->UsesHardwareMeshCulling() && Frame->Mirror==1.f
+					&& Frame->NearClip.W==0.f && !(Flags & (PF_Environment|PF_Unlit))
+					&& !(A.Flags|B.Flags|C.Flags) ) ++HW;
+				else
+				{
+					++Face;
+					if( Frame->Mirror * -(((A.Point-B.Point) ^ (C.Point-A.Point)) | A.Point)<=0.f )
+					{ ++Back; continue; }
+				}
+			}
+			if( NumRanges && Ranges[NumRanges-1].Run==r && Ranges[NumRanges-1].Last==v-1 )
+				Ranges[NumRanges-1].Last=v;
+			else { FDCVisibleRange& R=Ranges[NumRanges++]; R.Run=r; R.First=R.Last=v; }
+			++Visible;
+		}
+	}
+	DCFrameCount(DCFC_MeshVisOutcodeReject,Out); DCFrameCount(DCFC_MeshVisFacingTest,Face);
+	DCFrameCount(DCFC_MeshVisBackfaceReject,Back); DCFrameCount(DCFC_MeshVisHardwareCull,HW);
+	return Visible;
+}
+
+static void DCDrawVisibleRanges(FSceneNode* Frame, UMesh* Mesh, FTransTexture* Samples,
+	FSpanBuffer* Span, DWORD ExtraFlags, FDCVisibleRange* Ranges, INT Count,
+	FTransTexture** StripPts, FTransTexture* StripCorners, UBOOL UseStrips, const FDCMeshView& View)
+{
+	for( INT r=0; r<Count; ++r )
+	{
+		const FDCVisibleRange& Range=Ranges[r];
+		const FDCMeshRun& Run=(*View.Runs)(Range.Run);
+		const FDCMeshMaterial& Mat=Mesh->DCMaterials(Run.Material);
+		const DWORD Flags=Mat.Flags | ExtraFlags;
+		if( !(Flags & PF_Invisible) && !Frame->Viewport->RenDev->WantsMeshFlags(Flags) ) continue;
+		FTextureInfo& Info=Textures[Mat.Texture] && !(Flags & PF_Environment) ? TextureInfo[Mat.Texture] : EnvironmentInfo;
+		UScale=Info.UScale*Info.USize/256.0; VScale=Info.VScale*Info.VSize/256.0;
+		if( UseStrips && Range.Last>Range.First && (Flags & PF_Flat)
+			&& !(Flags & (PF_Environment|PF_Invisible))
+			&& EmitMeshStrip(Frame,Mesh,Samples,Span,Info,Flags,Run,Range.First-2,Range.Last,StripPts,StripCorners,View.Indices,View.UVs) )
+		{
+			DCFrameCount(DCFC_MeshStripTris,Range.Last-Range.First+1);
+			continue;
+		}
+		// Only exceptional/clipped ranges are expanded, directly into corners.
+		for( INT v=Range.First; v<=Range.Last; ++v )
+		{
+			FTransTexture Corners[3]; FTransTexture* Pts[6];
+			for( INT c=0; c<3; ++c )
+			{
+				const INT Slot=Run.First+v-2+(c==2 ? 2 : (v&1) ? 1-c : c);
+				Corners[c]=Samples[(*View.Indices)(Slot)];
+				const DWORD UV=(*View.UVs)(Slot);
+				Corners[c].U=(UV&255)*UScale; Corners[c].V=(UV>>8)*VScale; Pts[c]=&Corners[c];
+			}
+			if( Flags & PF_Invisible )
+			{
+				FVector Mid=(Corners[0].Point+Corners[2].Point)*0.5f;
+				FCoords C; C.Origin=FVector(0,0,0);
+				C.XAxis=(Corners[1].Point-Mid).SafeNormal();
+				C.YAxis=(C.XAxis ^ (Corners[0].Point-Corners[2].Point)).SafeNormal(); C.ZAxis=C.YAxis ^ C.XAxis;
+				SpecialCoords=GMath.UnitCoords * Mid * C; HasSpecialCoords=1;
+				continue;
+			}
+			if( Frame->Mirror==-1 ) Exchange(Pts[0],Pts[2]);
+			DCFrameCount(DCFC_MeshFallbackTris);
+			if( (Flags & PF_Flat) && !(Flags & (PF_Environment|PF_Unlit|PF_TwoSided))
+				&& !(Pts[0]->Flags|Pts[1]->Flags|Pts[2]->Flags) && Frame->NearClip.W==0.f )
+				Frame->Viewport->RenDev->DrawGouraudPolygon(Frame,Info,Pts,3,Flags,Span);
+			else RenderSubsurface(Frame,Info,Span,Pts,Flags,0);
+		}
+	}
+}
+struct FDCPreparedMesh
+{
+	FDCPreparedMesh* Next;
+	FSceneNode* Frame;
+	AActor* Owner;
+	UMesh* Mesh;
+	FCoords Coords;
+	FLOAT Mirror;
+	DWORD InputFlags, LitFlags;
+	FTransTexture* Samples;
+	FMeshTriSort* Triangles;
+	INT Count;
+	FDCVisibleRange* Ranges;
+	INT NumRanges;
+	UBOOL Lod;
+};
+static FDCPreparedMesh* GDCPreparedMeshes = NULL;
+static INT GDCPreparedMeshStamp = -1;
+static INT GDCPreparedMeshBytes = 0;
+#endif
 INT Compare( const FMeshTriSort& A, const FMeshTriSort& B )
 {
 	return B.Key - A.Key;
@@ -408,14 +619,55 @@ void URender::DrawMesh
 	STAT(uclock(GStat.MeshTime));
 	FMemMark Mark(GMem);
 	UMesh*  Mesh = Owner->Mesh;
+#if defined(PLATFORM_DREAMCAST)
+	FDCMeshView View(Mesh,!Engine->Client->CurvedSurfaces && DCSelectLOD(Frame,Mesh,Owner,Coords));
+	if(View.Lod) DCFrameCount(DCFC_MeshLod);
+	if( GDCMeshOptimize && Owner->bParticles && Frame->Viewport->RenDev->UsesOrderedLists()
+		&& !Frame->Viewport->RenDev->WantsMeshFlags(PF_Translucent)
+		&& !Frame->Viewport->IsOrtho() && Frame->Viewport->Actor->RendMap!=REN_Wire )
+	{
+		HasSpecialCoords = 0;
+		DCFrameCount(DCFC_MeshPassSkipped);
+		STAT(uunclock(GStat.MeshTime));
+		Mark.Pop();
+		return;
+	}
+	// Reject a whole wrong-list draw before decoding or transforming its pose.
+	// Invisible attachment triangles produce SpecialCoords for pawn weapons;
+	// they must still run in every pass until that result is cached separately.
+	if( GDCMeshOptimize && Mesh->DCRuns.Num() && !Owner->bParticles
+		&& !Frame->Viewport->IsOrtho() && Frame->Viewport->Actor->RendMap!=REN_Wire )
+	{
+		UBOOL Needed = 0;
+		for( INT m=0; m<Mesh->DCMaterials.Num(); ++m )
+			if( (Mesh->DCMaterials(m).Flags & PF_Invisible)
+				|| Frame->Viewport->RenDev->WantsMeshFlags(Mesh->DCMaterials(m).Flags | ExtraFlags) )
+			{
+				Needed = 1;
+				break;
+			}
+		if( !Needed )
+		{
+			DCFrameCount(DCFC_MeshPassSkipped);
+			HasSpecialCoords = 0;
+			STAT(uunclock(GStat.MeshTime));
+			Mark.Pop();
+			return;
+		}
+	}
+#endif
 	INT TriangleCount = Mesh->Tris.Num();
 	FMeshTri* Triangles = TriangleCount ? &Mesh->Tris(0) : NULL;
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
 	if( Mesh->DCRuns.Num() )
 	{
 		TriangleCount = 0;
+#if defined(PLATFORM_DREAMCAST)
+		for( INT Run=0; Run<View.Runs->Num(); ++Run ) TriangleCount+=(*View.Runs)(Run).Count-2;
+#else
 		for( INT Run = 0; Run < Mesh->DCRuns.Num(); ++Run )
 			TriangleCount += Mesh->DCRuns(Run).Count - 2;
+#endif
 		Triangles = NULL;
 	}
 	FVector* DCVertexNormals = NULL;
@@ -430,6 +682,50 @@ void URender::DrawMesh
 	UBOOL NotWeaponHeuristic=(Owner->Owner!=Frame->Viewport->Actor);
 	if( !Engine->Client->CurvedSurfaces )
 		ExtraFlags |= PF_Flat;
+#if defined(PLATFORM_DREAMCAST)
+	if( GDCPreparedMeshStamp != GFrameStamp )
+	{
+		GDCPreparedMeshes = NULL;
+		GDCPreparedMeshBytes = 0;
+		GDCPreparedMeshStamp = GFrameStamp;
+	}
+	FDCPreparedMesh* Prepared = NULL;
+	const DWORD CacheInputFlags = ExtraFlags;
+	UBOOL CacheEligible = GDCMeshOptimize && Mesh->DCRuns.Num() && !Owner->bParticles
+		&& (ExtraFlags & PF_Flat) && Frame->Viewport->RenDev->UsesOrderedLists()
+		&& !Frame->Viewport->RenDev->SpanBased
+		&& GDCOrderedWorldPass >= 0
+		&& (Mesh->DCNormalWords.Num() || Mesh->DCNormalStreamData.Size() || Mesh->DCNormalCompressed.Num())
+		&& !Frame->Viewport->IsOrtho() && Frame->Viewport->Actor->RendMap!=REN_Wire;
+	DWORD MaterialLists = 0;
+	UBOOL HasAttachment = 0;
+	for( INT m=0; CacheEligible && m<Mesh->DCMaterials.Num(); ++m )
+	{
+		const DWORD Flags = ExtraFlags | Mesh->DCMaterials(m).Flags;
+		MaterialLists |= Flags & (PF_Translucent|PF_Modulated|PF_Highlighted) ? 4 : Flags & PF_Masked ? 2 : 1;
+		HasAttachment |= (Flags & PF_Invisible)!=0;
+		// Native draws copy every strip/fallback corner before UV, winding or
+		// clipping work. Two-sided masked faces therefore cannot mutate the
+		// shared prepared samples. Keep special shading on its existing path.
+		// Invisible attachment faces are replayed from those samples each pass.
+		if( !(Flags & PF_Invisible) && (Flags & (PF_Environment|PF_Unlit)) )
+			CacheEligible = 0;
+	}
+	CacheEligible = CacheEligible && (HasAttachment || (MaterialLists & (MaterialLists-1)));
+	if( CacheEligible )
+	{
+		for( Prepared=GDCPreparedMeshes; Prepared; Prepared=Prepared->Next )
+			if( Prepared->Frame==Frame && Prepared->Owner==Owner && Prepared->Mesh==Mesh
+				&& Prepared->Mirror==Frame->Mirror
+				&& Prepared->Lod==View.Lod
+				&& Prepared->InputFlags==ExtraFlags && !appMemcmp(&Prepared->Coords,&Coords,sizeof(Coords)) )
+				break;
+	}
+	const INT CacheBytes = sizeof(FDCPreparedMesh) + Mesh->FrameVerts*sizeof(FTransTexture)
+		+ TriangleCount*sizeof(FDCVisibleRange);
+	CacheEligible = CacheEligible && (Prepared || GDCPreparedMeshBytes+CacheBytes <= 128*1024);
+	if( CacheEligible && !Prepared ) GDCPreparedMeshBytes += CacheBytes;
+#endif
 
 #if 0
 	// For testing actor span clipping.
@@ -441,24 +737,63 @@ void URender::DrawMesh
 
 	// Get transformed verts.
 	FTransTexture* Samples=NULL;
+#if defined(PLATFORM_DREAMCAST)
+	BYTE* ActiveMeshlets=NULL;
+	BYTE* ActiveVertices=Prepared ? NULL : DCSelectMeshlets(Frame,Mesh,Owner,Coords,ActiveMeshlets,View);
+	if(ActiveVertices)
+	{
+		UBOOL Any=0;
+		for(INT v=0;v<Mesh->FrameVerts && !Any;++v) Any=ActiveVertices[v]!=0;
+		if(!Any) { HasSpecialCoords=0; STAT(uunclock(GStat.MeshTime)); Mark.Pop(); return; }
+	}
+#endif
 	UBOOL bWire=0;
+	BYTE Outcode = FVF_OutReject;
+#if defined(PLATFORM_DREAMCAST)
+	if( Prepared )
+	{
+		DCFrameCount(DCFC_MeshPreparedReuse);
+		Samples = Prepared->Samples;
+		DCCookedNormals = 1;
+		Outcode = 0;
+	}
+	else
+#endif
+	{
 	guardSlow(Transform);
 	STAT(uclock(GStat.MeshGetFrameTime));
 #if defined(PLATFORM_DREAMCAST)
 	DCFrameEnter( DCFS_MeshFrame );
 #endif
+#if defined(PLATFORM_DREAMCAST)
+	Samples = New<FTransTexture>(CacheEligible ? GSceneMem : GMem,Mesh->FrameVerts);
+#else
 	Samples = New<FTransTexture>(GMem,Mesh->FrameVerts);
+#endif
 	bWire = Frame->Viewport->IsOrtho() || Frame->Viewport->Actor->RendMap==REN_Wire;
+#if defined(PLATFORM_DREAMCAST)
+	Mesh->GetFrame( &Samples->Point, sizeof(Samples[0]), bWire ? GMath.UnitCoords : Coords, Owner, ActiveVertices );
+#else
 	Mesh->GetFrame( &Samples->Point, sizeof(Samples[0]), bWire ? GMath.UnitCoords : Coords, Owner );
+#endif
 #if defined(PLATFORM_DREAMCAST)
 	if( Mesh->DCNormalWords.Num() || Mesh->DCNormalStreamData.Size()
 		|| Mesh->DCNormalCompressed.Num() )
 	{
 		DCVertexNormals = New<FVector>( GMem, Mesh->FrameVerts );
 		DCCookedNormals = Mesh->GetDCCookedNormals( DCVertexNormals,
-			bWire ? GMath.UnitCoords : Coords, Owner );
+			bWire ? GMath.UnitCoords : Coords, Owner, ActiveVertices );
 		if( DCCookedNormals )
 			DCFrameCount( DCFC_MeshCookedNormals, Mesh->FrameVerts );
+	}
+	if(!DCCookedNormals && (ActiveVertices || View.Lod))
+	{
+		// A missing/unsupported normal pose must use the complete legacy input.
+		View=FDCMeshView(Mesh,0); ActiveVertices=NULL; ActiveMeshlets=NULL;
+		TriangleCount=0;
+		for(INT r=0;r<Mesh->DCRuns.Num();++r) TriangleCount+=Mesh->DCRuns(r).Count-2;
+		CacheEligible=0;
+		Mesh->GetFrame(&Samples->Point,sizeof(Samples[0]),bWire ? GMath.UnitCoords : Coords,Owner);
 	}
 	DCFrameLeave( DCFS_MeshFrame );
 #endif
@@ -466,7 +801,6 @@ void URender::DrawMesh
 	unguardSlow;
 
 	// Compute outcodes.
-	BYTE Outcode = FVF_OutReject;
 	guardSlow(Outcode);
 #if defined(PLATFORM_DREAMCAST)
 	DCFrameEnter( DCFS_MeshOutcode );
@@ -474,6 +808,9 @@ void URender::DrawMesh
 	for( INT i=0; i<Mesh->FrameVerts; i++ )
 	{
 		Samples[i].Light.R = -1;
+#if defined(PLATFORM_DREAMCAST)
+		if( ActiveVertices && !ActiveVertices[i] ) { Samples[i].Flags=FVF_OutReject; continue; }
+#endif
 		Samples[i].ComputeOutcode( Frame );
 		Outcode &= Samples[i].Flags;
 	}
@@ -481,6 +818,7 @@ void URender::DrawMesh
 	DCFrameLeave( DCFS_MeshOutcode );
 #endif
 	unguardSlow;
+	}
 
 	// Render a wireframe view or textured view.
 	if( bWire )
@@ -574,6 +912,17 @@ void URender::DrawMesh
 	HasSpecialCoords = 0;
 	FMeshTriSort* TriPool=NULL;
 	FVector* TriNormals=NULL;
+#if defined(PLATFORM_DREAMCAST)
+	FDCVisibleRange* NativeRanges=NULL;
+	INT NumNativeRanges=0;
+	if( Prepared )
+	{
+		TriPool = Prepared->Triangles;
+		VisibleTriangles = Prepared->Count;
+		NativeRanges=Prepared->Ranges; NumNativeRanges=Prepared->NumRanges;
+	}
+	else
+#endif
 	if( Outcode == 0 )
 	{
 		// Process triangles.
@@ -583,7 +932,13 @@ void URender::DrawMesh
 		DCFrameEnter( DCFS_MeshPrepareSetup );
 		DCFrameCount( DCFC_MeshPrepareTris, TriangleCount );
 #endif
+#if defined(PLATFORM_DREAMCAST)
+		if( GDCMeshOptimize && Mesh->DCRuns.Num() && DCCookedNormals && !Frame->Viewport->RenDev->SpanBased )
+			NativeRanges=New<FDCVisibleRange>(CacheEligible ? GSceneMem : GMem,TriangleCount);
+		else TriPool = New<FMeshTriSort>(CacheEligible ? GSceneMem : GMem,TriangleCount);
+#else
 		TriPool = New<FMeshTriSort>(GMem,TriangleCount);
+#endif
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
 		if( Mesh->DCRuns.Num() )
 		{
@@ -600,7 +955,7 @@ void URender::DrawMesh
 
 		// Set up list for triangle sorting, adding all possibly visible triangles.
 		STAT(uclock(GStat.MeshProcessTime));
-		FMeshTriSort* TriTop = &TriPool[0];
+		FMeshTriSort* TriTop = TriPool;
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
 		FDCMeshTriangleCursor DCTriangleCursor( *Mesh );
 #endif
@@ -608,7 +963,9 @@ void URender::DrawMesh
 		DCFrameLeave( DCFS_MeshPrepareSetup );
 		// Batch whole phases so timer granularity cannot be amplified by
 		// extrapolating individual microsecond-long triangle samples.
-		if( Mesh->DCRuns.Num() && DCCookedNormals )
+		if( NativeRanges )
+			VisibleTriangles=DCBuildVisibleRanges(Frame,Mesh,Samples,ExtraFlags,NativeRanges,NumNativeRanges,ActiveMeshlets,View);
+		else if( Mesh->DCRuns.Num() && DCCookedNormals )
 		{
 			// Cooked strips need only three indices for visibility. Do not
 			// expand their UVs or copy a full FMeshTri unless drawing falls back.
@@ -922,6 +1279,12 @@ void URender::DrawMesh
 		unguardSlow;
 
 		// Build list of all incident lights on the mesh.
+#if defined(PLATFORM_DREAMCAST)
+		if( Prepared )
+			ExtraFlags = Prepared->LitFlags;
+		else
+#endif
+		{
 		STAT(uclock(GStat.MeshLightSetupTime));
 #if defined(PLATFORM_DREAMCAST)
 		DCFrameEnter( DCFS_MeshLightSetup );
@@ -941,6 +1304,21 @@ void URender::DrawMesh
 		DCFrameEnter( DCFS_MeshVertexCollect );
 		INT* VisibleVerts = New<INT>( GMem, Mesh->FrameVerts );
 		INT UniqueVerts = 0;
+		if( NativeRanges )
+		{
+			for( INT r=0; r<NumNativeRanges; ++r )
+			{
+				const FDCVisibleRange& Range=NativeRanges[r];
+				const FDCMeshRun& Run=(*View.Runs)(Range.Run);
+				for( INT v=Range.First-2; v<=Range.Last; ++v )
+				{
+					const INT Index=(*View.Indices)(Run.First+v);
+					if( Samples[Index].Light.R==-1 )
+					{ Samples[Index].Light.R=-2; VisibleVerts[UniqueVerts++]=Index; }
+				}
+			}
+		}
+		else
 		for( INT i=0; i<VisibleTriangles; ++i )
 		{
 			const FMeshTri& Tri = TriPool[i].Tri;
@@ -981,11 +1359,7 @@ void URender::DrawMesh
 		DCFrameLeave( DCFS_MeshVertexNormal );
 
 		DCFrameEnter( DCFS_MeshVertexLightCall );
-		for( INT i=0; i<UniqueVerts; ++i )
-		{
-			FTransSample& Vert = Samples[VisibleVerts[i]];
-			Vert.Light = GLightManager->Light( Vert, ExtraFlags );
-		}
+		GLightManager->LightBatch(Samples,VisibleVerts,UniqueVerts,ExtraFlags);
 		DCFrameLeave( DCFS_MeshVertexLightCall );
 
 		DCFrameEnter( DCFS_MeshVertexFog );
@@ -1056,6 +1430,22 @@ void URender::DrawMesh
 		DCFrameLeave( DCFS_MeshVertexLight );
 #endif
 		unguardSlow;
+#if defined(PLATFORM_DREAMCAST)
+		// Only the native corner-copy draw path may publish shared samples.
+		if( CacheEligible && DCCookedNormals && NativeRanges )
+		{
+			FDCPreparedMesh* Entry = New<FDCPreparedMesh>(GSceneMem);
+			Entry->Next=GDCPreparedMeshes; GDCPreparedMeshes=Entry;
+			Entry->Frame=Frame; Entry->Owner=Owner; Entry->Mesh=Mesh; Entry->Coords=Coords;
+			Entry->Mirror=Frame->Mirror;
+			Entry->InputFlags=CacheInputFlags;
+			Entry->LitFlags=ExtraFlags; Entry->Samples=Samples; Entry->Triangles=TriPool;
+			Entry->Count=VisibleTriangles;
+			Entry->Ranges=NativeRanges; Entry->NumRanges=NumNativeRanges;
+			Entry->Lod=View.Lod;
+		}
+#endif
+		}
 
 		// Draw the triangles.
 		guardSlow(DrawVisible);
@@ -1075,18 +1465,16 @@ void URender::DrawMesh
 			&& !Frame->Viewport->RenDev->SpanBased
 			&& Frame->Mirror != -1;
 		FTransTexture** StripPts = NULL;
-		DWORD* StripStamp = NULL;
-		DWORD StripId = 0;
+		FTransTexture* StripCorners = NULL;
 		if( UseStrips )
 		{
 			INT MaxRun = 0;
-			for( INT r=0; r<Mesh->DCRuns.Num(); r++ )
-				MaxRun = Max<INT>( MaxRun, Mesh->DCRuns(r).Count );
+			for( INT r=0; r<View.Runs->Num(); r++ )
+				MaxRun = Max<INT>( MaxRun, (*View.Runs)(r).Count );
 			if( MaxRun >= 3 && Mesh->FrameVerts > 0 )
 			{
-				StripPts   = New<FTransTexture*>( GMem, MaxRun );
-				StripStamp = New<DWORD>( GMem, Mesh->FrameVerts );
-				appMemset( StripStamp, 0, Mesh->FrameVerts * sizeof(DWORD) );
+				StripPts   = New<FTransTexture*>( GMem, MaxRun+1 );
+				StripCorners = New<FTransTexture>( GMem, MaxRun );
 			}
 			else
 			{
@@ -1097,6 +1485,12 @@ void URender::DrawMesh
 		FDCMeshTriangleCursor DCDrawCursor( *Mesh );
 #endif
 
+#if defined(PLATFORM_DREAMCAST)
+		if( NativeRanges )
+			DCDrawVisibleRanges(Frame,Mesh,Samples,SpanBuffer,ExtraFlags,NativeRanges,NumNativeRanges,
+				StripPts,StripCorners,UseStrips,View);
+		else
+#endif
 		for( INT i=0; i<VisibleTriangles; i++ )
 		{
 			// Set up the triangle.
@@ -1107,6 +1501,11 @@ void URender::DrawMesh
 #endif
 
 #if defined(PLATFORM_DREAMCAST)
+			// Mixed-list meshes share preparation but submit only this list.
+			// Do not pay clipping/UV/strip-copy work for rejected submissions.
+			if( GDCMeshOptimize && !(Tri.PolyFlags & PF_Invisible)
+				&& !Frame->Viewport->RenDev->WantsMeshFlags(Tri.PolyFlags | ExtraFlags) )
+				continue;
 			if( UseStrips && !(Tri.PolyFlags & PF_Invisible) && TriPool[i].StripRun != INDEX_NONE )
 			{
 				const DWORD StripFlags = Tri.PolyFlags | ExtraFlags;
@@ -1133,7 +1532,7 @@ void URender::DrawMesh
 						VScale = StripInfo.VScale * StripInfo.VSize / 256.0;
 						if( EmitMeshStrip( Frame, Mesh, Samples, SpanBuffer, StripInfo, StripFlags,
 								Mesh->DCRuns(Run), TriPool[i].StripVert - 2, TriPool[End].StripVert,
-								StripPts, StripStamp, ++StripId ) )
+								StripPts, StripCorners ) )
 						{
 							STAT(GStat.MeshSubCount += End - i + 1);
 							DCFrameCount( DCFC_MeshStripTris, End - i + 1 );
@@ -1205,7 +1604,10 @@ void URender::DrawMesh
 #if defined(PLATFORM_DREAMCAST)
 		Frame->Viewport->RenDev->EndCookedMesh();
 #endif
-		GLightManager->FinishActor();
+#if defined(PLATFORM_DREAMCAST)
+		if( !Prepared )
+#endif
+			GLightManager->FinishActor();
 #if defined(PLATFORM_DREAMCAST)
 		DCFrameLeave( DCFS_MeshDraw );
 #endif

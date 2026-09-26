@@ -66,6 +66,7 @@ class ENGINE_API URenderDevice : public USubsystem
 	virtual UBOOL UsesHardwareMeshCulling() const { return 0; }
 	virtual void BeginRenderPass( INT Pass ) {}
 	virtual UBOOL WantsBspSurface( DWORD PolyFlags, INT Pass ) const { return 1; }
+	virtual UBOOL WantsMeshFlags( DWORD PolyFlags ) const { return 1; }
 #endif
 	virtual void DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& Surface, FSurfaceFacet& Facet )=0;
 	virtual void DrawGouraudPolygon( FSceneNode* Frame, FTextureInfo& Info, FTransTexture** Pts, int NumPts, DWORD PolyFlags, FSpanBuffer* Span )=0;
@@ -81,6 +82,7 @@ class ENGINE_API URenderDevice : public USubsystem
 	virtual void BeginCookedMesh() {}
 	virtual void EndCookedMesh() {}
 	virtual UBOOL DrawCookedMeshStrip( FSceneNode* Frame, FTextureInfo& Info, FTransTexture** Pts, INT NumPts, DWORD PolyFlags, FSpanBuffer* Span, INT MeshletId ) { return 0; }
+	virtual UBOOL DrawIndexedMeshStrip( FSceneNode* Frame, FTextureInfo& Info, const FTransTexture* Samples, const _WORD* Indices, const _WORD* UVs, INT Count, UBOOL OddStart, DWORD PolyFlags ) { return 0; }
 #endif
 	virtual void DrawTile( FSceneNode* Frame, FTextureInfo& Info, FLOAT X, FLOAT Y, FLOAT XL, FLOAT YL, FLOAT U, FLOAT V, FLOAT UL, FLOAT VL, class FSpanBuffer* Span, FLOAT Z, FPlane Color, FPlane Fog, DWORD PolyFlags )=0;
 	virtual void Draw2DLine( FSceneNode* Frame, FPlane Color, DWORD LineFlags, FVector P1, FVector P2 )=0;

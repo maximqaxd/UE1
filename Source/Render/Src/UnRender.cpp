@@ -2609,7 +2609,16 @@ void URender::OccludeFrame( FSceneNode* Frame )
 
 #if defined(PLATFORM_DREAMCAST)
 // Only the direct PVR renderer replays the visible frame for ordered TA lists.
-static INT GDCOrderedWorldPass = -1;
+INT GDCOrderedWorldPass = -1;
+struct FDCPreparedWorldDraws
+{
+	FDCPreparedWorldDraws* Next;
+	FSceneNode* Frame;
+	FBspDrawListPtr* First[3];
+	FBspDrawListPtr* Last[3];
+};
+static FDCPreparedWorldDraws* GDCPreparedWorldDraws = NULL;
+static INT GDCPreparedWorldStamp = -1;
 #endif
 
 void URender::DrawFrame( FSceneNode* Frame )
@@ -2627,16 +2636,44 @@ void URender::DrawFrame( FSceneNode* Frame )
 	if( Frame->Draw[0] )
 		Viewport->RenDev->ClearZ( Frame );
 
+	FBspDrawListPtr* FirstDraw[3];
+	FBspDrawListPtr* LastDraw[3];
+	INT Pass;
+#if defined(PLATFORM_DREAMCAST)
+	if( GDCPreparedWorldStamp != GFrameStamp )
+	{
+		GDCPreparedWorldDraws = NULL;
+		GDCPreparedWorldStamp = GFrameStamp;
+	}
+	FDCPreparedWorldDraws* Prepared = GDCPreparedWorldDraws;
+	while( Prepared && Prepared->Frame != Frame ) Prepared = Prepared->Next;
+	if( Prepared )
+	{
+		for( Pass=0; Pass<3; ++Pass )
+		{
+			FirstDraw[Pass] = Prepared->First[Pass];
+			LastDraw[Pass] = Prepared->Last[Pass];
+		}
+	}
+	else
+#endif
+	{
 	// Count surfaces to draw.
 	INT Num[3]={0,0,0};
-	INT Pass;
 	for( Pass=0; Pass<3; Pass++ )
 		for( FBspDrawList* Draw = Frame->Draw[Pass]; Draw; Draw = Draw->Next )
 			Num[Pass]++;
 
 	// Group surfaces into solid (draw-order invariant) and transparent.
-	FBspDrawListPtr* FirstDraw [3] = {new(GMem,Num[0])FBspDrawListPtr,new(GMem,Num[1])FBspDrawListPtr,new(GMem,Num[2])FBspDrawListPtr};
-	FBspDrawListPtr* LastDraw  [3] = {FirstDraw[0],FirstDraw[1],FirstDraw[2]};
+	for( Pass=0; Pass<3; ++Pass )
+	{
+#if defined(PLATFORM_DREAMCAST)
+		FirstDraw[Pass] = new(GSceneMem,Num[Pass])FBspDrawListPtr;
+#else
+		FirstDraw[Pass] = new(GMem,Num[Pass])FBspDrawListPtr;
+#endif
+		LastDraw[Pass] = FirstDraw[Pass];
+	}
 	for( Pass=0; Pass<3; Pass++ )
 		for( FBspDrawList* Draw = Frame->Draw[Pass]; Draw; Draw = Draw->Next )
 			(LastDraw[Pass]++)->Ptr = Draw;
@@ -2645,6 +2682,18 @@ void URender::DrawFrame( FSceneNode* Frame )
 
 	// Sort solid surfaces by texture and then by palette for cache coherence.
 	appSort( FirstDraw[1], Num[1] );
+#if defined(PLATFORM_DREAMCAST)
+	Prepared = New<FDCPreparedWorldDraws>(GSceneMem);
+	Prepared->Frame = Frame;
+	Prepared->Next = GDCPreparedWorldDraws;
+	GDCPreparedWorldDraws = Prepared;
+	for( Pass=0; Pass<3; ++Pass )
+	{
+		Prepared->First[Pass] = FirstDraw[Pass];
+		Prepared->Last[Pass] = LastDraw[Pass];
+	}
+#endif
+	}
 
 	// Render everything.
 	for( Pass=0; Pass<3; Pass++ )

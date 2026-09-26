@@ -59,6 +59,7 @@ public:
 	virtual void FinishSurf()=0;
 	virtual void FinishActor()=0;
 	virtual FPlane Light( FTransSample& Point, DWORD ExtraFlags )=0;
+	virtual void LightBatch( FTransTexture* Samples, const INT* Indices, INT Count, DWORD ExtraFlags )=0;
 	virtual FPlane Fog( FTransSample& Point, DWORD ExtraFlags )=0;
 };
 

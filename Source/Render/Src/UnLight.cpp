@@ -134,6 +134,8 @@ public:
 	void FinishSurf();
 	void FinishActor();
 	FPlane Light( FTransSample& Point, DWORD PolyFlags );
+	void LightBatch( FTransTexture* Samples, const INT* Indices, INT Count, DWORD PolyFlags );
+	FPlane LightInternal( FTransSample& Point, DWORD PolyFlags, const FLOAT* RadiusSquared, DWORD* Counters );
 	FPlane Fog( FTransSample& Point, DWORD PolyFlags );
 
 	// Constants.
@@ -528,6 +530,40 @@ FPlane FLightManager::Light( FTransSample& Vert, DWORD PolyFlags )
 {
 	guard(FLightManager::Light);
 	STAT(uclock(GStat.MeshLightTime));
+	const FPlane Result=LightInternal(Vert,PolyFlags,NULL,NULL);
+	STAT(uunclock(GStat.MeshLightTime));
+	return Result;
+	unguard;
+}
+
+void FLightManager::LightBatch( FTransTexture* Samples, const INT* Indices, INT Count, DWORD PolyFlags )
+{
+	guard(FLightManager::LightBatch);
+	STAT(uclock(GStat.MeshLightTime));
+	FLOAT RadiusSquared[MAX_LIGHTS];
+	DWORD Counters[3]={0,0,0};
+#if defined(PLATFORM_DREAMCAST)
+	for( FLightInfo* L=FirstLight; L<LastLight; ++L )
+	{
+		const FLOAT Radius=Max(1.f,L->Radius);
+		RadiusSquared[L-FirstLight]=Radius*Radius;
+	}
+#endif
+	for( INT i=0; i<Count; ++i )
+	{
+		FTransSample& Vert=Samples[Indices[i]];
+		Vert.Light=LightInternal(Vert,PolyFlags,RadiusSquared,Counters);
+	}
+#if defined(PLATFORM_DREAMCAST)
+	DCFrameMeshLightStats(Counters[0],Counters[1],Counters[2]);
+#endif
+	STAT(uunclock(GStat.MeshLightTime));
+	unguard;
+}
+
+inline FPlane FLightManager::LightInternal( FTransSample& Vert, DWORD PolyFlags,
+	const FLOAT* RadiusSquared, DWORD* Counters )
+{
 
 	FPlane Color(0,0,0,0);
 	if( !(PolyFlags & PF_Unlit) )
@@ -559,8 +595,8 @@ FPlane FLightManager::Light( FTransSample& Vert, DWORD PolyFlags )
 				                                       LightVector.X, LightVector.Y, LightVector.Z, 0.f );
 				// Outside the radial falloff, this light cannot contribute. Reject
 				// before FSRRA, diffuse and specular math.
-				const FLOAT Radius = Max( 1.f, Light->Radius );
-				if( LightSquared >= Radius * Radius )
+				const FLOAT Radius2 = RadiusSquared ? RadiusSquared[Light-FirstLight] : Square(Max(1.f,Light->Radius));
+				if( LightSquared >= Radius2 )
 				{
 					++RadiusRejects;
 					continue;
@@ -596,7 +632,9 @@ FPlane FLightManager::Light( FTransSample& Vert, DWORD PolyFlags )
 					Color += Light->FloatColor * G;
 			}
 		}
-		DCFrameMeshLightStats( LightPairs, RadiusRejects, LightEvaluations );
+		if( Counters )
+		{ Counters[0]+=LightPairs; Counters[1]+=RadiusRejects; Counters[2]+=LightEvaluations; }
+		else DCFrameMeshLightStats( LightPairs, RadiusRejects, LightEvaluations );
 #else
 		for( FLightInfo* Light=FirstLight; Light<LastLight; Light++ )
 		{
@@ -636,9 +674,7 @@ FPlane FLightManager::Light( FTransSample& Vert, DWORD PolyFlags )
 	if( (PolyFlags & PF_Selected) && GIsEditor )
 		Color = Color*0.5 + FVector(0.5,0.5,0.5);
 
-	STAT(uunclock(GStat.MeshLightTime));
 	return Color;
-	unguard;
 }
 
 
