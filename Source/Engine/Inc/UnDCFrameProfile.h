@@ -85,6 +85,9 @@ enum EDCFrameCount
 	DCFC_MeshCookedNormals,
 	DCFC_MeshVisOutcodeReject, DCFC_MeshVisFacingTest, DCFC_MeshVisBackfaceReject,
 	DCFC_MeshVisHardwareCull,
+	DCFC_MeshPassSkipped, DCFC_MeshPreparedReuse, DCFC_MeshPoseReuse,
+	DCFC_MeshletReject,
+	DCFC_MeshLod,
 	DCFC_Count
 };
 ENGINE_API void DCFrameCount( INT Counter, DWORD Amount = 1 );
@@ -97,6 +100,7 @@ extern ENGINE_API INT GDCSpanMode;
 extern ENGINE_API INT GDCStationaryLightHz;
 // Set only while a mesh actually uses the on-chip OIX work area.
 extern ENGINE_API UBOOL GDCMeshOIXActive;
+extern ENGINE_API UBOOL GDCMeshOptimize;
 ENGINE_API void DCFrameProfileReset();
 ENGINE_API void DCFrameProfileReport( FOutputDevice* Out );
 

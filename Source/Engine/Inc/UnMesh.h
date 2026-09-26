@@ -179,20 +179,27 @@ class ENGINE_API UMesh : public UPrimitive
 	TArray<FDCMeshMaterial>  DCMaterials;
 	TArray<_WORD>            DCIndices;
 	TArray<_WORD>            DCUVs;
+	TArray<FBox>             DCMeshletBounds;
+	TArray<_WORD>            DCFrameBlockOffsets;
+	TArray<FDCMeshRun>       DCLodRuns;
+	TArray<_WORD>            DCLodIndices, DCLodUVs;
+	TArray<FBox>             DCLodBounds;
+	INT                     DCLodVerts;
 	// Octahedral local-space vertex normals, one word per animation vertex.
 	TArray<_WORD>            DCNormalWords;
 	FDCStreamSlice           DCNormalStreamData;
 	TArray<INT>              DCNormalBlockOffsets;
 	TArray<BYTE>             DCNormalCompressed;
-	UBOOL                    DCTemporalFrames;
+	UBOOL                    DCTemporalFrames; // Codec: 0 spatial, 1 temporal, 2 repeat, 3 sparse.
 	UBOOL                    DCClusteredRuns;
 	UBOOL                    DCQuantizedNormals;
 	void SerializeDCVerts( FArchive& Ar );
 	void SerializeDCTopology( FArchive& Ar );
 	void ValidateDCMesh();
+	void ResolveDCFrameSample( INT& First, INT& Second, FLOAT& Alpha ) const;
 	FMeshTri* GetDCTriangles( INT& Count );
 #if defined(PLATFORM_DREAMCAST)
-	UBOOL GetDCCookedNormals( FVector* Result, FCoords Coords, AActor* Owner ) const;
+	UBOOL GetDCCookedNormals( FVector* Result, FCoords Coords, AActor* Owner, const BYTE* Active = NULL ) const;
 #endif
 #if defined(DC_RESOURCE_COOKER)
 	void CookDCMesh();
@@ -253,7 +260,7 @@ class ENGINE_API UMesh : public UPrimitive
 		return NULL;
 		unguardSlow;
 	}
-	void GetFrame( FVector* Verts, INT Size, FCoords Coords, AActor* Owner );
+	void GetFrame( FVector* Verts, INT Size, FCoords Coords, AActor* Owner, const BYTE* Active = NULL );
 	void AMD3DGetFrame( FVector* Verts, INT Size, FCoords Coords, AActor* Owner );
 	UTexture* GetTexture( INT Count, AActor* Owner )
 	{
@@ -272,7 +279,7 @@ class ENGINE_API UMesh : public UPrimitive
 class ENGINE_API FDCMeshFrameCursor
 {
 public:
-	FDCMeshFrameCursor( const UMesh& InMesh, INT Frame );
+	FDCMeshFrameCursor( const UMesh& InMesh, INT Frame, const BYTE* Active = NULL );
 	FVector Next();
 	UBOOL AtEnd() const;
 
@@ -285,6 +292,10 @@ private:
 	INT KeyFrame;
 	INT Positions[8];
 	INT Ends[8];
+#if !defined(PLATFORM_DREAMCAST)
+	TArray<FVector> SparseVerts;
+	INT SparsePosition;
+#endif
 #if defined(PLATFORM_DREAMCAST)
 	const FMeshVert* Decoded;
 #endif

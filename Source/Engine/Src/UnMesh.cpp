@@ -9,6 +9,7 @@
 #include "EnginePrivate.h"
 #include "UnRender.h"
 #include "Amd3d.h"
+#include "UnDCFrameProfile.h"
 
 #if defined(PLATFORM_DREAMCAST)
 //
@@ -186,7 +187,8 @@ void UMesh::GetFrame
 	FVector*	ResultVerts,
 	INT			Size,
 	FCoords		Coords,
-	AActor*		Owner
+	AActor*		Owner,
+	const BYTE* Active
 )
 {
 	guard(UMesh::GetFrame);
@@ -210,7 +212,11 @@ void UMesh::GetFrame
 			Item->Unlock();
 			GCache.Flush( CacheID );
 		}
-		Mem = GCache.Create( CacheID, Item, sizeof(UMesh*) + sizeof(FLOAT) + sizeof(FName) + FrameVerts * sizeof(FVector) );
+		Mem = GCache.Create( CacheID, Item, sizeof(UMesh*) + sizeof(FLOAT) + sizeof(FName) + FrameVerts * sizeof(FVector)
+#if defined(PLATFORM_DREAMCAST)
+			+ FrameVerts
+#endif
+		);
 		WasCached = 0;
 	}
 	UMesh*& CachedMesh  = *(UMesh**)Mem; Mem += sizeof(UMesh*);
@@ -228,8 +234,56 @@ void UMesh::GetFrame
 	FVector* CachedVerts    = (FVector*)Mem;
 	Coords                  = Coords * (Owner->Location + Owner->PrePivot) * Owner->Rotation * RotOrigin * FScale(Scale * DrawScale,0.0,SHEER_None);
 	const FMeshAnimSeq* Seq = GetAnimSeq( Owner->AnimSequence );
+#if defined(PLATFORM_DREAMCAST)
+	if( Owner->AnimFrame<0.f ) Active=NULL;
+	BYTE* CachedValid=(BYTE*)(CachedVerts+FrameVerts);
+	if(!WasCached) appMemset(CachedValid,0,FrameVerts);
+	UBOOL SamePose=WasCached && Owner->AnimFrame>=0.f && CachedFrame==Owner->AnimFrame && CachedSeq==Owner->AnimSequence;
+	UBOOL CanReuse=SamePose;
+	for(INT v=0;CanReuse && v<FrameVerts;++v) if((!Active || Active[v]) && !CachedValid[v]) CanReuse=0;
+	// Complete the previous pose only when a sequence starts tweening. Missing
+	// offscreen vertices must not snap to the new sequence's first frame.
+	if(WasCached && Owner->AnimFrame<0.f && CachedFrame>=0.f)
+	{
+		UBOOL Missing=0;
+		for(INT v=0;v<FrameVerts;++v) Missing|=!CachedValid[v];
+		if(Missing)
+		{
+			const FMeshAnimSeq* Old=GetAnimSeq(CachedSeq);
+			INT First=0,Second=0; FLOAT Alpha=0.f;
+			if(Old && Old->NumFrames>0)
+			{
+				FLOAT F=CachedFrame*Old->NumFrames; INT I=appFloor(F); Alpha=F-I;
+				First=Old->StartFrame+I%Old->NumFrames; Second=Old->StartFrame+(I+1)%Old->NumFrames;
+			}
+			ResolveDCFrameSample(First,Second,Alpha);
+			FDCMeshFrameCursor A(*this,First),B(*this,Second);
+			for(INT v=0;v<FrameVerts;++v)
+			{
+				const FVector P=A.Next(),Q=B.Next();
+				if(!CachedValid[v]) CachedVerts[v]=P+(Q-P)*Alpha;
+			}
+			appMemset(CachedValid,1,FrameVerts);
+		}
+	}
+#endif
 
 	// Transform all points into screenspace.
+#if defined(PLATFORM_DREAMCAST)
+	if( GDCMeshOptimize && CanReuse )
+	{
+		// The existing per-actor tween cache also owns the object-space pose.
+		DCFrameCount(DCFC_MeshPoseReuse);
+		// A paused pose needs a new view transform, not another stream decode.
+		DCLoadMeshCoords( Coords, Origin );
+		for( INT i=0; i<FrameVerts; ++i )
+		{
+			if( !Active || Active[i] ) *ResultVerts = DCTransformMeshVert( CachedVerts[i] );
+			*(BYTE**)&ResultVerts += Size;
+		}
+	}
+	else
+#endif
 	if( Owner->AnimFrame>=0.0 || !WasCached )
 	{
 		// Compute interpolation numbers.
@@ -246,10 +300,12 @@ void UMesh::GetFrame
 
 		// Interpolate two frames.
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
-		FDCMeshFrameCursor Frame1( *this, iFrameOffset1 / FrameVerts );
+		INT SampleFirst=iFrameOffset1/FrameVerts, SampleSecond=iFrameOffset2/FrameVerts;
+		ResolveDCFrameSample(SampleFirst,SampleSecond,Alpha);
+		FDCMeshFrameCursor Frame1( *this, SampleFirst, Active );
 		// Do not decode a second cooked frame for an exact keyframe.
 		FDCMeshFrameCursor Frame2 = Alpha == 0.0f
-			? Frame1 : FDCMeshFrameCursor( *this, iFrameOffset2 / FrameVerts );
+			? Frame1 : FDCMeshFrameCursor( *this, SampleSecond, Active );
 #else
 		FMeshVert* MeshVertex1 = &Verts( iFrameOffset1 );
 		FMeshVert* MeshVertex2 = &Verts( iFrameOffset2 );
@@ -258,6 +314,7 @@ void UMesh::GetFrame
 		// Loaded here, not earlier: the cursors above are constructed first
 		// and XMTRX shares the back FP bank with 8-byte moves.
 		DCLoadMeshCoords( Coords, Origin );
+		if(!SamePose) appMemset(CachedValid,0,FrameVerts);
 #endif
 		for( INT i=0; i<FrameVerts; i++ )
 		{
@@ -269,6 +326,10 @@ void UMesh::GetFrame
 #else
 			FVector V1( MeshVertex1[i].X, MeshVertex1[i].Y, MeshVertex1[i].Z );
 			FVector V2( MeshVertex2[i].X, MeshVertex2[i].Y, MeshVertex2[i].Z );
+#endif
+#if defined(PLATFORM_DREAMCAST)
+			if( Active && !Active[i] ) { *(BYTE**)&ResultVerts+=Size; continue; }
+			CachedValid[i]=1;
 #endif
 			CachedVerts[i] = Alpha == 0.0f ? V1 : V1 + (V2-V1)*Alpha;
 #if defined(PLATFORM_DREAMCAST)
@@ -320,6 +381,14 @@ void UMesh::GetFrame
 		// Update cached frame.
 		CachedFrame = Owner->AnimFrame;
 	}
+#if defined(PLATFORM_DREAMCAST)
+	if( Owner->AnimFrame>=0.0 )
+	{
+		CachedFrame = Owner->AnimFrame;
+		CachedSeq = Owner->AnimSequence;
+	}
+	if(Owner->AnimFrame<0.f) appMemset(CachedValid,1,FrameVerts);
+#endif
 	Item->Unlock();
 	unguardobj;
 }

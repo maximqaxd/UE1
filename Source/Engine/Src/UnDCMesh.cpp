@@ -5,11 +5,17 @@
 
 static const INT DCFrameTag = -0x44434631;
 static const INT DCFrameTemporalTag = -0x44434632;
+// Temporal v3: an empty non-keyframe range repeats the preceding pose.
+// Keep all virtual frame numbers so sequence rates/notifies need no remapping.
+static const INT DCFrameRepeatTag = -0x44434633;
+static const INT DCFrameSparseTag = -0x44434634;
 static const INT DCTopologyTag = -0x44435431;
 static const INT DCTopologyClusterTag = -0x44435432;
 static const INT DCTopologyNormalTag = -0x44435433;
 static const INT DCTopologyNormalZTag = -0x44435434;
 static const INT DCTopologyNormalQTag = -0x44435435;
+static const INT DCTopologyBoundsTag = -0x44435436;
+static const INT DCTopologyLodTag = -0x44435437;
 
 #if defined(DC_RESOURCE_COOKER)
 static _WORD DCPackMeshNormal( const FVector& Sum )
@@ -168,6 +174,31 @@ static INT SignedBits( DWORD Value, INT Bits )
 	return (INT)(Value & ((1 << Bits) - 1)) - ((Value & Mask) ? (1 << Bits) : 0);
 }
 
+// Also exercised by the cooker's sequential-versus-block roundtrip.
+static void DCApplyIndependentBlock(const _WORD* Words, INT Count, FMeshVert* Verts, INT Num, UBOOL Key)
+{
+	INT p=0,X=0,Y=0,Z=0;
+	for(INT v=0;v<Num;++v)
+	{
+		if(!Key) {X=Verts[v].X; Y=Verts[v].Y; Z=Verts[v].Z;}
+		if(p>=Count) appErrorf("Truncated mesh block");
+		DWORD W=Words[p++];
+		if(W&0x8000)
+		{
+			if(Key && v==0) appErrorf("Dependent mesh block anchor");
+			X+=SignedBits(W>>10,5); Y+=SignedBits(W>>5,5); Z+=SignedBits(W,5);
+		}
+		else
+		{
+			if(p>=Count) appErrorf("Truncated absolute mesh block");
+			DWORD P=(W<<16)|Words[p++];
+			X=SignedBits(P>>21,10)*2; Y=SignedBits(P>>10,11); Z=SignedBits(P,10);
+		}
+		Verts[v]=FMeshVert(FVector(X,Y,Z));
+	}
+	if(p!=Count) appErrorf("Trailing mesh block data");
+}
+
 #if defined(PLATFORM_DREAMCAST)
 struct FDCDecodedMeshFrame
 {
@@ -175,6 +206,7 @@ struct FDCDecodedMeshFrame
 	INT Frame;
 	DWORD Stamp;
 	TArray<FMeshVert> Verts;
+	TArray<BYTE> Blocks;
 
 	FDCDecodedMeshFrame()
 		: Mesh(NULL), Frame(INDEX_NONE), Stamp(0)
@@ -320,34 +352,93 @@ static void DCApplyMeshFrame( const UMesh& Mesh, INT Frame, UBOOL KeyFrame,
 		appErrorf( "Cooked frame has trailing words: %s", Mesh.GetPathName() );
 }
 
-static const FMeshVert* DCDecodeMeshFrame( const UMesh& Mesh, INT Frame )
+static const FMeshVert* DCDecodeMeshFrame( const UMesh& Mesh, INT Frame, const BYTE* Active )
 {
+	if( Mesh.DCTemporalFrames==3 && Frame+1<Mesh.AnimFrames
+		&& Mesh.DCFrameOffsets(Frame)==Mesh.DCFrameOffsets(Frame+1) )
+		appErrorf("Sparse mesh frame must be resolved to retained anchors: %s",Mesh.GetPathName());
+	INT Hit=INDEX_NONE;
 	for( INT i = 0; i < 2; ++i )
 	{
 		if( GDCDecodedMeshFrames[i].Mesh == &Mesh && GDCDecodedMeshFrames[i].Frame == Frame )
 		{
-			GDCDecodedMeshFrames[i].Stamp = ++GDCMeshFrameStamp;
-			return &GDCDecodedMeshFrames[i].Verts(0);
+			Hit=i;
+			break;
 		}
 	}
 
-	INT Slot = GDCDecodedMeshFrames[0].Stamp <= GDCDecodedMeshFrames[1].Stamp ? 0 : 1;
+	INT Slot = Hit!=INDEX_NONE ? Hit : GDCDecodedMeshFrames[0].Stamp <= GDCDecodedMeshFrames[1].Stamp ? 0 : 1;
 	FDCDecodedMeshFrame& Cache = GDCDecodedMeshFrames[Slot];
+	const INT Blocks=(Mesh.FrameVerts+31)/32;
+	if( Hit==INDEX_NONE )
+	{
+		Cache.Blocks.SetNum(Blocks); appMemset(Cache.Blocks.GetData(),0,Blocks);
+		Cache.Verts.SetNum(Mesh.FrameVerts); appMemset(Cache.Verts.GetData(),0,Mesh.FrameVerts*sizeof(FMeshVert));
+	}
+	if( Active && Mesh.DCFrameBlockOffsets.Num()==Mesh.AnimFrames*(Blocks+1) )
+	{
+		for( INT b=0; b<Blocks; ++b )
+		{
+			if( Cache.Blocks(b) ) continue;
+			const INT First=b*32, Last=Min(First+32,Mesh.FrameVerts);
+			UBOOL Needed=!Active;
+			for( INT v=First; !Needed && v<Last; ++v ) Needed=Active[v]!=0;
+			if( !Needed ) continue;
+			const INT Key=Mesh.DCTemporalFrames ? Frame&~7 : Frame;
+			for( INT f=Key; f<=Frame; ++f )
+			{
+				const INT Begin=Mesh.DCFrameBlockOffsets(f*(Blocks+1)+b);
+				const INT End=Mesh.DCFrameBlockOffsets(f*(Blocks+1)+b+1);
+				if( Begin==End && f!=Key ) continue;
+				if( End-Begin<Last-First || End-Begin>2*(Last-First) ) appErrorf("Invalid mesh block range");
+				_WORD Words[64];
+				const INT Offset=Mesh.DCFrameOffsets(f)+Begin;
+				if( Mesh.DCFrameStreamData.Size() ) DCReadStreamedMeshBytes(Mesh,Offset*2,Words,(End-Begin)*2);
+				else appMemcpy(Words,&Mesh.DCFrameWords(Offset),(End-Begin)*2);
+				DCApplyIndependentBlock(Words,End-Begin,&Cache.Verts(First),Last-First,f==Key);
+			}
+			Cache.Blocks(b)=1;
+		}
+		Cache.Mesh=&Mesh; Cache.Frame=Frame; Cache.Stamp=++GDCMeshFrameStamp;
+		return &Cache.Verts(0);
+	}
+	UBOOL Complete=Hit!=INDEX_NONE;
+	for(INT b=0; Complete && b<Blocks; ++b) Complete=Cache.Blocks(b)!=0;
+	if( Complete ) { Cache.Stamp=++GDCMeshFrameStamp; return &Cache.Verts(0); }
 	Cache.Mesh = NULL;
 	Cache.Frame = INDEX_NONE;
 	Cache.Verts.SetNum( Mesh.FrameVerts );
 	INT KeyFrame = Mesh.DCTemporalFrames ? Frame & ~7 : Frame;
 	DCApplyMeshFrame( Mesh, KeyFrame, 1, Cache.Verts );
 	for( INT SourceFrame = KeyFrame + 1; SourceFrame <= Frame; ++SourceFrame )
+	{
+		const INT End = SourceFrame + 1 < Mesh.AnimFrames
+			? Mesh.DCFrameOffsets(SourceFrame + 1) : DCFrameWordCount(Mesh);
+		if( Mesh.DCTemporalFrames >= 2 && End == Mesh.DCFrameOffsets(SourceFrame) )
+			continue;
 		DCApplyMeshFrame( Mesh, SourceFrame, 0, Cache.Verts );
+	}
 	Cache.Mesh = &Mesh;
 	Cache.Frame = Frame;
+	appMemset(Cache.Blocks.GetData(),1,Blocks);
 	Cache.Stamp = ++GDCMeshFrameStamp;
 	return &Cache.Verts(0);
 }
 #endif
 
-FDCMeshFrameCursor::FDCMeshFrameCursor( const UMesh& InMesh, INT Frame )
+void UMesh::ResolveDCFrameSample( INT& First, INT& Second, FLOAT& Alpha ) const
+{
+	if( DCTemporalFrames != 3 ) return;
+	const INT OldFirst=First, OldSecond=Second;
+	const FLOAT Time=First+Alpha;
+	while( First>0 && First+1<AnimFrames && DCFrameOffsets(First)==DCFrameOffsets(First+1) ) --First;
+	while( Second+1<AnimFrames && DCFrameOffsets(Second)==DCFrameOffsets(Second+1) ) ++Second;
+	// Sequence loop edges are pinned; never interpolate across a sequence seam.
+	if( OldSecond<OldFirst || First==Second ) return;
+	Alpha=(Time-First)/(Second-First);
+}
+
+FDCMeshFrameCursor::FDCMeshFrameCursor( const UMesh& InMesh, INT Frame, const BYTE* Active )
 	: Mesh(InMesh), X(0), Y(0), Z(0), TargetFrame(Frame), KeyFrame(Frame)
 #if defined(PLATFORM_DREAMCAST)
 	, Decoded(NULL)
@@ -359,8 +450,23 @@ FDCMeshFrameCursor::FDCMeshFrameCursor( const UMesh& InMesh, INT Frame )
 	}
 	if( Mesh.DCFrameOffsets.Num() )
 	{
+#if !defined(PLATFORM_DREAMCAST)
+		if( Mesh.DCTemporalFrames==3 && Frame+1<Mesh.AnimFrames
+			&& Mesh.DCFrameOffsets(Frame)==Mesh.DCFrameOffsets(Frame+1) )
+		{
+			INT First=Frame, Second=Frame; FLOAT Alpha=0.f;
+			Mesh.ResolveDCFrameSample(First,Second,Alpha);
+			FDCMeshFrameCursor A(Mesh,First), B(Mesh,Second);
+			SparseVerts.SetNum(Mesh.FrameVerts); SparsePosition=0;
+			for( INT i=0; i<Mesh.FrameVerts; ++i )
+			{
+				const FVector V=A.Next(); SparseVerts(i)=V+(B.Next()-V)*Alpha;
+			}
+			return;
+		}
+#endif
 #if defined(PLATFORM_DREAMCAST)
-		Decoded = DCDecodeMeshFrame( Mesh, Frame );
+		Decoded = DCDecodeMeshFrame( Mesh, Frame, Active );
 		Positions[0] = 0;
 		Ends[0] = Mesh.FrameVerts;
 		return;
@@ -391,6 +497,9 @@ FDCMeshFrameCursor::FDCMeshFrameCursor( const UMesh& InMesh, INT Frame )
 
 FVector FDCMeshFrameCursor::Next()
 {
+#if !defined(PLATFORM_DREAMCAST)
+	if( SparseVerts.Num() ) return SparseVerts(SparsePosition++);
+#endif
 	if( Positions[0] >= Ends[0] )
 	{
 		appErrorf( "Truncated mesh frame: %s", Mesh.GetPathName() );
@@ -424,6 +533,8 @@ FVector FDCMeshFrameCursor::Next()
 	for( INT Frame = KeyFrame + 1; Frame <= TargetFrame; ++Frame )
 	{
 		INT Slot = Frame - KeyFrame;
+		if( Mesh.DCTemporalFrames >= 2 && Positions[Slot] == Ends[Slot] )
+			continue;
 		if( Positions[Slot] >= Ends[Slot] )
 			appErrorf( "Truncated temporal mesh frame: %s", Mesh.GetPathName() );
 		DWORD Delta = Mesh.DCFrameWords(Positions[Slot]++);
@@ -448,6 +559,9 @@ FVector FDCMeshFrameCursor::Next()
 
 UBOOL FDCMeshFrameCursor::AtEnd() const
 {
+#if !defined(PLATFORM_DREAMCAST)
+	if( SparseVerts.Num() ) return SparsePosition==SparseVerts.Num();
+#endif
 #if defined(PLATFORM_DREAMCAST)
 	if( Decoded )
 		return Positions[0] == Ends[0];
@@ -484,13 +598,14 @@ void UMesh::SerializeDCVerts( FArchive& Ar )
 		Ar << Verts << DCFrameOffsets << DCFrameWords;
 		return;
 	}
-	INT Count = DCFrameOffsets.Num() ? (DCTemporalFrames ? DCFrameTemporalTag : DCFrameTag) : Verts.Num();
+	INT Count = DCFrameOffsets.Num() ? (DCTemporalFrames == 3 ? DCFrameSparseTag : DCTemporalFrames == 2 ? DCFrameRepeatTag
+		: DCTemporalFrames ? DCFrameTemporalTag : DCFrameTag) : Verts.Num();
 	Ar << AR_INDEX(Count);
-	if( Count == DCFrameTag || Count == DCFrameTemporalTag )
+	if( Count == DCFrameTag || Count == DCFrameTemporalTag || Count == DCFrameRepeatTag || Count == DCFrameSparseTag )
 	{
 		if( Ar.IsLoading() )
 		{
-			DCTemporalFrames = Count == DCFrameTemporalTag;
+			DCTemporalFrames = Count == DCFrameSparseTag ? 3 : Count == DCFrameRepeatTag ? 2 : Count == DCFrameTemporalTag;
 		}
 		Ar << DCFrameOffsets;
 		if( Ar.IsLoading() && appDCStreamActive() )
@@ -557,14 +672,20 @@ void UMesh::SerializeDCTopology( FArchive& Ar )
 	if( !Ar.IsLoading() && !Ar.IsSaving() )
 	{
 		Ar << Tris << DCRuns << DCMaterials << DCIndices << DCUVs
-			<< DCNormalWords << DCNormalBlockOffsets << DCNormalCompressed;
+			<< DCNormalWords << DCNormalBlockOffsets << DCNormalCompressed
+			<< DCMeshletBounds << DCFrameBlockOffsets << DCLodRuns << DCLodIndices << DCLodUVs << DCLodBounds;
 		return;
 	}
 	INT Count = DCRuns.Num() ? (DCNormalBlockOffsets.Num()
 		? (DCQuantizedNormals ? DCTopologyNormalQTag : DCTopologyNormalZTag)
 		: DCNormalWords.Num() ? DCTopologyNormalTag
 		: (DCClusteredRuns ? DCTopologyClusterTag : DCTopologyTag)) : Tris.Num();
+	if( DCMeshletBounds.Num() ) Count=DCTopologyBoundsTag;
+	if( DCLodRuns.Num() ) Count=DCTopologyLodTag;
 	Ar << AR_INDEX(Count);
+	const UBOOL HasLod=Count==DCTopologyLodTag;
+	const UBOOL HasBounds=Count==DCTopologyBoundsTag || HasLod;
+	if( HasBounds ) Count=DCTopologyNormalQTag;
 	if( Count == DCTopologyTag || Count == DCTopologyClusterTag
 		|| Count == DCTopologyNormalTag || Count == DCTopologyNormalZTag
 		|| Count == DCTopologyNormalQTag )
@@ -620,6 +741,10 @@ void UMesh::SerializeDCTopology( FArchive& Ar )
 			DCNormalBlockOffsets.Empty();
 			DCNormalCompressed.Empty();
 		}
+		if( HasBounds ) Ar << DCMeshletBounds << DCFrameBlockOffsets;
+		else if( Ar.IsLoading() ) { DCMeshletBounds.Empty(); DCFrameBlockOffsets.Empty(); }
+		if( HasLod ) Ar << DCLodRuns << DCLodIndices << DCLodUVs << DCLodBounds << DCLodVerts;
+		else if( Ar.IsLoading() ) { DCLodRuns.Empty(); DCLodIndices.Empty(); DCLodUVs.Empty(); DCLodBounds.Empty(); DCLodVerts=0; }
 	}
 	else
 	{
@@ -640,6 +765,42 @@ void UMesh::SerializeDCTopology( FArchive& Ar )
 
 void UMesh::ValidateDCMesh()
 {
+	if( DCFrameBlockOffsets.Num() )
+	{
+		const INT Blocks=(FrameVerts+31)/32;
+		if(DCFrameOffsets.Num()!=AnimFrames || DCFrameBlockOffsets.Num()!=AnimFrames*(Blocks+1))
+			appErrorf("Invalid mesh independent-block directory");
+		for(INT f=0;f<AnimFrames;++f)
+		{
+			const INT Length=(f+1<AnimFrames ? DCFrameOffsets(f+1) : DCFrameWordCount(*this))-DCFrameOffsets(f);
+			if(DCFrameBlockOffsets(f*(Blocks+1))!=0 || DCFrameBlockOffsets(f*(Blocks+1)+Blocks)!=Length)
+				appErrorf("Invalid mesh block extent");
+			for(INT b=0;b<Blocks;++b)
+			{
+				INT N=DCFrameBlockOffsets(f*(Blocks+1)+b+1)-DCFrameBlockOffsets(f*(Blocks+1)+b);
+				INT V=Min(32,FrameVerts-b*32);
+				if(Length && (N<V || N>V*2)) appErrorf("Invalid mesh block length");
+			}
+		}
+	}
+	for(INT mode=0;mode<2;++mode)
+	{
+		const TArray<FDCMeshRun>& Runs=mode ? DCLodRuns : DCRuns;
+		const TArray<_WORD>& Indices=mode ? DCLodIndices : DCIndices;
+		const TArray<_WORD>& UVs=mode ? DCLodUVs : DCUVs;
+		const TArray<FBox>& Bounds=mode ? DCLodBounds : DCMeshletBounds;
+		INT End=0;
+		if(mode && Runs.Num() && (DCLodVerts<=0 || DCLodVerts>FrameVerts || !Bounds.Num())) appErrorf("Invalid mesh LOD");
+		for(INT r=0;r<Runs.Num();++r)
+		{
+			const FDCMeshRun& R=Runs(r);
+			if(R.First!=End || R.Count<3 || R.Count>Indices.Num()-End || R.Material>=DCMaterials.Num()
+				|| (Bounds.Num() && R.Reserved>=Bounds.Num())) appErrorf("Invalid bounded mesh run");
+			End+=R.Count;
+		}
+		if(End!=Indices.Num() || Indices.Num()!=UVs.Num()) appErrorf("Invalid bounded mesh indices");
+		for(INT i=0;i<Indices.Num();++i) if(Indices(i)>=(mode ? DCLodVerts : FrameVerts)) appErrorf("Invalid bounded mesh vertex");
+	}
 	if( DCNormalBlockOffsets.Num() )
 	{
 		const INT Blocks = (AnimFrames + 15) / 16;
@@ -671,12 +832,24 @@ void UMesh::ValidateDCMesh()
 		{
 			INT End = Frame + 1 < AnimFrames ? DCFrameOffsets(Frame + 1) : WordCount;
 			if( DCFrameOffsets(Frame) < 0 || End < DCFrameOffsets(Frame) || End > WordCount
-				|| End - DCFrameOffsets(Frame) < FrameVerts
+				|| (End - DCFrameOffsets(Frame) < FrameVerts
+					&& !((DCTemporalFrames==2 || (DCTemporalFrames==3 && Frame+1<AnimFrames))
+						&& (Frame & 7) != 0 && End == DCFrameOffsets(Frame)))
 				|| End - DCFrameOffsets(Frame) > FrameVerts * 2 )
 			{
 				appErrorf( "Invalid cooked mesh frame directory" );
 			}
 		}
+		if( DCTemporalFrames==3 )
+			for( INT i=0; i<AnimSeqs.Num(); ++i )
+			{
+				const FMeshAnimSeq& Seq=AnimSeqs(i);
+				if( Seq.NumFrames<=0 || Seq.StartFrame<0 || Seq.StartFrame+Seq.NumFrames>AnimFrames ) continue;
+				const INT First=Seq.StartFrame, Last=First+Seq.NumFrames-1;
+				if( (First+1<AnimFrames && DCFrameOffsets(First)==DCFrameOffsets(First+1))
+					|| (Last+1<AnimFrames && DCFrameOffsets(Last)==DCFrameOffsets(Last+1)) )
+					appErrorf("Sparse mesh sequence endpoint is missing: %s",GetPathName());
+			}
 #if !defined(PLATFORM_DREAMCAST)
 		for( INT Frame = 0; Frame < AnimFrames; ++Frame )
 		{
@@ -748,7 +921,7 @@ void UMesh::ValidateDCMesh()
 }
 
 #if defined(PLATFORM_DREAMCAST)
-UBOOL UMesh::GetDCCookedNormals( FVector* Result, FCoords Coords, AActor* Owner ) const
+UBOOL UMesh::GetDCCookedNormals( FVector* Result, FCoords Coords, AActor* Owner, const BYTE* Active ) const
 {
 	if( (!DCNormalWords.Num() && !DCNormalStreamData.Size()
 		&& !DCNormalCompressed.Num()) || !Owner
@@ -783,6 +956,7 @@ UBOOL UMesh::GetDCCookedNormals( FVector* Result, FCoords Coords, AActor* Owner 
 	for( INT i = 0; i < FrameVerts; ++i )
 	{
 		const FVector A = DCUnpackMeshNormal(N1[i]);
+		if( Active && !Active[i] ) { Result[i]=FVector(0,0,0); continue; }
 		const FVector B = DCUnpackMeshNormal(N2[i]);
 		Result[i] = (A + (B-A)*Alpha).TransformVectorBy(Coords);
 	}
@@ -903,7 +1077,7 @@ static void DCEncodeSpatialFrame( const FMeshVert* Verts, INT Count, TArray<_WOR
 		INT DX = Verts[i].X - X;
 		INT DY = Verts[i].Y - Y;
 		INT DZ = Verts[i].Z - Z;
-		if( DX >= -16 && DX <= 15 && DY >= -16 && DY <= 15 && DZ >= -16 && DZ <= 15 )
+		if( (i&31) && DX >= -16 && DX <= 15 && DY >= -16 && DY <= 15 && DZ >= -16 && DZ <= 15 )
 		{
 			Words.AddItem( 0x8000 | ((DX & 31) << 10) | ((DY & 31) << 5) | (DZ & 31) );
 			X = Verts[i].X;
@@ -940,6 +1114,619 @@ static void DCEncodeTemporalFrame( TArray<FMeshVert>& Reconstructed, const FMesh
 	}
 }
 
+// A UE1 mesh index may be duplicated for a UV seam, but UVs live on triangle
+// corners in the cooked format. Merge only identical animation trajectories
+// whose lighting remains identical after the topology is remapped.
+static void DCCalculateRawMeshNormals( const TArray<FMeshVert>& Verts,
+	const TArray<FMeshTri>& Tris, INT FrameVerts, INT AnimFrames,
+	const FVector& Scale, TArray<_WORD>& Result, TArray<FVector>& Directions )
+{
+	TArray<FVector> Points, Sums;
+	Points.SetNum( FrameVerts );
+	Sums.SetNum( FrameVerts );
+	Result.SetNum( FrameVerts * AnimFrames );
+	Directions.SetNum( FrameVerts * AnimFrames );
+	for( INT Frame=0; Frame<AnimFrames; ++Frame )
+	{
+		for( INT i=0; i<FrameVerts; ++i )
+			Points(i) = Verts(Frame * FrameVerts + i).Vector() * Scale;
+		appMemset( Sums.GetData(), 0, FrameVerts * sizeof(FVector) );
+		for( INT i=0; i<Tris.Num(); ++i )
+		{
+			const FMeshTri& Tri=Tris(i);
+			const FVector Face=(Points(Tri.iVertex[0])-Points(Tri.iVertex[1]))
+				^ (Points(Tri.iVertex[2])-Points(Tri.iVertex[0]));
+			const FVector Unit=Face * (1.f / appSqrt(Face.SizeSquared()+0.001f));
+			for( INT Corner=0; Corner<3; ++Corner )
+				Sums(Tri.iVertex[Corner]) += Unit;
+		}
+		for( INT i=0; i<FrameVerts; ++i )
+		{
+			const FVector& Sum=Sums(i);
+			const FLOAT Length2=Sum.SizeSquared();
+			Directions(Frame * FrameVerts + i)=Length2>0.000001f
+				? Sum * (1.f / appSqrt(Length2)) : FVector(0,0,0);
+			Result(Frame * FrameVerts + i)=DCPackMeshNormal(Sum);
+		}
+	}
+}
+
+static INT DCDeduplicateMeshVertices( UMesh& Mesh )
+{
+	const INT OldCount=Mesh.FrameVerts;
+	if( Mesh.Tris.Num()==0 ) return 0;
+	// Particle rendering consumes all vertices, not just triangle indices.
+	for( TObjectIterator<UClass> It; It; ++It )
+		if( It->IsChildOf(AActor::StaticClass) )
+		{
+			const AActor* Default=It->GetDefaultActor();
+			if( Default && Default->bParticles && Default->Mesh==&Mesh ) return 0;
+		}
+	for( TObjectIterator<AActor> It; It; ++It )
+		if( It->bParticles && It->Mesh==&Mesh ) return 0;
+	TArray<BYTE> Used;
+	Used.SetNum(OldCount);
+	appMemset(Used.GetData(),0,OldCount);
+	for( INT i=0; i<Mesh.Tris.Num(); ++i )
+		for( INT Corner=0; Corner<3; ++Corner )
+		{
+			const INT Vertex=Mesh.Tris(i).iVertex[Corner];
+			if( Vertex<0 || Vertex>=OldCount )
+				appErrorf("Mesh triangle index out of range: %s",Mesh.GetPathName());
+			Used(Vertex)=1;
+		}
+	TArray<INT> Canonical;
+	Canonical.SetNum(OldCount);
+	INT PositionCandidates=0;
+	INT Unused=0;
+	for( INT i=0; i<OldCount; ++i )
+	{
+		Canonical(i)=i;
+		if( !Used(i) ) { ++Unused; continue; }
+		for( INT j=0; j<i; ++j )
+		{
+			if( !Used(j) || Mesh.Verts(i).D!=Mesh.Verts(j).D )
+				continue;
+			if( Canonical(j)!=j ) continue;
+			INT Frame=1;
+			for( ; Frame<Mesh.AnimFrames; ++Frame )
+				if( Mesh.Verts(Frame*OldCount+i).D!=Mesh.Verts(Frame*OldCount+j).D )
+					break;
+			if( Frame==Mesh.AnimFrames )
+			{
+				Canonical(i)=j;
+				++PositionCandidates;
+				break;
+			}
+		}
+	}
+	if( !PositionCandidates && !Unused ) return 0;
+	TArray<_WORD> OriginalNormals;
+	TArray<FVector> OriginalDirections;
+	DCCalculateRawMeshNormals(Mesh.Verts,Mesh.Tris,OldCount,Mesh.AnimFrames,
+		Mesh.Scale,OriginalNormals,OriginalDirections);
+	for( INT i=0; i<OldCount; ++i )
+		if( Canonical(i)!=i )
+			for( INT Frame=0; Frame<Mesh.AnimFrames; ++Frame )
+				if( OriginalNormals(Frame*OldCount+i)
+					!=OriginalNormals(Frame*OldCount+Canonical(i)) )
+				{
+					Canonical(i)=i;
+					break;
+				}
+	TArray<INT> Remap;
+	Remap.SetNum(OldCount);
+	INT NewCount=0;
+	for( INT i=0; i<OldCount; ++i )
+		Remap(i)=Used(i) && Canonical(i)==i ? NewCount++ : INDEX_NONE;
+	for( INT i=0; i<OldCount; ++i )
+		if( Used(i) && Canonical(i)!=i ) Remap(i)=Remap(Canonical(i));
+	if( NewCount==OldCount ) return 0;
+	TArray<FMeshVert> NewVerts;
+	NewVerts.SetNum(NewCount*Mesh.AnimFrames);
+	for( INT Frame=0; Frame<Mesh.AnimFrames; ++Frame )
+		for( INT i=0; i<OldCount; ++i )
+			if( Used(i) && Canonical(i)==i )
+				NewVerts(Frame*NewCount+Remap(i))=Mesh.Verts(Frame*OldCount+i);
+	TArray<FMeshTri> NewTris=Mesh.Tris;
+	for( INT i=0; i<NewTris.Num(); ++i )
+		for( INT Corner=0; Corner<3; ++Corner )
+			NewTris(i).iVertex[Corner]=Remap(NewTris(i).iVertex[Corner]);
+	TArray<_WORD> NewNormals;
+	TArray<FVector> NewDirections;
+	DCCalculateRawMeshNormals(NewVerts,NewTris,NewCount,Mesh.AnimFrames,
+		Mesh.Scale,NewNormals,NewDirections);
+	for( INT Frame=0; Frame<Mesh.AnimFrames; ++Frame )
+		for( INT i=0; i<OldCount; ++i )
+		{
+			if( !Used(i) ) continue;
+			const FVector& A=OriginalDirections(Frame*OldCount+i);
+			const FVector& B=NewDirections(Frame*NewCount+Remap(i));
+			if( OriginalNormals(Frame*OldCount+i)!=NewNormals(Frame*NewCount+Remap(i))
+				|| Abs(A.X-B.X)>0.00001f || Abs(A.Y-B.Y)>0.00001f
+				|| Abs(A.Z-B.Z)>0.00001f )
+			{
+				printf("DCMESH dedup skipped %s: merged normals differ\n",Mesh.GetPathName());
+				return 0;
+			}
+		}
+	Mesh.Verts=NewVerts;
+	Mesh.Tris=NewTris;
+	Mesh.FrameVerts=NewCount;
+	if( Mesh.CurVertex>=0 && Mesh.CurVertex<OldCount )
+		Mesh.CurVertex=Remap(Mesh.CurVertex)==INDEX_NONE ? 0 : Remap(Mesh.CurVertex);
+	printf("DCMESH dedup %s vertices=%d->%d candidates=%d unused=%d\n",
+		Mesh.GetPathName(),OldCount,NewCount,PositionCandidates,Unused);
+	return OldCount-NewCount;
+}
+
+// Position identities are independent of normals, UV corners and materials.
+// Hash decoded retained anchors, then verify full trajectories on hash matches.
+static void DCReportPositionIdentities( const UMesh& Mesh )
+{
+	TArray<DWORD> Hashes;
+	TArray<FMeshVert> Anchors;
+	Hashes.SetNum(Mesh.FrameVerts);
+	for( INT v=0; v<Mesh.FrameVerts; ++v ) Hashes(v)=2166136261U;
+	INT Frames=0;
+	for( INT f=0; f<Mesh.AnimFrames; ++f )
+	{
+		if( Mesh.DCTemporalFrames==3 && f+1<Mesh.AnimFrames
+			&& Mesh.DCFrameOffsets(f)==Mesh.DCFrameOffsets(f+1) ) continue;
+		FDCMeshFrameCursor Cursor(Mesh,f);
+		const INT Base=Anchors.Add(Mesh.FrameVerts);
+		for( INT v=0; v<Mesh.FrameVerts; ++v )
+		{
+			Anchors(Base+v)=FMeshVert(Cursor.Next());
+			Hashes(v)=(Hashes(v)^Anchors(Base+v).D)*16777619U;
+		}
+		if( !Cursor.AtEnd() ) appErrorf("Position identity scan left trailing frame words");
+		++Frames;
+	}
+	TArray<INT> Canonical;
+	Canonical.SetNum(Mesh.FrameVerts);
+	INT Unique=0, Collisions=0;
+	for( INT v=0; v<Mesh.FrameVerts; ++v )
+	{
+		Canonical(v)=v;
+		for( INT j=0; j<v; ++j )
+		{
+			if( Canonical(j)!=j || Hashes(j)!=Hashes(v) ) continue;
+			INT f=0;
+			for( ; f<Frames; ++f )
+				if( Anchors(f*Mesh.FrameVerts+j).D!=Anchors(f*Mesh.FrameVerts+v).D ) break;
+			if( f==Frames ) { Canonical(v)=j; break; }
+			++Collisions;
+		}
+		Unique+=Canonical(v)==v;
+	}
+	printf("DCMESH position_ids %s shading=%d positions=%d shared=%d anchors=%d collisions=%d\n",
+		Mesh.GetPathName(),Mesh.FrameVerts,Unique,Mesh.FrameVerts-Unique,Frames,Collisions);
+}
+
+static void DCSelectReducedKeyframes( const UMesh& Mesh, TArray<BYTE>& Removed )
+{
+	Removed.SetNum(Mesh.AnimFrames);
+	appMemset(Removed.GetData(),0,Mesh.AnimFrames);
+	if( Mesh.AnimFrames<4 || Mesh.Tris.Num()==0 ) return;
+	TArray<BYTE> Pinned;
+	Pinned.SetNum(Mesh.AnimFrames);
+	appMemset(Pinned.GetData(),0,Mesh.AnimFrames);
+	Pinned(0)=Pinned(Mesh.AnimFrames-1)=1;
+	FLOAT MinRate=10000.f, MaxRate=0.f;
+	for( INT i=0; i<Mesh.AnimSeqs.Num(); ++i )
+	{
+		const FMeshAnimSeq& Seq=Mesh.AnimSeqs(i);
+		MinRate=Min(MinRate,Seq.Rate);
+		MaxRate=Max(MaxRate,Seq.Rate);
+		if( Seq.StartFrame<0 || Seq.StartFrame+Seq.NumFrames>Mesh.AnimFrames ) continue;
+		Pinned(Seq.StartFrame)=Pinned(Seq.StartFrame+Seq.NumFrames-1)=1;
+		for( INT j=0; j<Seq.Notifys.Num(); ++j )
+		{
+			const INT Frame=Clamp(Seq.StartFrame+appRound(Seq.Notifys(j).Time*Seq.NumFrames),
+				Seq.StartFrame,Seq.StartFrame+Seq.NumFrames-1);
+			Pinned(Frame)=1;
+		}
+	}
+	TArray<_WORD> NormalWords; TArray<FVector> Normals;
+	DCCalculateRawMeshNormals(Mesh.Verts,Mesh.Tris,Mesh.FrameVerts,Mesh.AnimFrames,
+		Mesh.Scale,NormalWords,Normals);
+	TArray<FVector> Points,Sums;
+	Points.SetNum(Mesh.FrameVerts); Sums.SetNum(Mesh.FrameVerts);
+	INT Reduced=0;
+	FLOAT Worst=0.f;
+	for( INT Frame=1; Frame+1<Mesh.AnimFrames; Frame+=2 )
+	{
+		if( Pinned(Frame) ) continue;
+		FLOAT Maximum=0.f;
+		for( INT i=0; i<Mesh.FrameVerts; ++i )
+		{
+			const FVector A=Mesh.Verts((Frame-1)*Mesh.FrameVerts+i).Vector()*Mesh.Scale;
+			const FVector B=Mesh.Verts(Frame*Mesh.FrameVerts+i).Vector()*Mesh.Scale;
+			const FVector C=Mesh.Verts((Frame+1)*Mesh.FrameVerts+i).Vector()*Mesh.Scale;
+			Maximum=Max(Maximum,(B-(A+C)*0.5f).Size());
+		}
+		if( Maximum>1.f ) continue;
+		for( INT i=0; i<Mesh.FrameVerts; ++i )
+			Points(i)=(Mesh.Verts((Frame-1)*Mesh.FrameVerts+i).Vector()
+				+Mesh.Verts((Frame+1)*Mesh.FrameVerts+i).Vector())*0.5f*Mesh.Scale;
+		appMemset(Sums.GetData(),0,Mesh.FrameVerts*sizeof(FVector));
+		UBOOL Safe=1;
+		for( INT i=0; i<Mesh.Tris.Num(); ++i )
+		{
+			const FMeshTri& T=Mesh.Tris(i);
+			const FVector Face=(Points(T.iVertex[0])-Points(T.iVertex[1]))
+				^ (Points(T.iVertex[2])-Points(T.iVertex[0]));
+			const FVector OldA=Mesh.Verts(Frame*Mesh.FrameVerts+T.iVertex[0]).Vector()*Mesh.Scale;
+			const FVector OldB=Mesh.Verts(Frame*Mesh.FrameVerts+T.iVertex[1]).Vector()*Mesh.Scale;
+			const FVector OldC=Mesh.Verts(Frame*Mesh.FrameVerts+T.iVertex[2]).Vector()*Mesh.Scale;
+			const FVector OldFace=(OldA-OldB)^(OldC-OldA);
+			if( OldFace.SizeSquared()>0.000001f && (OldFace|Face)<=0.f ) { Safe=0; break; }
+			const FVector Unit=Face*(1.f/appSqrt(Face.SizeSquared()+0.001f));
+			for( INT c=0; c<3; ++c ) Sums(T.iVertex[c])+=Unit;
+		}
+		for( INT i=0; i<Mesh.FrameVerts && Safe; ++i )
+		{
+			const FLOAT Size2=Sums(i).SizeSquared();
+			const FVector N=Size2>0.000001f ? Sums(i)*(1.f/appSqrt(Size2)) : FVector(0,0,1);
+			Safe=(N|Normals(Frame*Mesh.FrameVerts+i))>=0.995f;
+		}
+		if( Safe ) { Removed(Frame)=1; ++Reduced; Worst=Max(Worst,Maximum); }
+	}
+	if( Reduced ) printf("DCMESH sparse %s removed=%d/%d max_error=%.3f normal_dot=0.995 rate=%.1f..%.1f\n",
+		Mesh.GetPathName(),Reduced,Mesh.AnimFrames,Worst,MinRate,MaxRate);
+}
+
+static FLOAT DCMinFace(const FVector* A, const FVector* B, const FVector& Ref)
+{
+	const FVector E=A[1]-A[0], F=A[2]-A[0];
+	const FVector DE=(B[1]-B[0])-E, DF=(B[2]-B[0])-F;
+	const FLOAT C0=(E^F)|Ref, C1=((DE^F)+(E^DF))|Ref, C2=(DE^DF)|Ref;
+	FLOAT Result=Min(C0,C0+C1+C2);
+	if( C2>0.f ) { const FLOAT t=-C1/(2.f*C2); if(t>0.f && t<1.f) Result=Min(Result,C0+t*(C1+t*C2)); }
+	return Result;
+}
+
+static void DCBuildAnimationLOD(UMesh& Mesh, TArray<FMeshTri>& Lod)
+{
+	Mesh.DCLodVerts=0;
+	const INT N=Mesh.FrameVerts;
+	if( N<224 || N>512 || Mesh.Tris.Num()<128 ) return;
+	for( TObjectIterator<UClass> It; It; ++It )
+		if( It->IsChildOf(AActor::StaticClass) && It->GetDefaultActor()->bParticles && It->GetDefaultActor()->Mesh==&Mesh ) return;
+	for( TObjectIterator<AActor> It; It; ++It ) if(It->bParticles && It->Mesh==&Mesh) return;
+	TArray<FVector> P(Mesh.Verts.Num());
+	FBox Box(0);
+	for( INT i=0; i<P.Num(); ++i )
+	{
+		FMeshVert V=Mesh.Verts(i); V.X &= ~1; P(i)=V.Vector()*Mesh.Scale; Box+=P(i);
+	}
+	const FVector Extent=Box.Max-Box.Min;
+	const FLOAT Limit=Max(Extent.X,Max(Extent.Y,Extent.Z))*0.02f;
+	if( Limit<=0.f ) return;
+	TArray<BYTE> Protected(N), Rejected(N*N);
+	TArray<INT> UV(N), Mat(N), Root(N), Edges(N*N);
+	TArray<DWORD> MaterialFlags(N); appMemset(MaterialFlags.GetData(),255,N*sizeof(DWORD));
+	TArray<FLOAT> Error(N);
+	appMemset(Protected.GetData(),0,N); appMemset(Edges.GetData(),0,N*N*sizeof(INT));
+	appMemset(Rejected.GetData(),0,N*N); appMemset(Error.GetData(),0,N*sizeof(FLOAT));
+	for(INT i=0;i<N;++i) { UV(i)=Mat(i)=INDEX_NONE; Root(i)=i; }
+	for(INT t=0;t<Mesh.Tris.Num();++t)
+	{
+		const FMeshTri& T=Mesh.Tris(t);
+		for(INT c=0;c<3;++c)
+		{
+			const INT v=T.iVertex[c], u=PackedUV(T.Tex[c]), m=T.TextureIndex;
+			if( (UV(v)!=INDEX_NONE && UV(v)!=u) || (Mat(v)!=INDEX_NONE && Mat(v)!=m)
+				|| (MaterialFlags(v)!=0xffffffffu && MaterialFlags(v)!=T.PolyFlags)
+				|| (T.PolyFlags & (PF_Invisible|PF_Translucent|PF_Modulated|PF_Environment|PF_TwoSided)) ) Protected(v)=1;
+			UV(v)=u; Mat(v)=m; MaterialFlags(v)=T.PolyFlags;
+			const INT b=T.iVertex[(c+1)%3]; ++Edges(Min(v,b)*N+Max(v,b));
+		}
+	}
+	for(INT a=0;a<N;++a) for(INT b=a+1;b<N;++b)
+		if( Edges(a*N+b) && Edges(a*N+b)!=2 ) Protected(a)=Protected(b)=1;
+	Lod=Mesh.Tris;
+	INT Collapses=0;
+	while( Lod.Num()>Mesh.Tris.Num()*3/5 )
+	{
+		INT A=INDEX_NONE,B=INDEX_NONE; FLOAT Best=Limit;
+		for(INT t=0;t<Lod.Num();++t) for(INT c=0;c<3;++c)
+		{
+			INT a=Lod(t).iVertex[c], b=Lod(t).iVertex[(c+1)%3];
+			if(a<b) Exchange(a,b);
+			if(a==b || Protected(a) || Protected(b) || Rejected(a*N+b)) continue;
+			FLOAT Distance2=0.f;
+			const FLOAT Remaining=Best-Error(a);
+			if(Remaining<=0.f) continue;
+			for(INT f=0;f<Mesh.AnimFrames;++f)
+			{
+				Distance2=Max(Distance2,(P(f*N+a)-P(f*N+b)).SizeSquared());
+				if(Distance2>=Remaining*Remaining) break;
+			}
+			const FLOAT Cost=Max(Error(b),Error(a)+(FLOAT)appSqrt(Distance2));
+			if(Cost<Best) { Best=Cost; A=a; B=b; }
+		}
+		if(A==INDEX_NONE) break;
+		BYTE NA[512]={0}, NB[512]={0}, Opp[512]={0}; INT Faces=0;
+		for(INT t=0;t<Lod.Num();++t)
+		{
+			UBOOL HA=0,HB=0;
+			for(INT c=0;c<3;++c) { HA|=Lod(t).iVertex[c]==A; HB|=Lod(t).iVertex[c]==B; }
+			for(INT c=0;c<3;++c)
+			{
+				const INT v=Lod(t).iVertex[c]; if(v==A || v==B) continue;
+				if(HA) NA[v]=1; if(HB) NB[v]=1; if(HA && HB) Opp[v]=1;
+			}
+			Faces+=HA && HB;
+		}
+		UBOOL Safe=Faces==2;
+		for(INT v=0;v<N;++v) if((NA[v] && NB[v])!=Opp[v]) Safe=0;
+		for(INT t=0;Safe && t<Lod.Num();++t)
+		{
+			INT Old[3], New[3]; UBOOL Changed=0,HasB=0;
+			for(INT c=0;c<3;++c) { Old[c]=Lod(t).iVertex[c]; New[c]=Old[c]==A ? B : Old[c]; Changed|=Old[c]==A; HasB|=Old[c]==B; }
+			if(!Changed || HasB) continue;
+			// Check the entire linear interval, including sequence wrap edges.
+			for(INT s=-1;Safe && s<Mesh.AnimSeqs.Num();++s)
+			{
+				const INT Start=s<0 ? 0 : Mesh.AnimSeqs(s).StartFrame;
+				const INT Count=s<0 ? Mesh.AnimFrames : Mesh.AnimSeqs(s).NumFrames;
+				if(Count<=0 || Start<0 || Start+Count>Mesh.AnimFrames) { Safe=0; break; }
+				for(INT f=0;Safe && f<Count;++f)
+				{
+					const INT f0=Start+f, f1=s<0 ? f0 : Start+(f+1)%Count;
+					FVector O0[3],O1[3],Q0[3],Q1[3];
+					for(INT c=0;c<3;++c) { O0[c]=P(f0*N+Old[c]); O1[c]=P(f1*N+Old[c]); Q0[c]=P(f0*N+New[c]); Q1[c]=P(f1*N+New[c]); }
+					const FVector Ref=(O0[1]-O0[0])^(O0[2]-O0[0]);
+					const FLOAT Epsilon=Ref.SizeSquared()*0.001f+0.0000001f;
+					if(DCMinFace(O0,O1,Ref)<=Epsilon || DCMinFace(Q0,Q1,Ref)<=Epsilon) Safe=0;
+				}
+			}
+		}
+		if(!Safe) { Rejected(A*N+B)=1; continue; }
+		for(INT v=0;v<N;++v) if(Root(v)==A) Root(v)=B;
+		Error(B)=Best; ++Collapses;
+		for(INT t=Lod.Num()-1;t>=0;--t)
+		{
+			for(INT c=0;c<3;++c) if(Lod(t).iVertex[c]==A) Lod(t).iVertex[c]=B;
+			if(Lod(t).iVertex[0]==Lod(t).iVertex[1] || Lod(t).iVertex[1]==Lod(t).iVertex[2] || Lod(t).iVertex[0]==Lod(t).iVertex[2]) Lod.Remove(t);
+		}
+		appMemset(Rejected.GetData(),0,N*N);
+	}
+	if( Collapses<4 ) { Lod.Empty(); return; }
+	// Pack active LOD vertices first: rejected tail blocks need no read/decode.
+	TArray<BYTE> Active(N); appMemset(Active.GetData(),0,N);
+	for(INT t=0;t<Lod.Num();++t) for(INT c=0;c<3;++c) Active(Lod(t).iVertex[c])=1;
+	TArray<INT> Remap(N); INT Next=0;
+	for(INT v=0;v<N;++v) if(Active(v)) Remap(v)=Next++;
+	Mesh.DCLodVerts=Next;
+	for(INT v=0;v<N;++v) if(!Active(v)) Remap(v)=Next++;
+	TArray<FMeshVert> Reordered(Mesh.Verts.Num());
+	for(INT f=0;f<Mesh.AnimFrames;++f) for(INT v=0;v<N;++v)
+	{
+		FMeshVert V=Mesh.Verts(f*N+v); V.X &= ~1; Reordered(f*N+Remap(v))=V;
+		Mesh.BoundingBoxes(f)+=V.Vector(); Mesh.BoundingBox+=V.Vector();
+	}
+	Mesh.Verts=Reordered;
+	for(INT t=0;t<Mesh.Tris.Num();++t) for(INT c=0;c<3;++c) Mesh.Tris(t).iVertex[c]=Remap(Mesh.Tris(t).iVertex[c]);
+	for(INT t=0;t<Lod.Num();++t) for(INT c=0;c<3;++c) Lod(t).iVertex[c]=Remap(Lod(t).iVertex[c]);
+	printf("DCMESH lod %s vertices=%d/%d triangles=%d/%d bound=%.3f collapses=%d\n",Mesh.GetPathName(),Mesh.DCLodVerts,N,Lod.Num(),Mesh.Tris.Num(),Limit,Collapses);
+}
+
+static void DCCookStrips(const char* Name, const TArray<FMeshTri>& Tris,
+	TArray<FDCMeshRun>& DCRuns, TArray<FDCMeshMaterial>& DCMaterials,
+	TArray<_WORD>& DCIndices, TArray<_WORD>& DCUVs)
+{
+	const TArray<FDCMeshMaterial> InitialMaterials=DCMaterials;
+	TArray<BYTE> Used( Tris.Num() );
+	TArray<FDCMeshRun> BaselineRuns;
+	TArray<FDCMeshMaterial> BaselineMaterials;
+	TArray<_WORD> BaselineIndices, BaselineUVs;
+	for( INT Strategy=0; Strategy<2; ++Strategy )
+	{
+	const UBOOL Optimize = Strategy!=0;
+	DCRuns.Empty(); DCMaterials=InitialMaterials; DCIndices.Empty(); DCUVs.Empty();
+	appMemset( Used.GetData(), 0, Used.Num() );
+	// Offline directed-edge adjacency. Each corner includes its UV so seams
+	// cannot be welded accidentally. Hash collisions are checked explicitly.
+	TArray<INT> EdgeHeads(4096), EdgeNext(Tris.Num()*3), Degree(Tris.Num());
+	for( INT i=0; i<EdgeHeads.Num(); ++i ) EdgeHeads(i)=INDEX_NONE;
+	appMemset(Degree.GetData(),0,Degree.Num()*sizeof(INT));
+	for( INT t=0; t<Tris.Num(); ++t )
+		for( INT c=0; c<3; ++c )
+		{
+			const INT n=(c+1)%3;
+			const DWORD A=Tris(t).iVertex[c] | (DWORD(PackedUV(Tris(t).Tex[c]))<<16);
+			const DWORD B=Tris(t).iVertex[n] | (DWORD(PackedUV(Tris(t).Tex[n]))<<16);
+			const INT H=((A*1664525u) ^ (B*1013904223u)) & 4095;
+			EdgeNext(t*3+c)=EdgeHeads(H); EdgeHeads(H)=t*3+c;
+		}
+	for( INT t=0; t<Tris.Num(); ++t )
+		for( INT c=0; c<3; ++c )
+		{
+			const INT n=(c+1)%3;
+			const DWORD A=Tris(t).iVertex[n] | (DWORD(PackedUV(Tris(t).Tex[n]))<<16);
+			const DWORD B=Tris(t).iVertex[c] | (DWORD(PackedUV(Tris(t).Tex[c]))<<16);
+			const INT H=((A*1664525u) ^ (B*1013904223u)) & 4095;
+			for( INT e=EdgeHeads(H); e!=INDEX_NONE; e=EdgeNext(e) )
+			{
+				const FMeshTri& T=Tris(e/3); const INT k=e%3, j=(k+1)%3;
+				if( e/3!=t && T.PolyFlags==Tris(t).PolyFlags && T.TextureIndex==Tris(t).TextureIndex
+					&& (T.iVertex[k] | (DWORD(PackedUV(T.Tex[k]))<<16))==A
+					&& (T.iVertex[j] | (DWORD(PackedUV(T.Tex[j]))<<16))==B ) ++Degree(t);
+			}
+		}
+	TArray<INT> TrialMarks( Tris.Num() );
+	appMemset( TrialMarks.GetData(), 0, TrialMarks.Num() * sizeof(INT) );
+	INT TrialId = 0;
+	for( INT Start = 0; Start < Tris.Num(); ++Start )
+	{
+		if( Used(Start) )
+		{
+			continue;
+		}
+		const FMeshTri& First = Tris(Start);
+		const UBOOL OrderSensitive = (First.PolyFlags & (PF_Translucent|PF_Modulated|PF_Highlighted|PF_Invisible))!=0;
+		INT Material = 0;
+		while( Material < DCMaterials.Num() && (DCMaterials(Material).Flags != First.PolyFlags
+			|| DCMaterials(Material).Texture != First.TextureIndex) )
+		{
+			++Material;
+		}
+		if( Material == DCMaterials.Num() )
+		{
+			FDCMeshMaterial Entry = { First.PolyFlags, First.TextureIndex };
+			DCMaterials.AddItem( Entry );
+		}
+		// The first corner of a strip is arbitrary, but it decides which edge
+		// can be extended. Try all three cyclic (winding-preserving) starts and
+		// keep the longest strip. Every triangle, UV seam and material is still
+		// checked by the full topology roundtrip below.
+		TArray<_WORD> BestIndices;
+		TArray<_WORD> BestUVs;
+		TArray<INT> BestTriangles;
+		TArray<INT> Seeds;
+		Seeds.AddItem(Start);
+		if( Optimize && !OrderSensitive )
+			for( INT s=0; s<5; ++s )
+			{
+				INT Pick=INDEX_NONE;
+				for( INT t=Start+1; t<Tris.Num(); ++t )
+				{
+					if( Used(t) || Tris(t).PolyFlags!=First.PolyFlags || Tris(t).TextureIndex!=First.TextureIndex ) continue;
+					UBOOL Seen=0;
+					for( INT k=0; k<Seeds.Num(); ++k ) if( Seeds(k)==t ) Seen=1;
+					if( !Seen && (Pick==INDEX_NONE || Degree(t)<Degree(Pick)) ) Pick=t;
+				}
+				if( Pick==INDEX_NONE ) break;
+				Seeds.AddItem(Pick);
+			}
+		for( INT Trial=0; Trial<Seeds.Num()*3; ++Trial )
+		{
+			const INT Seed=Seeds(Trial/3), Rotation=Trial%3;
+			TArray<_WORD> CandidateIndices;
+			TArray<_WORD> CandidateUVs;
+			TArray<INT> CandidateTriangles;
+			for( INT Corner = 0; Corner < 3; ++Corner )
+			{
+				const INT SourceCorner = (Corner + Rotation) % 3;
+				CandidateIndices.AddItem( Tris(Seed).iVertex[SourceCorner] );
+				CandidateUVs.AddItem( PackedUV(Tris(Seed).Tex[SourceCorner]) );
+			}
+			CandidateTriangles.AddItem( Seed );
+			++TrialId;
+			TrialMarks(Seed) = TrialId;
+		while( CandidateIndices.Num() < 128 )
+			{
+				INT A = CandidateIndices.Num() - 2;
+				INT B = CandidateIndices.Num() - 1;
+				if( CandidateIndices.Num() & 1 )
+					Exchange( A, B );
+				INT Match = INDEX_NONE;
+				INT MatchCorner = 0;
+				const DWORD KA=CandidateIndices(A) | (DWORD(CandidateUVs(A))<<16);
+				const DWORD KB=CandidateIndices(B) | (DWORD(CandidateUVs(B))<<16);
+				const INT H=((KA*1664525u) ^ (KB*1013904223u)) & 4095;
+				for( INT Edge=EdgeHeads(H); Edge!=INDEX_NONE; Edge=EdgeNext(Edge) )
+				{
+					const INT i=Edge/3;
+					const FMeshTri& Tri = Tris(i);
+					if( Used(i) || TrialMarks(i) == TrialId
+						|| Tri.PolyFlags != First.PolyFlags
+						|| Tri.TextureIndex != First.TextureIndex )
+						continue;
+					const INT Corner=Edge%3;
+					{
+						const INT Next = (Corner + 1) % 3;
+						if( Tri.iVertex[Corner] == CandidateIndices(A)
+							&& PackedUV(Tri.Tex[Corner]) == CandidateUVs(A)
+							&& Tri.iVertex[Next] == CandidateIndices(B)
+							&& PackedUV(Tri.Tex[Next]) == CandidateUVs(B) )
+						{
+							if( Match==INDEX_NONE || ((OrderSensitive || !Optimize) ? i<Match
+								: Degree(i)<Degree(Match) || (Degree(i)==Degree(Match) && i<Match)) )
+							{
+								Match = i;
+								MatchCorner = (Corner + 2) % 3;
+							}
+						}
+					}
+				}
+				if( Match == INDEX_NONE )
+					break;
+				CandidateIndices.AddItem( Tris(Match).iVertex[MatchCorner] );
+				CandidateUVs.AddItem( PackedUV(Tris(Match).Tex[MatchCorner]) );
+				CandidateTriangles.AddItem( Match );
+				TrialMarks(Match) = TrialId;
+			}
+			if( CandidateTriangles.Num() > BestTriangles.Num() )
+			{
+				BestIndices = CandidateIndices;
+				BestUVs = CandidateUVs;
+				BestTriangles = CandidateTriangles;
+			}
+		}
+		FDCMeshRun Run = { (_WORD)Material, 0, (_WORD)DCIndices.Num(), (_WORD)BestIndices.Num() };
+		for( INT i = 0; i < BestIndices.Num(); ++i )
+		{
+			DCIndices.AddItem( BestIndices(i) );
+			DCUVs.AddItem( BestUVs(i) );
+		}
+		for( INT i = 0; i < BestTriangles.Num(); ++i )
+			Used(BestTriangles(i)) = 1;
+		DCRuns.AddItem( Run );
+		// Another seed may have won: do not lose the original unused face.
+		if( !Used(Start) ) --Start;
+	}
+	if( !Optimize )
+	{
+		BaselineRuns=DCRuns; BaselineMaterials=DCMaterials;
+		BaselineIndices=DCIndices; BaselineUVs=DCUVs;
+	}
+	else
+	{
+		const INT CandidateCount=DCIndices.Num();
+		if( CandidateCount>=BaselineIndices.Num() )
+		{
+			DCRuns=BaselineRuns; DCMaterials=BaselineMaterials;
+			DCIndices=BaselineIndices; DCUVs=BaselineUVs;
+		}
+		printf("DCMESH strip_search %s baseline=%d candidate=%d selected=%d\n",
+			Name,BaselineIndices.Num(),CandidateCount,DCIndices.Num());
+	}
+	}
+}
+
+static void DCVerifyStripTopology(const TArray<FMeshTri>& Tris, const TArray<FDCMeshRun>& Runs,
+	const TArray<FDCMeshMaterial>& Materials, const TArray<_WORD>& Indices, const TArray<_WORD>& UVs)
+{
+	TArray<BYTE> Used(Tris.Num()); appMemset(Used.GetData(),0,Used.Num());
+	INT Count=0;
+	for(INT r=0;r<Runs.Num();++r) for(INT v=2;v<Runs(r).Count;++v)
+	{
+		const FDCMeshRun& R=Runs(r); const FDCMeshMaterial& M=Materials(R.Material);
+		UBOOL Found=0;
+		for(INT t=0;t<Tris.Num() && !Found;++t)
+		{
+			if(Used(t) || Tris(t).TextureIndex!=M.Texture || Tris(t).PolyFlags!=M.Flags) continue;
+			for(INT rotation=0;rotation<3 && !Found;++rotation)
+			{
+				Found=1;
+				for(INT c=0;c<3;++c)
+				{
+					INT slot=R.First+v-2+(c==2 ? 2 : (v&1) ? 1-c : c), src=(c+rotation)%3;
+					Found=Found && Indices(slot)==Tris(t).iVertex[src] && UVs(slot)==PackedUV(Tris(t).Tex[src]);
+				}
+			}
+			if(Found) Used(t)=1;
+		}
+		if(!Found) appErrorf("LOD strip topology mismatch");
+		++Count;
+	}
+	if(Count!=Tris.Num()) appErrorf("LOD strip triangle count mismatch");
+}
+
 void UMesh::CookDCMesh()
 {
 	guard(UMesh::CookDCMesh);
@@ -954,6 +1741,18 @@ void UMesh::CookDCMesh()
 		appErrorf( "Mesh cannot be cooked: %s", GetPathName() );
 	}
 	INT Before = Verts.Num() * 4 + Tris.Num() * 20 + Connects.Num() * 8 + VertLinks.Num() * 4;
+	const UBOOL CookNormals = FrameVerts >= 224 && Tris.Num() != 0;
+	DCDeduplicateMeshVertices(*this);
+	TArray<FMeshTri> LodTriangles;
+	if( CookNormals ) DCBuildAnimationLOD(*this,LodTriangles);
+	TArray<BYTE> Removed;
+	if( LodTriangles.Num() )
+	{
+		// LOD validation covers the original piecewise-linear animation. Do not
+		// subsequently change its interpolation intervals with sparse sampling.
+		Removed.SetNum(AnimFrames); appMemset(Removed.GetData(),0,AnimFrames);
+	}
+	else DCSelectReducedKeyframes(*this,Removed);
 
 	TArray<INT> SpatialOffsets;
 	TArray<_WORD> SpatialWords;
@@ -961,6 +1760,7 @@ void UMesh::CookDCMesh()
 	TArray<_WORD> TemporalWords;
 	TArray<FMeshVert> Reconstructed;
 	Reconstructed.Add(FrameVerts);
+	INT RepeatedFrames = 0;
 	for( INT Frame = 0; Frame < AnimFrames; ++Frame )
 	{
 		const FMeshVert* Current = &Verts(Frame * FrameVerts);
@@ -977,7 +1777,10 @@ void UMesh::CookDCMesh()
 			}
 		}
 		else
-			DCEncodeTemporalFrame( Reconstructed, Current, FrameVerts, TemporalWords );
+		{
+			if( Removed(Frame) ) ++RepeatedFrames;
+			else DCEncodeTemporalFrame( Reconstructed, Current, FrameVerts, TemporalWords );
+		}
 	}
 	INT RawBytes = Verts.Num() * sizeof(FMeshVert);
 	INT SpatialBytes = SpatialWords.Num() * sizeof(_WORD) + SpatialOffsets.Num() * sizeof(INT);
@@ -986,7 +1789,10 @@ void UMesh::CookDCMesh()
 	{
 		DCFrameOffsets = TemporalOffsets;
 		DCFrameWords = TemporalWords;
-		DCTemporalFrames = 1;
+		DCTemporalFrames = RepeatedFrames ? 3 : 1;
+		if( RepeatedFrames )
+			printf("DCMESH sparse_encoded %s removed=%d/%d minimum_saved=%d bytes\n",
+				GetPathName(),RepeatedFrames,AnimFrames,RepeatedFrames*FrameVerts*2);
 	}
 	else if( SpatialBytes < RawBytes )
 	{
@@ -1003,8 +1809,10 @@ void UMesh::CookDCMesh()
 			{
 				FVector Decoded = Cursor.Next();
 				FVector Original = Verts(Frame * FrameVerts + i).Vector();
-				if( Abs( Decoded.X - Original.X ) > 1
-					|| Decoded.Y != Original.Y || Decoded.Z != Original.Z )
+				if( DCTemporalFrames==3 && Removed(Frame)
+					? ((Decoded-Original)*Scale).Size()>1.f+Abs(Scale.X)+0.0001f
+					: (Abs( Decoded.X - Original.X ) > 1
+					|| Decoded.Y != Original.Y || Decoded.Z != Original.Z) )
 				{
 					appErrorf( "Mesh frame roundtrip failed" );
 				}
@@ -1015,10 +1823,48 @@ void UMesh::CookDCMesh()
 			}
 		}
 	}
+	if( DCTemporalFrames==3 )
+	{
+		// A virtual frame's original bound may not contain its replacement.
+		// Use the enclosing anchor bounds, also conservative between samples.
+		for( INT Frame=1; Frame+1<AnimFrames; ++Frame )
+			if( Removed(Frame) )
+				BoundingBoxes(Frame)=BoundingBoxes(Frame)+BoundingBoxes(Frame-1)+BoundingBoxes(Frame+1);
+		INT Tested=0;
+		for( INT s=0; s<AnimSeqs.Num(); ++s )
+		{
+			const FMeshAnimSeq& Seq=AnimSeqs(s);
+			if( Seq.NumFrames<=0 || Seq.StartFrame<0 || Seq.StartFrame+Seq.NumFrames>AnimFrames ) continue;
+			for( INT f=0; f<Seq.NumFrames; ++f )
+			{
+				const INT OriginalFirst=Seq.StartFrame+f;
+				const INT OriginalSecond=Seq.StartFrame+(f+1)%Seq.NumFrames;
+				if( !Removed(OriginalFirst) && !Removed(OriginalSecond) ) continue;
+				for( INT q=0; q<4; ++q )
+				{
+					INT First=OriginalFirst,Second=OriginalSecond; FLOAT Alpha=q*0.25f;
+					ResolveDCFrameSample(First,Second,Alpha);
+					if( Removed(First) || Removed(Second) ) appErrorf("Sparse sample resolved to missing anchor");
+					FDCMeshFrameCursor A(*this,First), B(*this,Second);
+					for( INT v=0; v<FrameVerts; ++v )
+					{
+						const FVector P=A.Next(), Sample=P+(B.Next()-P)*Alpha;
+						const FVector OldA=Verts(OriginalFirst*FrameVerts+v).Vector();
+						const FVector OldB=Verts(OriginalSecond*FrameVerts+v).Vector();
+						if( ((Sample-(OldA+(OldB-OldA)*(q*0.25f)))*Scale).Size()>1.f+Abs(Scale.X)+0.0001f )
+							appErrorf("Sparse animation sample exceeded error bound: %s",GetPathName());
+					}
+					++Tested;
+				}
+			}
+		}
+		printf("DCMESH sparse_verified %s samples=%d timeline_unchanged=1\n",GetPathName(),Tested);
+	}
+	DCReportPositionIdentities(*this);
 	// The position frames stay in the DAT at runtime. Cook one compact normal
 	// per animation vertex now, while the original oriented triangles exist.
 	// Runtime keeps only a bounded frame cache rather than all animation normals.
-	if( FrameVerts >= 224 && Tris.Num() )
+	if( CookNormals )
 	{
 		TArray<FVector> Points;
 		TArray<FVector> NormalSums;
@@ -1102,102 +1948,11 @@ void UMesh::CookDCMesh()
 		Verts.Empty();
 	}
 
-	TArray<BYTE> Used( Tris.Num() );
-	appMemset( Used.GetData(), 0, Used.Num() );
-	TArray<INT> TrialMarks( Tris.Num() );
-	appMemset( TrialMarks.GetData(), 0, TrialMarks.Num() * sizeof(INT) );
-	INT TrialId = 0;
-	for( INT Start = 0; Start < Tris.Num(); ++Start )
+	DCCookStrips(GetPathName(),Tris,DCRuns,DCMaterials,DCIndices,DCUVs);
+	if( LodTriangles.Num() )
 	{
-		if( Used(Start) )
-		{
-			continue;
-		}
-		const FMeshTri& First = Tris(Start);
-		INT Material = 0;
-		while( Material < DCMaterials.Num() && (DCMaterials(Material).Flags != First.PolyFlags
-			|| DCMaterials(Material).Texture != First.TextureIndex) )
-		{
-			++Material;
-		}
-		if( Material == DCMaterials.Num() )
-		{
-			FDCMeshMaterial Entry = { First.PolyFlags, First.TextureIndex };
-			DCMaterials.AddItem( Entry );
-		}
-		// The first corner of a strip is arbitrary, but it decides which edge
-		// can be extended. Try all three cyclic (winding-preserving) starts and
-		// keep the longest strip. Every triangle, UV seam and material is still
-		// checked by the full topology roundtrip below.
-		TArray<_WORD> BestIndices;
-		TArray<_WORD> BestUVs;
-		TArray<INT> BestTriangles;
-		for( INT Rotation = 0; Rotation < 3; ++Rotation )
-		{
-			TArray<_WORD> CandidateIndices;
-			TArray<_WORD> CandidateUVs;
-			TArray<INT> CandidateTriangles;
-			for( INT Corner = 0; Corner < 3; ++Corner )
-			{
-				const INT SourceCorner = (Corner + Rotation) % 3;
-				CandidateIndices.AddItem( First.iVertex[SourceCorner] );
-				CandidateUVs.AddItem( PackedUV(First.Tex[SourceCorner]) );
-			}
-			CandidateTriangles.AddItem( Start );
-			++TrialId;
-			TrialMarks(Start) = TrialId;
-		while( CandidateIndices.Num() < 128 )
-			{
-				INT A = CandidateIndices.Num() - 2;
-				INT B = CandidateIndices.Num() - 1;
-				if( CandidateIndices.Num() & 1 )
-					Exchange( A, B );
-				INT Match = INDEX_NONE;
-				INT MatchCorner = 0;
-				for( INT i = 0; i < Tris.Num() && Match == INDEX_NONE; ++i )
-				{
-					const FMeshTri& Tri = Tris(i);
-					if( Used(i) || TrialMarks(i) == TrialId
-						|| Tri.PolyFlags != First.PolyFlags
-						|| Tri.TextureIndex != First.TextureIndex )
-						continue;
-					for( INT Corner = 0; Corner < 3; ++Corner )
-					{
-						const INT Next = (Corner + 1) % 3;
-						if( Tri.iVertex[Corner] == CandidateIndices(A)
-							&& PackedUV(Tri.Tex[Corner]) == CandidateUVs(A)
-							&& Tri.iVertex[Next] == CandidateIndices(B)
-							&& PackedUV(Tri.Tex[Next]) == CandidateUVs(B) )
-						{
-							Match = i;
-							MatchCorner = (Corner + 2) % 3;
-							break;
-						}
-					}
-				}
-				if( Match == INDEX_NONE )
-					break;
-				CandidateIndices.AddItem( Tris(Match).iVertex[MatchCorner] );
-				CandidateUVs.AddItem( PackedUV(Tris(Match).Tex[MatchCorner]) );
-				CandidateTriangles.AddItem( Match );
-				TrialMarks(Match) = TrialId;
-			}
-			if( CandidateTriangles.Num() > BestTriangles.Num() )
-			{
-				BestIndices = CandidateIndices;
-				BestUVs = CandidateUVs;
-				BestTriangles = CandidateTriangles;
-			}
-		}
-		FDCMeshRun Run = { (_WORD)Material, 0, (_WORD)DCIndices.Num(), (_WORD)BestIndices.Num() };
-		for( INT i = 0; i < BestIndices.Num(); ++i )
-		{
-			DCIndices.AddItem( BestIndices(i) );
-			DCUVs.AddItem( BestUVs(i) );
-		}
-		for( INT i = 0; i < BestTriangles.Num(); ++i )
-			Used(BestTriangles(i)) = 1;
-		DCRuns.AddItem( Run );
+		DCCookStrips(GetPathName(),LodTriangles,DCLodRuns,DCMaterials,DCLodIndices,DCLodUVs);
+		DCVerifyStripTopology(LodTriangles,DCLodRuns,DCMaterials,DCLodIndices,DCLodUVs);
 	}
 
 	// Store a meshlet ID in the run's formerly reserved word. Meshlets keep
@@ -1249,7 +2004,76 @@ void UMesh::CookDCMesh()
 		DCClusteredRuns = 1;
 	}
 
+	INT LodMeshlets=0;
+	if( DCLodRuns.Num() )
+	{
+		TArray<BYTE> Seen(FrameVerts); appMemset(Seen.GetData(),0,FrameVerts);
+		INT Unique=0;
+		for(INT r=0;r<DCLodRuns.Num();++r)
+		{
+			INT Added=0; TArray<BYTE> Trial=Seen;
+			for(INT v=0;v<DCLodRuns(r).Count;++v) { INT i=DCLodIndices(DCLodRuns(r).First+v); if(!Trial(i)) {Trial(i)=1; ++Added;} }
+			if(Unique+Added>128) { ++LodMeshlets; Unique=0; appMemset(Seen.GetData(),0,FrameVerts); }
+			DCLodRuns(r).Reserved=LodMeshlets;
+			for(INT v=0;v<DCLodRuns(r).Count;++v) { INT i=DCLodIndices(DCLodRuns(r).First+v); if(!Seen(i)) {Seen(i)=1; ++Unique;} }
+		}
+		++LodMeshlets;
+	}
+	if( CookNormals && DCQuantizedNormals && DCFrameOffsets.Num() && FrameVerts<16384 )
+	{
+		const INT Blocks=(FrameVerts+31)/32;
+		DCMeshletBounds.SetNum(MeshletCount);
+		for( INT b=0; b<MeshletCount; ++b ) DCMeshletBounds(b)=FBox(0);
+		DCLodBounds.SetNum(LodMeshlets);
+		for(INT b=0;b<LodMeshlets;++b) DCLodBounds(b)=FBox(0);
+		TArray<FVector> Pose(FrameVerts);
+		for( INT f=0; f<AnimFrames; ++f )
+		{
+			FDCMeshFrameCursor Cursor(*this,f);
+			for( INT v=0; v<FrameVerts; ++v ) Pose(v)=Cursor.Next();
+			for( INT r=0; r<DCRuns.Num(); ++r )
+				for( INT v=0; v<DCRuns(r).Count; ++v )
+					DCMeshletBounds(DCRuns(r).Reserved)+=Pose(DCIndices(DCRuns(r).First+v));
+			for(INT r=0;r<DCLodRuns.Num();++r) for(INT v=0;v<DCLodRuns(r).Count;++v)
+				DCLodBounds(DCLodRuns(r).Reserved)+=Pose(DCLodIndices(DCLodRuns(r).First+v));
+			const INT Start=DCFrameOffsets(f), End=f+1<AnimFrames ? DCFrameOffsets(f+1) : DCFrameWords.Num();
+			INT p=Start;
+			for( INT v=0; v<FrameVerts; ++v )
+			{
+				if( !(v&31) ) DCFrameBlockOffsets.AddItem((_WORD)(p-Start));
+				if( Start==End ) continue;
+				if( p>=End ) appErrorf("Cooked block directory truncated");
+				const _WORD W=DCFrameWords(p++);
+				if( !(v&31) && (!DCTemporalFrames || !(f&7)) && (W&0x8000) )
+					appErrorf("Mesh block does not start independently");
+				if( !(W&0x8000) ) ++p;
+			}
+			DCFrameBlockOffsets.AddItem((_WORD)(p-Start));
+			if( p!=End ) appErrorf("Mesh block directory trailing words");
+		}
+		if( DCFrameBlockOffsets.Num()!=AnimFrames*(Blocks+1) ) appErrorf("Mesh block directory count");
+		for( INT b=0; b<MeshletCount; ++b ) DCMeshletBounds(b)=DCMeshletBounds(b).ExpandBy(0.01f);
+		for(INT b=0;b<LodMeshlets;++b) DCLodBounds(b)=DCLodBounds(b).ExpandBy(0.01f);
+		for(INT f=0;f<AnimFrames;++f)
+		{
+			if(DCTemporalFrames==3 && f+1<AnimFrames && DCFrameOffsets(f)==DCFrameOffsets(f+1)) continue;
+			FDCMeshFrameCursor Full(*this,f);
+			for(INT b=0;b<Blocks;++b)
+			{
+				FMeshVert Decoded[32]; const INT N=Min(32,FrameVerts-b*32), Key=DCTemporalFrames ? f&~7 : f;
+				for(INT k=Key;k<=f;++k)
+				{
+					const INT Begin=DCFrameBlockOffsets(k*(Blocks+1)+b), End=DCFrameBlockOffsets(k*(Blocks+1)+b+1);
+					if(Begin!=End) DCApplyIndependentBlock(&DCFrameWords(DCFrameOffsets(k)+Begin),End-Begin,Decoded,N,k==Key);
+				}
+				for(INT v=0;v<N;++v) if(Decoded[v].Vector()!=Full.Next()) appErrorf("Independent mesh block mismatch: %s",GetPathName());
+			}
+		}
+	}
+	else { DCLodRuns.Empty(); DCLodIndices.Empty(); DCLodUVs.Empty(); DCLodBounds.Empty(); DCLodVerts=0; }
+
 	// Reconstruct and match oriented triangles, UV seams and materials before
+	// Both base and LOD strip searches retain their material/corner identities.
 	// removing the legacy topology. Cyclic corner rotation preserves winding.
 	FMemMark Mark( GMem );
 	INT Count = 0;
@@ -1258,6 +2082,7 @@ void UMesh::CookDCMesh()
 	{
 		appErrorf( "Mesh triangle count mismatch" );
 	}
+	TArray<BYTE> Used(Tris.Num());
 	appMemset( Used.GetData(), 0, Used.Num() );
 	for( INT i = 0; i < Count; ++i )
 	{
@@ -1298,7 +2123,9 @@ void UMesh::CookDCMesh()
 	}
 	INT After = Verts.Num() * 4 + DCFrameWords.Num() * 2 + DCFrameOffsets.Num() * 4
 		+ DCRuns.Num() * 8 + DCMaterials.Num() * 8 + DCIndices.Num() * 4
-		+ DCNormalBlockOffsets.Num() * 4 + DCNormalCompressed.Num();
+		+ DCNormalBlockOffsets.Num() * 4 + DCNormalCompressed.Num()
+		+ DCFrameBlockOffsets.Num()*2 + (DCMeshletBounds.Num()+DCLodBounds.Num())*sizeof(FBox)
+		+ DCLodRuns.Num()*sizeof(FDCMeshRun) + DCLodIndices.Num()*4;
 	printf( "DCMESH %s frames=%i vertices=%i strips=%i indices=%i meshlets=%i normals=%i raw=%i cooked=%i\n",
 		GetPathName(), AnimFrames, FrameVerts, DCRuns.Num(), DCIndices.Num(), MeshletCount,
 		DCNormalCompressed.Num(), Before, After );

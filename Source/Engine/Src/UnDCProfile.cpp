@@ -12,6 +12,7 @@ ENGINE_API INT GDCFrameProfilePage = 0;
 ENGINE_API INT GDCSpanMode = 1;
 ENGINE_API INT GDCStationaryLightHz = 5;
 ENGINE_API UBOOL GDCMeshOIXActive = 0;
+ENGINE_API UBOOL GDCMeshOptimize = 1;
 // Use the integer KOS timer directly; single-only floating point loses
 // microsecond precision when an absolute timestamp is converted to DOUBLE.
 static struct FDCFrameProfile
@@ -213,13 +214,15 @@ ENGINE_API void DCFrameEnd()
 			C[DCFC_LightStaticMiss], C[DCFC_LightStaticInvalidated],
 			C[DCFC_LightCacheCreate], T[DCFS_LightCacheCreate]);
 		appSprintf(GDCFrame.Lines[27], "MESH total %.2f frame %.2f outcode %.2f", T[DCFS_Mesh], T[DCFS_MeshFrame], T[DCFS_MeshOutcode]);
-		appSprintf(GDCFrame.Lines[28], "prepare %.2f texture info %.2f", T[DCFS_MeshPrepare], T[DCFS_MeshTextureInfo]);
+		appSprintf(GDCFrame.Lines[28], "prepare %.2f texinfo %.2f lod %.0f meshlet reject %.0f", T[DCFS_MeshPrepare], T[DCFS_MeshTextureInfo], C[DCFC_MeshLod], C[DCFC_MeshletReject]);
 		appSprintf(GDCFrame.Lines[29], "light setup %.2f vertex %.2f", T[DCFS_MeshLightSetup], T[DCFS_MeshVertexLight]);
 		appSprintf(GDCFrame.Lines[30], "draw+submit %.2f unmeasured %.2f", T[DCFS_MeshDraw],
 			Max(0.f, T[DCFS_Mesh] - T[DCFS_MeshFrame] - T[DCFS_MeshOutcode]
 				- T[DCFS_MeshPrepare] - T[DCFS_MeshTextureInfo]
 				- T[DCFS_MeshLightSetup] - T[DCFS_MeshVertexLight] - T[DCFS_MeshDraw]));
-		appSprintf(GDCFrame.Lines[31], "actors %.0f verts %.0f tris %.0f", C[DCFC_MeshActors], C[DCFC_MeshVerts], C[DCFC_MeshTris]);
+		appSprintf(GDCFrame.Lines[31], "draws %.0f v %.0f t %.0f skip %.0f reuse %.0f pose %.0f",
+			C[DCFC_MeshActors], C[DCFC_MeshVerts], C[DCFC_MeshTris],
+			C[DCFC_MeshPassSkipped], C[DCFC_MeshPreparedReuse], C[DCFC_MeshPoseReuse]);
 		appSprintf(GDCFrame.Lines[32], "visible %.0f strip %.0f fallback %.0f cover %.0f%%",
 			C[DCFC_MeshVisible], C[DCFC_MeshStripTris], C[DCFC_MeshFallbackTris],
 			100.f * C[DCFC_MeshStripTris] / Max(1.f, C[DCFC_MeshStripTris] + C[DCFC_MeshFallbackTris]));
