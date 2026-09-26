@@ -490,6 +490,9 @@ void FDCUtil::InitEngine()
 	|| Parse(appCmdLine(),"IMPORTDC=",DatArg,ARRAY_COUNT(DatArg))
 	|| Parse(appCmdLine(),"CHECKLIGHT=",DatArg,ARRAY_COUNT(DatArg))
 	|| Parse(appCmdLine(),"AUDITBSP=",DatArg,ARRAY_COUNT(DatArg))
+	|| Parse(appCmdLine(),"AUDITSPLIT=",DatArg,ARRAY_COUNT(DatArg))
+	|| Parse(appCmdLine(),"FIXSPLITTRAVEL=",DatArg,ARRAY_COUNT(DatArg))
+	|| Parse(appCmdLine(),"TESTSPLIT=",DatArg,ARRAY_COUNT(DatArg))
 	|| Parse(appCmdLine(),"COOKDAT=",DatArg,ARRAY_COUNT(DatArg))
 	|| Parse(appCmdLine(),"VERIFYDAT=",DatArg,ARRAY_COUNT(DatArg)) )
 		return;
@@ -559,6 +562,9 @@ void FDCUtil::ExitEngine()
 	|| Parse(appCmdLine(),"IMPORTDC=",DatArg,ARRAY_COUNT(DatArg))
 	|| Parse(appCmdLine(),"CHECKLIGHT=",DatArg,ARRAY_COUNT(DatArg))
 	|| Parse(appCmdLine(),"AUDITBSP=",DatArg,ARRAY_COUNT(DatArg))
+	|| Parse(appCmdLine(),"AUDITSPLIT=",DatArg,ARRAY_COUNT(DatArg))
+	|| Parse(appCmdLine(),"FIXSPLITTRAVEL=",DatArg,ARRAY_COUNT(DatArg))
+	|| Parse(appCmdLine(),"TESTSPLIT=",DatArg,ARRAY_COUNT(DatArg))
 	|| Parse(appCmdLine(),"COOKDAT=",DatArg,ARRAY_COUNT(DatArg))
 	|| Parse(appCmdLine(),"VERIFYDAT=",DatArg,ARRAY_COUNT(DatArg));
 	// Every DAT traversal runs in a fresh process. Some original packages have
@@ -931,6 +937,131 @@ static void AuditLightList( UModel* Model, INT Root, TArray<BYTE>& Used, INT& Ro
 	++BadCount;
 }
 
+void FDCUtil::AuditSplit( const char* MapPath, const char* OutPath )
+{
+	guard(FDCUtil::AuditSplit);
+
+	GIsEditor = false;
+	GIsClient = true;
+	GIsServer = true;
+	ULevel* Level = LoadObject<ULevel>( NULL, "MyLevel", MapPath, LOAD_KeepImports | LOAD_NoFail, NULL );
+	check(Level && Level->Model && Level->Model->Nodes && Level->Model->Points
+		&& Level->Model->Surfs && Level->Model->Verts);
+	UModel* Model = Level->Model;
+	FILE* Out = appFopen( OutPath, "w+b" );
+	if( !Out )
+		appErrorf( "Unable to open split audit '%s'", OutPath );
+
+	const INT Zones = Model->Nodes->NumZones;
+	INT ZoneNodes[64] = {0};
+	INT ZoneActors[64] = {0};
+	INT ZoneMovers[64] = {0};
+	INT PortalNodes = 0;
+	INT LiveActors = 0;
+	for( INT i = 0; i < Level->Num(); ++i )
+		LiveActors += Level->Actors(i) != NULL;
+	fprintf( Out, "SUMMARY\tmap=%s\tzones=%d\tnodes=%d\tsurfs=%d\tpoints=%d\tverts=%d\tactors=%d\n",
+		MapPath, Zones, Model->Nodes->Num(), Model->Surfs->Num(),
+		Model->Points->Num(), Model->Verts->Num(), LiveActors );
+	for( INT i = 0; i < Model->Nodes->Num(); ++i )
+	{
+		const FBspNode& Node = Model->Nodes->Element(i);
+		const INT Back = Node.iZone[0];
+		const INT Front = Node.iZone[1];
+		if( Back > 0 && Back < Zones ) ++ZoneNodes[Back];
+		else if( Front > 0 && Front < Zones ) ++ZoneNodes[Front];
+		const FBspSurf* Surf = Node.iSurf >= 0 && Node.iSurf < Model->Surfs->Num()
+			? &Model->Surfs->Element(Node.iSurf) : NULL;
+		const DWORD Flags = Surf ? Surf->PolyFlags : 0;
+		FVector Center(0,0,0);
+		FVector BoundsMin(0,0,0), BoundsMax(0,0,0);
+		INT ValidVerts = 0;
+		if( Node.NumVertices && Node.iVertPool >= 0
+			&& Node.iVertPool + Node.NumVertices <= Model->Verts->Num() )
+		{
+			for( INT j = 0; j < Node.NumVertices; ++j )
+			{
+				const INT Point = Model->Verts->Element(Node.iVertPool + j).pVertex;
+				if( Point >= 0 && Point < Model->Points->Num() )
+				{
+					const FVector& V = Model->Points->Element(Point);
+					Center += V;
+					if( !ValidVerts ) BoundsMin = BoundsMax = V;
+					else
+					{
+						BoundsMin.X = Min(BoundsMin.X,V.X); BoundsMax.X = Max(BoundsMax.X,V.X);
+						BoundsMin.Y = Min(BoundsMin.Y,V.Y); BoundsMax.Y = Max(BoundsMax.Y,V.Y);
+						BoundsMin.Z = Min(BoundsMin.Z,V.Z); BoundsMax.Z = Max(BoundsMax.Z,V.Z);
+					}
+					++ValidVerts;
+				}
+			}
+			if( ValidVerts ) Center /= (FLOAT)ValidVerts;
+		}
+		if( (Flags & PF_Portal) && Back > 0 && Front > 0 && Back != Front )
+			++PortalNodes;
+		fprintf( Out, "NODE\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%08x\t%.1f\t%.1f\t%.1f\t%08x\t%08x\t%.3f\t%.3f\t%.3f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\n",
+			i, Back, Front, Node.iBack, Node.iFront, Node.iPlane,
+			Node.iSurf, Node.NumVertices, Flags, Center.X, Center.Y, Center.Z,
+			(DWORD)(Node.ZoneMask >> 32), (DWORD)Node.ZoneMask,
+			Node.Plane.X, Node.Plane.Y, Node.Plane.Z,
+			BoundsMin.X, BoundsMin.Y, BoundsMin.Z,
+			BoundsMax.X, BoundsMax.Y, BoundsMax.Z );
+	}
+	for( INT i = 0; i < Level->Num(); ++i )
+	{
+		AActor* Actor = Level->Actors(i);
+		if( !Actor ) continue;
+		const INT Zone = Model->PointRegion( Level->GetLevelInfo(), Actor->Location ).ZoneNumber;
+		const UBOOL Mover = Actor->IsA(AMover::StaticClass);
+		if( Zone >= 0 && Zone < Zones )
+		{
+			++ZoneActors[Zone];
+			if( Mover ) ++ZoneMovers[Zone];
+		}
+		const ATeleporter* Teleporter = Cast<ATeleporter>(Actor);
+		const AMover* MoverActor = Cast<AMover>(Actor);
+		const ATrigger* TriggerActor = Cast<ATrigger>(Actor);
+		fprintf( Out, "ACTOR\t%d\t%d\t%s\t%s\t%.1f\t%.1f\t%.1f\t%s\t%s\t%d\t%s\t%s\t%d\t%d\t%d\t%d\n",
+			i, Zone, Actor->GetClassName(), Actor->GetName(),
+			Actor->Location.X, Actor->Location.Y, Actor->Location.Z,
+			*Actor->Tag, *Actor->Event, Mover, Teleporter ? Teleporter->URL : "",
+			*Actor->InitialState,
+			MoverActor ? MoverActor->bTriggerOnceOnly : TriggerActor ? TriggerActor->bTriggerOnceOnly : 0,
+			MoverActor ? MoverActor->NumKeys : 0,
+			Actor->bCollideActors,
+			Actor->IsA(AInventory::StaticClass) ? 1
+				: Actor->IsA(APawn::StaticClass) && !Actor->IsA(APlayerPawn::StaticClass) ? 2
+				: TriggerActor && TriggerActor->bTriggerOnceOnly ? 3 : 0 );
+	}
+	for( INT i = 0; i < Zones && i < 64; ++i )
+	{
+		const FZoneProperties& Zone = Model->Nodes->Zones[i];
+		fprintf( Out, "ZONE\t%d\t%d\t%d\t%d\t%s\t%08x\t%08x\n",
+			i, ZoneNodes[i], ZoneActors[i], ZoneMovers[i],
+			Zone.ZoneActor ? Zone.ZoneActor->GetName() : "",
+			(DWORD)(Zone.Connectivity >> 32), (DWORD)Zone.Connectivity );
+	}
+	appFclose( Out );
+	// Directional authored navigation evidence. A missing link is not proof of
+	// an impassable route; positive links help distinguish a spur from a drop.
+	FILE* ReachOut=appFopen(OutPath,"ab");
+	if( !ReachOut ) appErrorf("AUDITSPLIT cannot append reach audit");
+	for( INT i=0; i<Level->ReachSpecs.Num(); ++i )
+	{
+		const FReachSpec& R=Level->ReachSpecs(i);
+		if( !R.Start || !R.End ) continue;
+		const INT A=Model->PointRegion(Level->GetLevelInfo(),R.Start->Location).ZoneNumber;
+		const INT B=Model->PointRegion(Level->GetLevelInfo(),R.End->Location).ZoneNumber;
+		if( A!=B ) fprintf(ReachOut,"REACH\t%d\t%d\t%d\t%s\t%s\t%d\t%d\t%d\t%d\n",
+			i,A,B,R.Start->GetName(),R.End->GetName(),R.CollisionRadius,R.CollisionHeight,R.reachFlags,R.bPruned);
+	}
+	appFclose(ReachOut);
+	printf( "AUDITSPLIT OK map=%s zones=%d nodes=%d portal_nodes=%d actors=%d output=%s\n",
+		MapPath, Zones, Model->Nodes->Num(), PortalNodes, LiveActors, OutPath );
+	unguard;
+}
+
 void FDCUtil::AuditBsp( const char* MapPath, const char* OutPath )
 {
 	guard(FDCUtil::AuditBsp);
@@ -1228,6 +1359,34 @@ void FDCUtil::Main( )
 			appErrorf( "AUDITBSP requires OUT=<report.tsv>" );
 		AuditBsp( Temp, OutPath );
 	}
+	else if( Parse( Cmd, "AUDITSPLIT=", Temp, sizeof( Temp ) - 1 ) )
+	{
+		char OutPath[2048] = { 0 };
+		if( !Parse( Cmd, "OUT=", OutPath, sizeof( OutPath ) - 1 ) )
+			appErrorf( "AUDITSPLIT requires OUT=<report.tsv>" );
+		AuditSplit( Temp, OutPath );
+	}
+	else if( Parse( Cmd, "FIXSPLITTRAVEL=", Temp, sizeof( Temp ) - 1 ) )
+	{
+		char OutPath[2048]={0};
+		if( !Parse(Cmd,"OUT=",OutPath,sizeof(OutPath)-1) )
+			appErrorf("FIXSPLITTRAVEL requires OUT=<map.unr>");
+		FixSplitTravel(Temp,OutPath);
+	}
+	else if( Parse( Cmd, "TESTSPLIT=", Temp, sizeof( Temp ) - 1 ) )
+	{
+		char OutPath[2048] = { 0 };
+		char Zones[256] = { 0 };
+		char Role[64] = { 0 };
+		const char* RawZones = appStrfind( Cmd, "KEEPZONES=" );
+		if( RawZones && appStrchr( RawZones, ',' ) )
+			appErrorf( "TESTSPLIT KEEPZONES uses '+' separators, not commas" );
+		if( !Parse( Cmd, "OUT=", OutPath, sizeof( OutPath ) - 1 )
+			|| !Parse( Cmd, "KEEPZONES=", Zones, sizeof( Zones ) - 1 ) )
+			appErrorf( "TESTSPLIT requires OUT=<map.unr> KEEPZONES=<zone+zone+...>" );
+		Parse( Cmd, "ROLE=", Role, sizeof( Role ) - 1 );
+		TestSplitBsp( Temp, OutPath, Zones, Role );
+	}
 	else if( Parse( Cmd, "COOKDAT=", Temp, sizeof( Temp ) - 1 ) )
 	{
 		char DatPath[2048] = { 0 };
@@ -1347,6 +1506,9 @@ void FDCUtil::Main( )
 	else
 	{
 		printf( "Usage: DCUtil AUDITBSP=<MAP.UNR> OUT=<REPORT.TSV>\n" );
+		printf( "       DCUtil AUDITSPLIT=<MAP.UNR> OUT=<REPORT.TSV>\n" );
+		printf( "       DCUtil FIXSPLITTRAVEL=<MAP.UNR> OUT=<REPAIRED.UNR>\n" );
+		printf( "       DCUtil TESTSPLIT=<MAP.UNR> OUT=<TEST.UNR> KEEPZONES=<id+id+...>\n" );
 		printf( "       DCUtil COOKDAT=<MAP.UNR> OUT=<MAP.DAT>\n" );
 		printf( "       DCUtil VERIFYDAT=<MAP.UNR> DAT=<MAP.DAT>\n" );
 		printf( "       DCUtil <MAP.UNR> -COOKSESSION OUT=<RAW.DAT> -DEFERMIPS\n" );
@@ -1413,6 +1575,9 @@ int main( int argc, const char** argv )
 			|| Parse( appCmdLine(), "IMPORTDC=", ResourceArg, ARRAY_COUNT(ResourceArg) )
 			|| Parse( appCmdLine(), "CHECKLIGHT=", ResourceArg, ARRAY_COUNT(ResourceArg) )
 			|| Parse( appCmdLine(), "AUDITBSP=", ResourceArg, ARRAY_COUNT(ResourceArg) )
+			|| Parse( appCmdLine(), "AUDITSPLIT=", ResourceArg, ARRAY_COUNT(ResourceArg) )
+			|| Parse( appCmdLine(), "FIXSPLITTRAVEL=", ResourceArg, ARRAY_COUNT(ResourceArg) )
+			|| Parse( appCmdLine(), "TESTSPLIT=", ResourceArg, ARRAY_COUNT(ResourceArg) )
 			|| Parse( appCmdLine(), "COOKDAT=", ResourceArg, ARRAY_COUNT(ResourceArg) )
 			|| Parse( appCmdLine(), "VERIFYDAT=", ResourceArg, ARRAY_COUNT(ResourceArg) )
 			|| ParseParam( appCmdLine(), "COOKSESSION" )

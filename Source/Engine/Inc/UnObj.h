@@ -193,6 +193,9 @@ enum EBspNodeFlags
 	NF_BoxOccluded		= 0x10, // Node's bounding box was occluded.
 	NF_BrightCorners	= 0x10, // Temporary.
 	NF_IsNew 		 	= 0x20, // Editor: Node was newly-added.
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	NF_DC_CsgOnly		= 0x20, // Cooked split map: CSG plane with no drawable polygon.
+#endif
 	NF_IsFront     		= 0x40, // Filter operation bounding-sphere precomputed and guaranteed to be front.
 	NF_IsBack      		= 0x80, // Guaranteed back.
 
@@ -271,7 +274,13 @@ public:
 	// Functions.
 	UBOOL IsCsg( DWORD ExtraFlags=0 ) const
 	{
+#if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+		return (NumVertices>0 || (NodeFlags & NF_DC_CsgOnly))
+			&& !(NodeFlags & (NF_NotCsg | ExtraFlags))
+			&& !(NumVertices>0 && (NodeFlags & NF_IsNew));
+#else
 		return (NumVertices>0) && !(NodeFlags & (NF_IsNew | NF_NotCsg | ExtraFlags));
+#endif
 	}
 	UBOOL ChildOutside( INT iChild, UBOOL Outside, DWORD ExtraFlags=0 ) const
 	{

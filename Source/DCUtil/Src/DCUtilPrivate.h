@@ -25,6 +25,9 @@ private:
 	void CommitChanges();
 	void CookDat( const char* MapPath, const char* DatPath, UBOOL Verify );
 	void AuditBsp( const char* MapPath, const char* OutPath );
+	void AuditSplit( const char* MapPath, const char* OutPath );
+	void FixSplitTravel( const char* MapPath, const char* OutPath );
+	void TestSplitBsp( const char* MapPath, const char* OutPath, const char* Zones, const char* Role );
 #if defined(DC_RESOURCE_COOKER)
 	void ProcessResources( const char* PackagePath, const char* ResourceDir, const char* OutPath );
 #endif

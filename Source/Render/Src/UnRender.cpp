@@ -2052,6 +2052,10 @@ void URender::OccludeBsp( FSceneNode* Frame )
 			for( ;; )
 			{
 				// Note: Can't zone mask reject coplanars due to moving brush rules.
+#if defined(PLATFORM_DREAMCAST)
+				if( Node->NumVertices==0 )
+					goto NextCoplanar; // Cooked split-map collision plane, no polygon.
+#endif
 				Poly		= &GSurfs[Node->iSurf];
 				PolyFlags	= Poly->PolyFlags | ExtraPolyFlags;
 
@@ -2513,8 +2517,16 @@ static void GAddCorona( FSceneNode* Frame, FCoronaLight* CoronaLights, INT& iFre
 				iFree++;
 			if( iFree<MAX_CORONA_LIGHTS )
 			{
+				// Baked BSP light lists can contain light objects that are not
+				// members of the live level actor array. They may still drive
+				// lightmaps, but cannot own a tracked corona actor index.
+				INT iActor=INDEX_NONE;
+				for( INT j=0; j<Light->XLevel->Num(); ++j )
+					if( Light->XLevel->Actors(j)==Light ) { iActor=j; break; }
+				if( iActor==INDEX_NONE )
+					return;
 				CoronaLights[iFree]._Actor = Light;
-				CoronaLights[iFree].iActor = Light->XLevel->GetActorIndex(Light);
+				CoronaLights[iFree].iActor = iActor;
 				CoronaLights[iFree].Bright = Min(1.f,2.f*Delta);
 			}
 		}

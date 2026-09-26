@@ -117,6 +117,11 @@ void AZoneInfo::PostEditChange()
 void AActor::ProcessEvent( UFunction* Function, void* Parms )
 {
 	guardSlow(AActor::ProcessEvent);
+#if defined(PLATFORM_DREAMCAST)
+	extern UBOOL DCTerraniuxHandleRelayEvent( AActor* Actor, UFunction* Function );
+	if( DCTerraniuxHandleRelayEvent(this,Function) )
+		return;
+#endif
 	if( Level->bBegunPlay )
 		Super::ProcessEvent( Function, Parms );
 	unguardSlow;

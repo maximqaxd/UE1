@@ -354,9 +354,43 @@ ENGINE_API void DCReserveMoverBsp( ULevel* Level )
 
 	INT Nodes = 0, Points = 0, Verts = 0;
 	const char* Map = Level->GetParent()->GetName();
-	if( !GetConfigInt(Map, "Nodes", Nodes, "DCMover.ini")
-		|| !GetConfigInt(Map, "Points", Points, "DCMover.ini")
-		|| !GetConfigInt(Map, "Verts", Verts, "DCMover.ini")
+	const char* BudgetMap = !appStricmp(Map,"Dig1") || !appStricmp(Map,"Dig2") ? "Dig"
+		: !appStricmp(Map,"Chizra1") || !appStricmp(Map,"Chizra2") ? "Chizra"
+		: !appStricmp(Map,"DasaCellars1") || !appStricmp(Map,"DasaCellars2") ? "DasaCellars"
+		: !appStricmp(Map,"Ruins1") || !appStricmp(Map,"Ruins2") ? "Ruins" : Map;
+	// The two Terraniux halves were probed independently after collision-BSP
+	// pruning. Keep the shared DCMover.ini unchanged so existing cooked streams
+	// retain their resource fingerprint.
+	const UBOOL Terra1=!appStricmp(Map,"Terraniux1");
+	const UBOOL Terra2=!appStricmp(Map,"Terraniux2");
+	const UBOOL Kran32A=!appStricmp(Map,"IsvKran32A");
+	const UBOOL Kran32B=!appStricmp(Map,"IsvKran32B");
+	const UBOOL SkyTown1=!appStricmp(Map,"SkyTown1");
+	const UBOOL SkyTown2=!appStricmp(Map,"SkyTown2");
+	if( Terra1 || Terra2 )
+	{
+		Nodes=Terra1 ? 1384 : 3148;
+		Points=Terra1 ? 5948 : 13618;
+		Verts=Terra1 ? 10500 : 24648;
+	}
+	if( Kran32A || Kran32B )
+	{
+		// Each pruned half was probed separately. The existing shared budget
+		// file stays unchanged so other cooked streams keep their fingerprint.
+		Nodes=Kran32A ? 3556 : 2802;
+		Points=Kran32A ? 15568 : 11550;
+		Verts=Kran32A ? 28088 : 21916;
+	}
+	if( SkyTown1 || SkyTown2 )
+	{
+		Nodes=SkyTown1 ? 4728 : 1048;
+		Points=SkyTown1 ? 21216 : 4574;
+		Verts=SkyTown1 ? 37492 : 8052;
+	}
+	if( (!(Terra1 || Terra2 || Kran32A || Kran32B || SkyTown1 || SkyTown2)
+			&& (!GetConfigInt(BudgetMap, "Nodes", Nodes, "DCMover.ini")
+				|| !GetConfigInt(BudgetMap, "Points", Points, "DCMover.ini")
+				|| !GetConfigInt(BudgetMap, "Verts", Verts, "DCMover.ini")))
 		|| Nodes <= 0 || Points <= NumMoverPolys || Verts <= 0
 		|| Nodes > 1048576 || Points > 1048576 || Verts > 4194304 )
 		appErrorf( "Missing/invalid measured mover budget for %s", Map );
@@ -423,7 +457,9 @@ FMovingBrushTracker::FMovingBrushTracker( ULevel* ThisLevel )
 	if( Probe && NumMovers )
 	{
 		ExpandDb(Level->Model->Nodes);
+		ExpandDb(Level->Model->Surfs);
 		ExpandDb(Level->Model->Points,16384);
+		ExpandDb(Level->Model->Vectors,16384);
 		ExpandDb(Level->Model->Verts);
 	}
 	else
@@ -1151,7 +1187,11 @@ void FMovingBrushTracker::FilterFPoly
 
 	FilterLoop:
 	Node  = &Level->Model->Nodes->Element(iNode);
-	Surf  = &Level->Model->Surfs->Element(Node->iSurf);
+	// A cooked split keeps opposite-half CSG decision planes for collision,
+	// but removes their drawable surfaces. Movers still filter against those
+	// planes, so never dereference iSurf when it is INDEX_NONE.
+	Surf  = Node->iSurf != INDEX_NONE
+		? &Level->Model->Surfs->Element(Node->iSurf) : NULL;
 
 	if( EdPoly->NumVertices >= FPoly::VERTEX_THRESHOLD )
 	{
@@ -1168,7 +1208,8 @@ void FMovingBrushTracker::FilterFPoly
 #endif
 	SplitResult = EdPoly->SplitWithPlaneFast
 	(
-		FPlane( Level->Model->Points->Element(Surf->pBase), Level->Model->Vectors->Element(Surf->vNormal) ),
+		Surf ? FPlane( Level->Model->Points->Element(Surf->pBase),
+			Level->Model->Vectors->Element(Surf->vNormal) ) : Node->Plane,
 		TempFrontEdPoly,
 		TempBackEdPoly
 	);
@@ -1210,7 +1251,10 @@ void FMovingBrushTracker::FilterFPoly
 		if( Node->NodeFlags & (NF_IsFront | NF_IsBack) )
 			appError("Precompute error 3");
 #endif
-		if( (Level->Model->Vectors->Element(Surf->vNormal) | FPolyNormal) >= 0.0 )
+		const FVector PlaneNormal = Surf
+			? Level->Model->Vectors->Element(Surf->vNormal)
+			: FVector(Node->Plane.X,Node->Plane.Y,Node->Plane.Z);
+		if( (PlaneNormal | FPolyNormal) >= 0.0 )
 			iCoplanarParent = iNode;
 		goto Front;
 	}

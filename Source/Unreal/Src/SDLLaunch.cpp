@@ -226,6 +226,22 @@ UEngine* InitEngine( UBOOL InitializePlatform=1 )
 	appStrncpy( StreamMap, MapName, ARRAY_COUNT(StreamMap) );
 	if( char* Extension = appStrchr(StreamMap,'.') )
 		*Extension = 0;
+	// Browse redirects legacy map names, but the dependency stream must be
+	// opened before Browse runs. Apply the same aliases to startup lookup.
+	if( !appStricmp(StreamMap,"Dig") && appFSize("../Maps/Dig1.dcs")>0 )
+		appStrcpy( StreamMap, "Dig1" );
+	if( !appStricmp(StreamMap,"DasaCellars") && appFSize("../Maps/DasaCellars1.dcs")>0 )
+		appStrcpy( StreamMap, "DasaCellars1" );
+	if( !appStricmp(StreamMap,"Ruins") && appFSize("../Maps/Ruins1.dcs")>0 )
+		appStrcpy( StreamMap, "Ruins1" );
+	if( !appStricmp(StreamMap,"Chizra") && appFSize("../Maps/Chizra1.dcs")>0 )
+		appStrcpy( StreamMap, "Chizra1" );
+	if( !appStricmp(StreamMap,"Terraniux") && appFSize("../Maps/Terraniux1.dcs")>0 )
+		appStrcpy( StreamMap, "Terraniux1" );
+	if( !appStricmp(StreamMap,"IsvKran32") && appFSize("../Maps/IsvKran32A.dcs")>0 )
+		appStrcpy( StreamMap, "IsvKran32A" );
+	if( !appStricmp(StreamMap,"SkyTown") && appFSize("../Maps/SkyTown1.dcs")>0 )
+		appStrcpy( StreamMap, "SkyTown1" );
 	char StreamPath[256];
 	appSprintf( StreamPath, "../Maps/%s.dcs", StreamMap );
 	if( StreamMap[0] && appFSize(StreamPath)>0 )

@@ -216,12 +216,14 @@ void ULevel::LoadDCLightmaps()
 	if( !appDCStreamActive() && appFSize(Filename) <= 0 )
 		return;
 
-	DWORD Header[4];
-	if( !appDCReadDependencyFile(Filename, 0, Header, sizeof(Header))
+	DWORD Header[4] = { 0, 0, 0, 0 };
+	const UBOOL HeaderRead = appDCReadDependencyFile(Filename, 0, Header, sizeof(Header));
+	if( !HeaderRead
 		|| Header[0] != DCLightmapMagic || (Header[1] != 3 && Header[1] != 4)
 		|| Header[2] > 65536 || Header[3] > 16 * 1024 * 1024 )
 	{
-		appErrorf( "Invalid DC lightmap header: %s", Filename );
+		appErrorf( "Invalid DC lightmap header: %s read=%d magic=%08x version=%u entries=%u bytes=%u",
+			Filename, HeaderRead, Header[0], Header[1], Header[2], Header[3] );
 	}
 
 	const UBOOL HasAtlas = Header[1] == 4;

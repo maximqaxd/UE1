@@ -142,6 +142,284 @@ static UBOOL GDCSessionTravel = 0;
 static char GDCSessionURL[DC_SESSION_URL_BYTES] = "";
 static char GDCSessionItems[DC_SESSION_ITEMS_BYTES] = "";
 
+static const char* GDCTerraniuxEvents[] =
+{
+	"lickmer", "fast", "sli", "goh", "sluty", "tremor", "tremor2", "noback"
+};
+static BYTE GDCTerraniuxPending[2][ARRAY_COUNT(GDCTerraniuxEvents)];
+static BYTE GDCTerraniuxEver[ARRAY_COUNT(GDCTerraniuxEvents)];
+static BYTE GDCTerraniuxOpen;
+static const char GDCTerraniuxRelayPrefix[]="DCSplitTerraniuxRelay_";
+static const char* GDCSkyTownEvents[] = { "Barndoors3", "StopAmbient" };
+static BYTE GDCSkyTownPending[ARRAY_COUNT(GDCSkyTownEvents)];
+static const char GDCSkyTownRelayPrefix[]="DCSplitSkyTownRelay_";
+
+static INT DCTerraniuxPart( ULevel* Level )
+{
+	if( !Level ) return INDEX_NONE;
+	const char* Name=Level->GetParent()->GetName();
+	return !appStricmp(Name,"Terraniux1") ? 0
+		: !appStricmp(Name,"Terraniux2") ? 1 : INDEX_NONE;
+}
+
+UBOOL DCTerraniuxHandleRelayEvent( AActor* Actor, UFunction* Function )
+{
+	const char* Name=Actor->GetName();
+	if( Name && !appStrnicmp(Name,GDCSkyTownRelayPrefix,
+		ARRAY_COUNT(GDCSkyTownRelayPrefix)-1) )
+	{
+		if( Function && !appStricmp(Function->GetName(),"Trigger") )
+			for( INT i=0; i<ARRAY_COUNT(GDCSkyTownEvents); ++i )
+				if( Actor->Tag==FName(GDCSkyTownEvents[i]) )
+				{
+					if( GDCSkyTownPending[i]<4 ) ++GDCSkyTownPending[i];
+					debugf("DCSKYTOWN relay event=%s pending=%d",
+						GDCSkyTownEvents[i],GDCSkyTownPending[i]);
+					return 1;
+				}
+		if( Function && !appStricmp(Function->GetName(),"UnTrigger") ) return 1;
+	}
+	if( Name && !appStrnicmp(Name,GDCTerraniuxRelayPrefix,
+		ARRAY_COUNT(GDCTerraniuxRelayPrefix)-1) )
+	{
+		if( Function && !appStricmp(Function->GetName(),"Trigger") )
+		{
+			const INT Part=DCTerraniuxPart(Actor->XLevel);
+			if( Part!=INDEX_NONE )
+				for( INT i=0; i<ARRAY_COUNT(GDCTerraniuxEvents); ++i )
+					if( Actor->Tag==FName(GDCTerraniuxEvents[i]) )
+					{
+						BYTE& Count=GDCTerraniuxPending[1-Part][i];
+						if( Count<4 ) ++Count;
+						if( i==3 || i==4 ) GDCTerraniuxEver[i]=1;
+						debugf("DCTERRA relay map=%s event=%s pending=%d",
+							Actor->XLevel->GetParent()->GetName(),GDCTerraniuxEvents[i],Count);
+						return 1;
+					}
+		}
+		if( Function && !appStricmp(Function->GetName(),"UnTrigger") ) return 1;
+	}
+	return 0;
+}
+
+static void DCTerraniuxCapture( ULevel* Level )
+{
+	if( DCTerraniuxPart(Level)!=1 ) return;
+	for( INT i=0; i<Level->Num(); ++i )
+	{
+		AMover* Mover=Cast<AMover>(Level->Actors(i));
+		if( !Mover || Mover->KeyNum<=0 ) continue;
+		if( Mover->Tag==FName("goh") ) GDCTerraniuxOpen|=1;
+		if( Mover->Tag==FName("sluty") ) GDCTerraniuxOpen|=2;
+	}
+}
+
+static void DCTerraniuxRestore( ULevel* Level )
+{
+	if( DCTerraniuxPart(Level)!=1 || !GDCTerraniuxOpen ) return;
+	for( INT i=0; i<Level->Num(); ++i )
+	{
+		AMover* Mover=Cast<AMover>(Level->Actors(i));
+		if( !Mover || Mover->bHidden ) continue;
+		const INT Bit=Mover->Tag==FName("goh") ? 1
+			: Mover->Tag==FName("sluty") ? 2 : 0;
+		if( !(Bit & GDCTerraniuxOpen) ) continue;
+		Mover->GotoState(NAME_None);
+		Mover->Physics=PHYS_None;
+		Mover->bInterpolating=0;
+		Mover->bOpening=0;
+		Mover->PhysAlpha=0;
+		Mover->KeyNum=Mover->PrevKeyNum=1;
+		Mover->Rotation=Mover->BaseRot+Mover->KeyRot[1];
+		if( !Level->FarMoveActor(Mover,Mover->BasePos+Mover->KeyPos[1],0,1) )
+			appErrorf("DCTERRA could not restore mover %s",Mover->GetName());
+	}
+}
+
+static void DCTerraniuxReplay( ULevel* Level )
+{
+	const INT Part=DCTerraniuxPart(Level);
+	if( Part==INDEX_NONE ) return;
+	for( INT Event=0; Event<ARRAY_COUNT(GDCTerraniuxEvents); ++Event )
+	{
+		INT Count=GDCTerraniuxPending[Part][Event];
+		if( (Event==3 || Event==4) && GDCTerraniuxEver[Event] && Part==1 && Count==0 )
+			Count=1;
+		GDCTerraniuxPending[Part][Event]=0;
+		for( INT Pass=0; Pass<Count; ++Pass )
+			for( INT i=0; i<Level->Num(); ++i )
+			{
+				AActor* Actor=Level->Actors(i);
+				if( !Actor || Actor->bDeleteMe || Actor->Tag!=FName(GDCTerraniuxEvents[Event])
+					|| !appStrnicmp(Actor->GetName(),GDCTerraniuxRelayPrefix,
+						ARRAY_COUNT(GDCTerraniuxRelayPrefix)-1) ) continue;
+				AMover* Mover=Cast<AMover>(Actor);
+				if( Mover && Mover->bTriggerOnceOnly && Mover->KeyNum>0 ) continue;
+				Actor->eventTrigger(NULL,NULL);
+			}
+		if( Count ) debugf("DCTERRA replay map=%s event=%s count=%d",
+			Level->GetParent()->GetName(),GDCTerraniuxEvents[Event],Count);
+	}
+}
+
+static void DCSkyTownReplay( ULevel* Level )
+{
+	if( appStricmp(Level->GetParent()->GetName(),"SkyTown1") ) return;
+	for( INT Event=0; Event<ARRAY_COUNT(GDCSkyTownEvents); ++Event )
+	{
+		const INT Count=GDCSkyTownPending[Event];
+		GDCSkyTownPending[Event]=0;
+		for( INT Pass=0; Pass<Count; ++Pass )
+			for( INT i=0; i<Level->Num(); ++i )
+			{
+				AActor* Actor=Level->Actors(i);
+				if( Actor && !Actor->bDeleteMe && Actor->Tag==FName(GDCSkyTownEvents[Event]) )
+					Actor->eventTrigger(NULL,NULL);
+			}
+		if( Count ) debugf("DCSKYTOWN replay event=%s count=%d",GDCSkyTownEvents[Event],Count);
+	}
+}
+
+// Only semantic, pointer-free state survives a Dreamcast session restart.
+// Keep this deliberately scoped to the experimental split maps: raw actor
+// frames, object references and latent script actions cannot cross appExit.
+enum { DC_CHIZRA_RECORDS = 160, DC_CHIZRA_NAME_BYTES = 48 };
+enum { DC_CHIZRA_PICKUP = 1, DC_CHIZRA_PAWN = 2, DC_CHIZRA_TRIGGER = 3 };
+struct FDCChizraRecord
+{
+	char Name[DC_CHIZRA_NAME_BYTES];
+	BYTE Kind;
+	BYTE Spent;
+};
+struct FDCChizraState
+{
+	UBOOL Initialized;
+	INT Count;
+	FDCChizraRecord Records[DC_CHIZRA_RECORDS];
+};
+static FDCChizraState GDCChizraStates[6];
+static UBOOL GDCChizraBaptistryOpen = 0;
+
+static INT DCChizraPart( ULevel* Level )
+{
+	if( !Level ) return INDEX_NONE;
+	const char* Name = Level->GetParent()->GetName();
+	return !appStricmp(Name,"Chizra1") ? 0 : !appStricmp(Name,"Chizra2") ? 1
+		: !appStricmp(Name,"IsvKran32A") ? 2 : !appStricmp(Name,"IsvKran32B") ? 3
+		: !appStricmp(Name,"SkyTown1") ? 4 : !appStricmp(Name,"SkyTown2") ? 5
+		: INDEX_NONE;
+}
+
+static AActor* DCChizraFindActor( ULevel* Level, const char* Name )
+{
+	for( INT i=0; i<Level->Num(); ++i )
+	{
+		AActor* Actor = Level->Actors(i);
+		if( Actor && !appStricmp(Actor->GetName(),Name) ) return Actor;
+	}
+	return NULL;
+}
+
+static BYTE DCChizraRecordKind( AActor* Actor )
+{
+	if( Actor->IsA(AInventory::StaticClass) ) return DC_CHIZRA_PICKUP;
+	if( Actor->IsA(APawn::StaticClass) && !Actor->IsA(APlayerPawn::StaticClass) )
+		return DC_CHIZRA_PAWN;
+	ATrigger* Trigger = Cast<ATrigger>(Actor);
+	return Trigger && Trigger->bTriggerOnceOnly ? DC_CHIZRA_TRIGGER : 0;
+}
+
+static void DCChizraCapture( ULevel* Level )
+{
+	const INT Part = DCChizraPart(Level);
+	if( Part==INDEX_NONE || !GDCChizraStates[Part].Initialized ) return;
+	FDCChizraState& State = GDCChizraStates[Part];
+	INT NewSpent=0;
+	for( INT i=0; i<State.Count; ++i )
+	{
+		FDCChizraRecord& Record = State.Records[i];
+		if( Record.Spent ) continue;
+		AActor* Actor = DCChizraFindActor(Level,Record.Name);
+		if( !Actor || Actor->bDeleteMe
+			|| (Record.Kind==DC_CHIZRA_PICKUP
+				&& (Cast<AInventory>(Actor)->bHeldItem || Actor->Owner))
+			|| (Record.Kind==DC_CHIZRA_PAWN && Cast<APawn>(Actor)->Health<=0)
+			|| (Record.Kind==DC_CHIZRA_TRIGGER && !Actor->bCollideActors) )
+		{
+			Record.Spent=1;
+			++NewSpent;
+		}
+	}
+	if( Part<2 )
+		for( INT i=0; i<Level->Num(); ++i )
+		{
+			AMover* Mover = Cast<AMover>(Level->Actors(i));
+			if( Mover && Mover->Tag==FName("baptistry") && Mover->KeyNum>0 )
+				GDCChizraBaptistryOpen=1;
+		}
+	debugf("DCCHIZRA save map=%s records=%d new_spent=%d baptistry=%d",
+		Level->GetParent()->GetName(),State.Count,NewSpent,GDCChizraBaptistryOpen);
+}
+
+static void DCChizraRestore( ULevel* Level )
+{
+	const INT Part = DCChizraPart(Level);
+	if( Part==INDEX_NONE ) return;
+	FDCChizraState& State = GDCChizraStates[Part];
+	if( !State.Initialized )
+	{
+		for( INT i=0; i<Level->Num(); ++i )
+		{
+			AActor* Actor = Level->Actors(i);
+			if( !Actor ) continue;
+			const BYTE Kind = DCChizraRecordKind(Actor);
+			if( !Kind ) continue;
+			if( State.Count==DC_CHIZRA_RECORDS
+				|| appStrlen(Actor->GetName())>=DC_CHIZRA_NAME_BYTES )
+				appErrorf("DCCHIZRA actor ledger overflow in %s",Level->GetParent()->GetName());
+			FDCChizraRecord& Record = State.Records[State.Count++];
+			appStrcpy(Record.Name,Actor->GetName());
+			Record.Kind=Kind;
+			Record.Spent=0;
+		}
+		State.Initialized=1;
+	}
+	else
+	{
+		INT Restored=0;
+		for( INT i=0; i<State.Count; ++i )
+		{
+			const FDCChizraRecord& Record = State.Records[i];
+			if( !Record.Spent ) continue;
+			AActor* Actor = DCChizraFindActor(Level,Record.Name);
+			if( !Actor ) continue;
+			if( Record.Kind==DC_CHIZRA_TRIGGER ) Actor->SetCollision(0,0,0);
+			else if( !Level->DestroyActor(Actor) )
+				appErrorf("DCCHIZRA could not restore spent actor %s",Record.Name);
+			++Restored;
+		}
+		debugf("DCCHIZRA restore map=%s records=%d spent=%d",
+			Level->GetParent()->GetName(),State.Count,Restored);
+	}
+	if( Part<2 && GDCChizraBaptistryOpen )
+	{
+		for( INT i=0; i<Level->Num(); ++i )
+		{
+			AMover* Mover = Cast<AMover>(Level->Actors(i));
+			if( !Mover || Mover->Tag!=FName("baptistry") || Mover->bHidden ) continue;
+			Mover->GotoState(NAME_None);
+			Mover->Physics=PHYS_None;
+			Mover->bInterpolating=0;
+			Mover->bOpening=0;
+			Mover->PhysAlpha=0;
+			Mover->KeyNum=Mover->PrevKeyNum=1;
+			Mover->Rotation=Mover->BaseRot+Mover->KeyRot[1];
+			if( !Level->FarMoveActor(Mover,Mover->BasePos+Mover->KeyPos[1],0,1) )
+				appErrorf("DCCHIZRA could not restore baptistry mover %s",Mover->GetName());
+		}
+	}
+}
+
 enum
 {
 	DC_MEMORY_SIM_MAGIC = 0x4443534d,
@@ -173,30 +451,39 @@ void UGameEngine::TickDCMemorySimulation()
 		"Unreal",
 		"Vortex2",
 		"Nyleve",
-		"Dig",
+		"Dig1",
+		"Dig2",
 		"Dug",
 		"Passage",
-		"Chizra",
+		"Chizra1",
+		"Chizra2",
 		"Ceremony",
 		"Dark",
 		"Harobed",
 		"TerraLift",
-		"Terraniux",
+		"Terraniux1",
+		"Terraniux2",
 		"Noork",
-		"Ruins",
+		"Ruins1",
+		"Ruins2",
 		"Trench",
 		"IsvKran4",
-		"IsvKran32",
+		"IsvKran32A",
+		"IsvKran32B",
+		"IsvKran32A",
 		"IsvDeck1",
 		"SpireVillage",
 		"TheSunspire",
 		"SkyCaves",
-		"SkyTown",
+		"SkyTown1",
+		"SkyTown2",
+		"SkyTown1",
 		"SkyBase",
 		"VeloraEnd",
 		"Bluff",
 		"DasaPass",
-		"DasaCellars",
+		"DasaCellars1",
+		"DasaCellars2",
 		"NaliBoat",
 		"NaliC",
 		"NaliLord",
@@ -219,8 +506,9 @@ void UGameEngine::TickDCMemorySimulation()
 	if( appStricmp(ActiveMap, Map) )
 	{
 		appStrncpy( ActiveMap, Map, ARRAY_COUNT(ActiveMap) );
+		const INT PreviousIndex = RouteIndex;
 		RouteIndex = INDEX_NONE;
-		for( INT i = 0; i < ARRAY_COUNT(Route); ++i )
+		for( INT i = PreviousIndex+1; i < ARRAY_COUNT(Route); ++i )
 		{
 			if( !appStricmp(Route[i], Map) )
 			{
@@ -228,6 +516,9 @@ void UGameEngine::TickDCMemorySimulation()
 				break;
 			}
 		}
+		if( RouteIndex == INDEX_NONE )
+			for( INT i = 0; i <= PreviousIndex; ++i )
+				if( !appStricmp(Route[i], Map) ) { RouteIndex=i; break; }
 		if( RouteIndex == INDEX_NONE )
 		{
 			appErrorf( "DCSIM unexpected map %s", Map );
@@ -265,8 +556,10 @@ const char* appDCGetSessionTravelURL()
 	return GDCSessionTravel ? GDCSessionURL : NULL;
 }
 
-static void DCSetSessionTravel( const FURL& URL, const char* TravelItems )
+static void DCSetSessionTravel( ULevel* Level, const FURL& URL, const char* TravelItems )
 {
+	DCChizraCapture(Level);
+	DCTerraniuxCapture(Level);
 	FString URLText;
 	URL.String( URLText );
 	const char* Items = TravelItems ? TravelItems : "";
@@ -375,6 +668,17 @@ void UGameEngine::Init()
 
 	// Init variables.
 	GLevel = NULL;
+#if defined(PLATFORM_DREAMCAST)
+	if( !GDCSessionTravel )
+	{
+		appMemset(GDCChizraStates,0,sizeof(GDCChizraStates));
+		GDCChizraBaptistryOpen=0;
+		appMemset(GDCTerraniuxPending,0,sizeof(GDCTerraniuxPending));
+		appMemset(GDCSkyTownPending,0,sizeof(GDCSkyTownPending));
+		appMemset(GDCTerraniuxEver,0,sizeof(GDCTerraniuxEver));
+		GDCTerraniuxOpen=0;
+	}
+#endif
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
 	GDCGameLinkersReleased = 0;
 	appDCSetLinkerTablesReleased( 0 );
@@ -691,6 +995,24 @@ UBOOL UGameEngine::Browse( FURL URL, char* Error256 )
 	check(Error256);
 	Error256[0]=0;
 	const char* Option;
+#if defined(PLATFORM_DREAMCAST)
+	// Existing campaign teleporters retain their legacy map names. Keep each
+	// portal suffix while routing to the first half of a split map.
+	if( !appStricmp(*URL.Map,"Dig") && appFSize("../Maps/Dig1.dcs")>0 )
+		URL.Map="Dig1";
+	if( !appStricmp(*URL.Map,"DasaCellars") && appFSize("../Maps/DasaCellars1.dcs")>0 )
+		URL.Map="DasaCellars1";
+	if( !appStricmp(*URL.Map,"Ruins") && appFSize("../Maps/Ruins1.dcs")>0 )
+		URL.Map="Ruins1";
+	if( !appStricmp(*URL.Map,"Chizra") && appFSize("../Maps/Chizra1.dcs")>0 )
+		URL.Map="Chizra1";
+	if( !appStricmp(*URL.Map,"Terraniux") && appFSize("../Maps/Terraniux1.dcs")>0 )
+		URL.Map="Terraniux1";
+	if( !appStricmp(*URL.Map,"IsvKran32") && appFSize("../Maps/IsvKran32A.dcs")>0 )
+		URL.Map="IsvKran32A";
+	if( !appStricmp(*URL.Map,"SkyTown") && appFSize("../Maps/SkyTown1.dcs")>0 )
+		URL.Map="SkyTown1";
+#endif
 
 	// Crack the URL.
 	FString UrlStr;
@@ -1238,6 +1560,14 @@ ULevel* UGameEngine::LoadMap( const FURL& URL, UPendingLevel* Pending, char* Err
 	Actors.Empty();
 	unguard;
 
+#if defined(PLATFORM_DREAMCAST)
+	// Scripts have initialized their movers and pickups, but the moving-brush
+	// tracker and arriving player are not yet present. Restore semantic state
+	// here so the tracker builds collision from the final keyframe.
+	DCChizraRestore(GLevel);
+	DCTerraniuxRestore(GLevel);
+#endif
+
 	// Cleanup profiling.
 #if DO_SLOW_GUARD
 	guard(CleanupProfiling);
@@ -1301,6 +1631,10 @@ ULevel* UGameEngine::LoadMap( const FURL& URL, UPendingLevel* Pending, char* Err
 	unguard;
 
 	// Successfully started local level.
+#if defined(PLATFORM_DREAMCAST)
+	DCTerraniuxReplay(GLevel);
+	DCSkyTownReplay(GLevel);
+#endif
 	return GLevel;
 	unguard;
 }
@@ -1563,7 +1897,7 @@ void UGameEngine::Tick( FLOAT DeltaSeconds )
 				const char* SessionItems = "";
 				if( Client && Client->Viewports.Num() )
 					SessionItems = *Client->Viewports(0)->TravelItems;
-				DCSetSessionTravel( SessionURL, SessionItems );
+				DCSetSessionTravel( GLevel, SessionURL, SessionItems );
 				*GLevel->GetLevelInfo()->NextURL = 0;
 				GIsRunning = 0;
 				return;
@@ -1591,7 +1925,7 @@ void UGameEngine::Tick( FLOAT DeltaSeconds )
 		FURL SessionURL( &LastURL, *NextURL, TravelType );
 		if( DCCanRestartTravel(SessionURL) )
 		{
-			DCSetSessionTravel( SessionURL, *Client->Viewports(0)->TravelItems );
+			DCSetSessionTravel( GLevel, SessionURL, *Client->Viewports(0)->TravelItems );
 			GIsRunning = 0;
 			return;
 		}

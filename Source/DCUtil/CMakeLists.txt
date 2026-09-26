@@ -1,6 +1,6 @@
 project(DCUtil)
 
-set(SRC_FILES "Src/Main.cpp" "Src/Texture.cpp" "Src/Resources.cpp")
+set(SRC_FILES "Src/Main.cpp" "Src/Texture.cpp" "Src/Resources.cpp" "Src/SplitBsp.cpp")
 
 add_executable(${PROJECT_NAME} ${SRC_FILES})
 
