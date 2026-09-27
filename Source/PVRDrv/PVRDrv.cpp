@@ -539,6 +539,7 @@ UPVRRenderDevice::UPVRRenderDevice()
 {
 	NoFiltering = false;
 	UseTriStrips = true;
+	ShinySurfaces = false;
 	UseVQDynamicLightmaps = true;
 	// CPU culling avoids lighting and submitting hidden faces. The PVR's
 	// backface test occurs only after those costs have already been paid.
@@ -816,6 +817,7 @@ void UPVRRenderDevice::Lock( FPlane FlashScale, FPlane FlashFog, FPlane ScreenCl
 	UIZCursor = 0.f;
 
 	pvr_set_bg_color( 0.f, 0.f, 0.f );
+	if( TextureFrame <= 2 ) debugf("DCFIRST scene begin frame=%u", (unsigned)TextureFrame);
 	pvr_scene_begin();
 
 	PVRStartList( PVR_LIST_OP_POLY );
@@ -898,7 +900,9 @@ void UPVRRenderDevice::Unlock( UBOOL Blit )
 			debugf( "PVR: TA VERTEX BUFFER FULL (Pos=%u End=%u) - geometry being dropped!", (unsigned)Pos, (unsigned)End );
 	}
 
+	if( TextureFrame <= 2 ) debugf("DCFIRST scene finish frame=%u", (unsigned)TextureFrame);
 	pvr_scene_finish();
+	if( TextureFrame <= 2 ) debugf("DCFIRST scene finished frame=%u", (unsigned)TextureFrame);
 
 	if( TextureFrame % 300 == 0 )
 		PrintTextureCPUProfile( 300 );
@@ -936,6 +940,7 @@ pvr_list_t UPVRRenderDevice::ListFor( DWORD PolyFlags ) const
 // Compile and emit a polygon header, skipping it when the previous primitive
 // in this list already established the same state.
 //
+SHZ_NO_INLINE __attribute__((noclone))
 void UPVRRenderDevice::EmitHeader( pvr_list_t List, DWORD PolyFlags, const FTexState* Tex, UBOOL NoDepth, pvr_cull_mode_t Cull )
 {
 	const DWORD StateBits =
@@ -1044,6 +1049,13 @@ void UPVRRenderDevice::EmitHeader( pvr_list_t List, DWORD PolyFlags, const FTexS
 	{
 		Cxt.blend.src = PVR_BLEND_ZERO;
 		Cxt.blend.dst = PVR_BLEND_ZERO;
+	}
+	else if( List == PVR_LIST_PT_POLY )
+	{
+		// Keep KOS' punch-through blend state: transparent cutout texels must
+		// preserve the background rather than overwrite it with their RGB.
+		Cxt.blend.src = PVR_BLEND_SRCALPHA;
+		Cxt.blend.dst = PVR_BLEND_INVSRCALPHA;
 	}
 	else if( List == PVR_LIST_TR_POLY )
 	{
@@ -1855,12 +1867,10 @@ void UPVRRenderDevice::SetSceneNode( FSceneNode* Frame )
 		AActor* ZoneActor = Frame->Level->Model->Nodes->Zones[Frame->ZoneNumber].ZoneActor;
 		CurrentSceneNode.bIsSky = ( Cast<ASkyZoneInfo>( ZoneActor ) != NULL );
 	}
-	// Sky has an explicit opening mask now. Restore the previously visible
-	// 2^-24 range, once at final submission (also covers sky sprites/meshes).
+	// Scale sky depth once at final submission, including sprites and meshes.
 	if( CurrentSceneNode.bIsSky )
 	{
-		// Route sky vertices through depth scaling, but only clip against
-		// genuine ancestor mirrors, never individual fake-backdrop pieces.
+		// Only genuine ancestor mirrors restrict the sky opening.
 		GPVRMirrorFrame=Frame;
 		GPVRMirrorDepthScale=1.f/16777216.f;
 	}

@@ -13,6 +13,8 @@
 #include <string.h>
 #include <stdarg.h>
 #include <kos/thread.h>
+#include <dc/biosfont.h>
+#include <dc/pvr/pvr_regs.h>
 #define MAIN_STACK_SIZE (32 * 1024)  
 #ifdef DREAMCAST_USE_FATFS
 extern "C" {
@@ -59,6 +61,41 @@ static void init_thread_stack(void) {
             current->flags |= THD_OWNS_STACK;
         }
     }
+}
+
+static BYTE DCCrashGlyphs[95][36];
+
+static void DCInitCrashGlyphs()
+{
+	for( INT Ch=32; Ch<127; ++Ch )
+		memcpy(DCCrashGlyphs[Ch-32], bfont_find_char(Ch), 36);
+}
+
+// Exception context cannot use the BIOS font renderer: it polls a scheduler
+// lock. Use the startup copy of its glyphs and ordinary framebuffer stores.
+static void DCExceptionScreen(const char* Text)
+{
+	PVR_SET(PVR_RESET, PVR_RESET_TA | PVR_RESET_ISPTSP);
+	PVR_SET(PVR_RESET, PVR_RESET_NONE);
+	vid_set_mode(DM_640x480, PM_RGB565);
+	volatile uint16_t* Pixels = vram_s;
+	for( INT i=0; i<640*480; ++i ) Pixels[i]=0;
+	INT X=16, Y=16;
+	for( ; *Text && Y+24<=480; ++Text )
+	{
+		if( *Text=='\n' ) { X=16; Y+=24; continue; }
+		if( X+12>624 ) { X=16; Y+=24; }
+		if( Y+24>480 ) break;
+		const BYTE* Glyph=DCCrashGlyphs[(*Text>=32 && *Text<127 ? *Text : '?')-32];
+		for( INT Row=0; Row<24; ++Row )
+		{
+			const BYTE* Pair=Glyph+(Row/2)*3;
+			const INT Bits=(Row&1) ? ((Pair[1]&15)<<8)|Pair[2] : (Pair[0]<<4)|(Pair[1]>>4);
+			for( INT Col=0; Col<12; ++Col )
+				Pixels[(Y+Row)*640+X+Col]=(Bits & (0x800>>Col)) ? 0xffff : 0;
+		}
+		X+=12;
+	}
 }
 
 static void DCCrashConsole()
@@ -117,18 +154,14 @@ void HandleAssertFail( const char* File, int Line, const char* Expr, const char*
 
 void HandleIrqException( irq_t Code, irq_context_t* Context, void* Data )
 {
-	// Report twice: once over dcload/serial if it is attached, then again on
-	// the television, which is the only output a stock console has. The
-	// registers are captured before the first print so the framebuffer switch
-	// cannot lose them if it misbehaves.
-	for( INT Pass = 0; Pass < 2; ++Pass )
-	{
-		if( Pass )
-			DCCrashConsole();
-		printf( "UNHANDLED EXCEPTION 0x%08x\n", Code );
-		printf( "PC: %p PR: %p\n", (void*)Context->pc, (void*)Context->pr );
-		printf( "SR: %p R0: %p\n", (void*)Context->sr, (void*)Context->r[0] );
-	}
+	char Report[1024];
+	INT Used=snprintf(Report,sizeof(Report),"UNHANDLED EXCEPTION %08lx\nPC: %08lx PR: %08lx\nSR: %08lx\n",
+		(unsigned long)Code,(unsigned long)Context->pc,(unsigned long)Context->pr,(unsigned long)Context->sr);
+	for( INT i=0; i<16; i+=2 )
+		Used+=snprintf(Report+Used,sizeof(Report)-Used,"R%02i: %08lx R%02i: %08lx\n",
+			i,(unsigned long)Context->r[i],i+1,(unsigned long)Context->r[i+1]);
+	printf("%s",Report);
+	DCExceptionScreen(Report);
 
 	// The exception may have followed memory corruption, so the interrupted
 	// frame pointer cannot be trusted. Walking it can replace the original
@@ -235,6 +268,8 @@ UEngine* InitEngine( UBOOL InitializePlatform=1 )
 	if( StreamMap[0] && appFSize(StreamPath)>0 )
 	{
 		appDCStreamOpen( StreamPath );
+		if( PendingURL && appStrstr(PendingURL, "?load=") )
+			appDCStreamUseIndexedReads();
 		debugf( "DCSESSION startup_stream=%s", StreamPath );
 	}
 	else
@@ -382,6 +417,7 @@ int main( int argc, const char** argv )
 		}
 	}
 	assert_set_handler( HandleAssertFail );
+	DCInitCrashGlyphs();
 	irq_set_handler( EXC_UNHANDLED_EXC, HandleIrqException, nullptr );
 #ifdef DREAMCAST_USE_FATFS
 	if( fs_fat_mount_sd() == 0 )

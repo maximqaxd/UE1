@@ -8,6 +8,7 @@ static pvr_vertex_t GPVRMirrorScratch __attribute__((aligned(32)));
 
 static DWORD PVRMirrorColor(DWORD A, DWORD B, FLOAT T)
 {
+	if( A==B ) return A;
 	DWORD Result=0;
 	for( INT Shift=0; Shift<32; Shift+=8 )
 	{

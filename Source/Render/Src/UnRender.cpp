@@ -8,6 +8,9 @@
 
 #include "RenderPrivate.h"
 #include "UnDCFrameProfile.h"
+#if defined(PLATFORM_DREAMCAST)
+static UBOOL GDCFirstWorldFrame = 1;
+#endif
 #if defined(DC_RESOURCE_COOKER)
 #include <zlib.h>
 #endif
@@ -159,6 +162,9 @@ void URender::InternalClassInitializer( UClass* Class )
 void URender::Init( UEngine* InEngine )
 {
 	guard(URender::Init);
+#if defined(PLATFORM_DREAMCAST)
+	GDCFirstWorldFrame = 1;
+#endif
 
 	// Call base.
 	URenderBase::Init( InEngine );
@@ -1845,6 +1851,9 @@ void Traverse( FSceneNode* Frame, INT iNode )
 }
 
 
+#if defined(PLATFORM_DREAMCAST)
+__attribute__((optimize(DC_TRAVERSAL_OPT)))
+#endif
 void URender::OccludeBsp( FSceneNode* Frame )
 {
 #if defined(PLATFORM_DREAMCAST)
@@ -2282,9 +2291,17 @@ void URender::OccludeBsp( FSceneNode* Frame )
 				{
 					// Handle mirrored surface.
 					guard(HandleMirrorWarp);
+#if defined(PLATFORM_DREAMCAST)
+					if( !RenDev->ShinySurfaces )
+#else
 					if( (PolyFlags & PF_Translucent) && !RenDev->ShinySurfaces )
+#endif
 					{
+#if defined(PLATFORM_DREAMCAST)
+						PolyFlags &= ~(PF_Translucent|PF_Mirrored|PF_Invisible);
+#else
 						PolyFlags &= ~PF_Translucent;
+#endif
 						PolyFlags |= PF_Occlude;
 						DrawBin = 1;
 						goto DrawIt;
@@ -3058,7 +3075,13 @@ void URender::DrawWorld( FSceneNode* Frame )
 
 	// Occlude once. Ordered-list devices submit the retained frame separately
 	// to OP, PT and TR; every list is then written directly to the TA.
+#if defined(PLATFORM_DREAMCAST)
+	if( GDCFirstWorldFrame ) debugf("DCFIRST visibility begin");
+#endif
 	OccludeFrame( Frame );
+#if defined(PLATFORM_DREAMCAST)
+	if( GDCFirstWorldFrame ) debugf("DCFIRST visibility complete");
+#endif
 
 	// Draw the player's weapon on top.
 	APawn* Actor
@@ -3094,6 +3117,9 @@ void URender::DrawWorld( FSceneNode* Frame )
 		}
 		#endif
 		DrawFrame( Frame );
+#if defined(PLATFORM_DREAMCAST)
+		if( GDCFirstWorldFrame ) debugf("DCFIRST world pass=%d complete", OrderedPass);
+#endif
 		if( DrawWeapon )
 		{
 			Actor->Weapon->bHidden = 0;
@@ -3110,6 +3136,10 @@ void URender::DrawWorld( FSceneNode* Frame )
 	DynMark.Pop();
 	SceneMark.Pop();
 	VectorMark.Pop();
+#if defined(PLATFORM_DREAMCAST)
+	if( GDCFirstWorldFrame ) debugf("DCFIRST world complete");
+	GDCFirstWorldFrame = 0;
+#endif
 	unguard;
 }
 

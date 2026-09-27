@@ -14,6 +14,19 @@ set(SRC_FILES
 
 add_library(${PROJECT_NAME} ${LIB_TYPE} ${SRC_FILES})
 
+set(DREAMCAST_TRAVERSAL_OPT "O3" CACHE STRING "OccludeBsp optimization: O3, O2 or Os")
+set(DREAMCAST_MESH_DRAW_OPT "O3" CACHE STRING "DrawMesh optimization: O3, O2 or Os")
+foreach(OPTION DREAMCAST_TRAVERSAL_OPT DREAMCAST_MESH_DRAW_OPT)
+  if(NOT "${${OPTION}}" MATCHES "^(O3|O2|Os)$")
+    message(FATAL_ERROR "${OPTION} must be O3, O2 or Os")
+  endif()
+endforeach()
+if(TARGET_IS_DREAMCAST)
+  target_compile_definitions(${PROJECT_NAME} PRIVATE
+    DC_TRAVERSAL_OPT="${DREAMCAST_TRAVERSAL_OPT}"
+    DC_MESH_DRAW_OPT="${DREAMCAST_MESH_DRAW_OPT}")
+endif()
+
 if(TARGET_IS_DREAMCAST AND NOT (CMAKE_BUILD_TYPE STREQUAL "Debug"))
   # Keep the large hot loops at -O3 without growing every engine object.
   # UnLight already required an override: compiling it with -Os breaks lightmaps.
