@@ -632,9 +632,11 @@ inline FPlane FLightManager::LightInternal( FTransSample& Vert, DWORD PolyFlags,
 					Color += Light->FloatColor * G;
 			}
 		}
+#if DC_FRAME_PROFILE
 		if( Counters )
 		{ Counters[0]+=LightPairs; Counters[1]+=RadiusRejects; Counters[2]+=LightEvaluations; }
 		else DCFrameMeshLightStats( LightPairs, RadiusRejects, LightEvaluations );
+#endif
 #else
 		for( FLightInfo* Light=FirstLight; Light<LastLight; Light++ )
 		{
@@ -1834,11 +1836,20 @@ void FLightManager::SetupForSurf
 		FogMap.VSize			= FogMip.VSize;
 		FogMap.TextureFlags		= TF_RealtimeChanged;
 		FogMap.CacheID			= MakeCacheID( CID_RenderFogMap, iLightMap, ZoneID, Model );
+#if defined(PLATFORM_DREAMCAST)
+		// Fog is camera dependent. Keep each view's upload alive until the TA
+		// consumes the entire scene, instead of overwriting a reflection's fog.
+		check(Model->GetIndex()<0x1000000);
+		FogMap.CacheID |= (QWORD)Frame->DCViewId << 56;
+#endif
 
 		// Setup the volumetrics.
 		FogMip.DataPtr = New<BYTE>(GMem,FogMap.USize*FogMap.VSize*sizeof(DWORD)+sizeof(FColor));
 		FogMap.MaxColor = (FColor*)FogMip.DataPtr; FogMip.DataPtr += sizeof(FColor);
 		*FogMap.MaxColor = FColor(255,255,255,255);
+		// If all candidate lights are rejected, the fog must be transparent,
+		// not stale scratch contents from another surface.
+		appMemset(FogMip.DataPtr, 0, FogMap.USize*FogMap.VSize*sizeof(FColor));
 		unguard;
 		
 		// Merge the volumetrics.
@@ -2072,7 +2083,16 @@ void FLightManager::SetupForSurf
 		{
 			DC_FRAME_COUNT(DCFC_LightCacheCreate);
 			DC_FRAME_SCOPE(DCFS_LightCacheCreate);
+#if defined(PLATFORM_DREAMCAST)
+			Stream = (DWORD*)GCache.TryCreate( LightMap.CacheID, TopItemToUnlock[-1], (LightMap.USize*LightMap.VClamp) * sizeof(DWORD) + sizeof(FColor) + sizeof(FMoverStamp), DEFAULT_ALIGNMENT, LightMap.USize*(LightMap.VSize-LightMap.VClamp) );
+			if(!Stream)
+			{
+				--TopItemToUnlock; // Failed allocation acquired no cache lock.
+				Stream=(DWORD*)New<BYTE>(GMem,LightMap.USize*LightMap.VSize*sizeof(DWORD)+sizeof(FColor)+sizeof(FMoverStamp),DEFAULT_ALIGNMENT);
+			}
+#else
 			Stream = (DWORD*)GCache.Create( LightMap.CacheID, TopItemToUnlock[-1], (LightMap.USize*LightMap.VClamp) * sizeof(DWORD) + sizeof(FColor) + sizeof(FMoverStamp), DEFAULT_ALIGNMENT, LightMap.USize*(LightMap.VSize-LightMap.VClamp) );
+#endif
 		}
 		if( Mover )
 		{
@@ -2161,7 +2181,17 @@ void FLightManager::SetupForSurf
 				{
 					DC_FRAME_COUNT(DCFC_LightCacheCreate);
 					DC_FRAME_SCOPE(DCFS_LightCacheCreate);
+#if defined(PLATFORM_DREAMCAST)
+					Stream = (DWORD*)GCache.TryCreate( LightMap.CacheID, TopItemToUnlock[-1], (LightMap.USize*LightMap.VClamp + 3) * sizeof(DWORD), DEFAULT_ALIGNMENT, LightMap.USize*(LightMap.VSize-LightMap.VClamp) );
+					if(!Stream)
+					{
+						--TopItemToUnlock;
+						// Surface Mark owns this until FinishSurf, including padding.
+						Stream=New<DWORD>(GMem,LightMap.USize*LightMap.VSize+3,DEFAULT_ALIGNMENT);
+					}
+#else
 					Stream = (DWORD*)GCache.Create( LightMap.CacheID, TopItemToUnlock[-1], (LightMap.USize*LightMap.VClamp + 3) * sizeof(DWORD), DEFAULT_ALIGNMENT, LightMap.USize*(LightMap.VSize-LightMap.VClamp) );
+#endif
 				}
 				*(DOUBLE*)Stream = DynamicLightTime;
 				Stream += 2;

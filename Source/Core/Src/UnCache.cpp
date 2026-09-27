@@ -442,7 +442,8 @@ BYTE* FMemCache::Create
 	FCacheItem*&	Item, 
 	INT				CreateSize, 
 	INT				Alignment,
-	INT				SafetyPad
+	INT				SafetyPad,
+	UBOOL           AllowFailure
 )
 {
 	guard(FMemCache::Create);
@@ -492,6 +493,12 @@ BYTE* FMemCache::Create
 	// See if we found a suitable place to put the item.
 	if( BestFirst == NULL )
 	{
+		if( AllowFailure )
+		{
+			Item = NULL;
+			uunclock(CreateCycles);
+			return NULL;
+		}
 		// Critical error: the item can't fit in the cache.
 		INT ItemsLocked=0, Bytes=0, BytesLocked=0;
 		for(FCacheItem* Last=CacheItems; Last!=LastItem; Last=Last->LinearNext )

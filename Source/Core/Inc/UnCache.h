@@ -75,7 +75,12 @@ public:
     void Init( INT BytesToAllocate, INT MaxItems, void* Start=NULL, INT SegSize=0 );
 	void Exit( INT FreeMemory );
 	void Flush( QWORD Id=0, DWORD Mask=~0, UBOOL IgnoreLocked=0 );
-	BYTE* Create( QWORD Id, FCacheItem *&Item, INT CreateSize, INT Alignment=DEFAULT_ALIGNMENT, INT SafetyPad=0 );
+	BYTE* Create( QWORD Id, FCacheItem *&Item, INT CreateSize, INT Alignment=DEFAULT_ALIGNMENT, INT SafetyPad=0, UBOOL AllowFailure=0 );
+	// Failure leaves the cache untouched and returns a null (unlocked) Item.
+	BYTE* TryCreate( QWORD Id, FCacheItem *&Item, INT CreateSize, INT Alignment=DEFAULT_ALIGNMENT, INT SafetyPad=0 )
+	{
+		return Create(Id,Item,CreateSize,Alignment,SafetyPad,1);
+	}
 	void Tick();
 	void CheckState();
 	UBOOL Exec( const char* Cmd, FOutputDevice* Out=GSystem );
