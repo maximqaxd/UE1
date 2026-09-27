@@ -14,24 +14,13 @@
 // A span buffer linked-list entry representing a free (undrawn) 
 // portion of a scanline. 
 //
-#if defined(PLATFORM_DREAMCAST) && DC_COMPACT_SPANS
-#include <sh4zam/shz_cdefs.h>
-#define DC_SPAN_ALIGN 8
-#define DC_SPAN_POOL_ALIGN 32
-class SHZ_ALIGNAS(8) FSpan
-#else
 #define DC_SPAN_ALIGN 4
 #define DC_SPAN_POOL_ALIGN 4
 class FSpan
-#endif
 {
 public:
 	// Variables.
-#if defined(PLATFORM_DREAMCAST) && DC_COMPACT_SPANS
-	SWORD Start, End;
-#else
 	INT Start, End;
-#endif
 	FSpan* Next;
 
 	// Constructors.
@@ -42,9 +31,6 @@ public:
 	,	End			(InEnd)
 	{}
 };
-#if defined(PLATFORM_DREAMCAST) && DC_COMPACT_SPANS
-static_assert(sizeof(FSpan)==8,"Compact spans must fit four per cache line");
-#endif
 
 //
 // A raster span.

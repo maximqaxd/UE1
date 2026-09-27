@@ -925,14 +925,8 @@ struct FDCPipePoolScope
 };
 static SHZ_NO_INLINE __attribute__((cold)) void DCRefillPipePoints(FMemStack& Mem)
 {
-#if DC_ALIGNED_TRANSFORMS
-		struct SHZ_ALIGNAS(32) FPipeBlock { FTransform Points[32]; };
-		static_assert(sizeof(FTransform)==32,"BSP transform stride changed");
-		DCPipePool=New<FPipeBlock>(Mem,1,32)->Points;
-#else
-		DCPipePool=New<FTransform>(Mem,32);
-#endif
-		DCPipeRemaining=32;
+	DCPipePool=New<FTransform>(Mem,32);
+	DCPipeRemaining=32;
 }
 static FTransform* DCAllocPipePoint(FMemStack& Mem)
 {
@@ -1337,7 +1331,7 @@ FRasterSpan HackRaster[1200];//max y res 1200!!
 #endif
 INT RasterStartY, RasterEndY, RasterStartX, RasterEndX;
 #if defined(PLATFORM_DREAMCAST)
-__attribute__((optimize(DC_BSP_SMALL_CODE),noinline))
+SHZ_NO_INLINE
 #endif
 static UBOOL SetupRaster( FTransform** Pts, INT NumPts, FSpanBuffer* Span, INT EndY )
 {
@@ -1467,7 +1461,7 @@ void URender::GetVisibleSurfs( UViewport* Viewport, TArray<INT>& iSurfs )
 // total occlusion, 1 if all or partial visibility.
 //
 #if defined(PLATFORM_DREAMCAST)
-__attribute__((optimize(DC_BSP_SMALL_CODE),noinline))
+SHZ_NO_INLINE
 #endif
 UBOOL URender::BoundVisible
 (
@@ -1851,9 +1845,6 @@ void Traverse( FSceneNode* Frame, INT iNode )
 }
 
 
-#if defined(PLATFORM_DREAMCAST)
-__attribute__((optimize(DC_TRAVERSAL_OPT)))
-#endif
 void URender::OccludeBsp( FSceneNode* Frame )
 {
 #if defined(PLATFORM_DREAMCAST)

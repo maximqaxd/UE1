@@ -653,9 +653,6 @@ INT Compare( const FTransform* A, const FTransform* B )
 
 // Draw a mesh map.
 //
-#if defined(PLATFORM_DREAMCAST)
-__attribute__((optimize(DC_MESH_DRAW_OPT)))
-#endif
 void URender::DrawMesh
 (
 	FSceneNode*		Frame,

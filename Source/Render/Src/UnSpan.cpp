@@ -98,10 +98,6 @@ void FSpanBuffer::AllocIndex( int AllocStartY, int AllocEndY, FMemStack* MemStac
 void FSpanBuffer::AllocIndexForScreen( INT SXR, INT SYR, FMemStack* MemStack )
 {
     guard(FSpanBuffer::AllocIndexForScreen);
-#if defined(PLATFORM_DREAMCAST) && DC_COMPACT_SPANS
-    if(SXR<0 || SXR>32767 || SYR<0 || SYR>32767)
-        appErrorf("Compact span viewport out of range: %dx%d",SXR,SYR);
-#endif
     int  i;
 
     Mem     = MemStack;

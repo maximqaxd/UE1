@@ -57,17 +57,8 @@ option(DREAMCAST_BUILD_CDI "Create CDI image after building (uses mkdcdisc)" OFF
 option(DREAMCAST_PROFILE_OVERLAY "Compile the Dreamcast on-screen profiling overlay" OFF)
 option(DREAMCAST_FRAME_PROFILE "Compile Dreamcast frame profiling hooks and counters" OFF)
 option(DREAMCAST_LEGACY_STATS "Compile legacy renderer statistics" OFF)
-option(DREAMCAST_COMPACT_SPANS "Use checked-screen-domain 8-byte Dreamcast spans" OFF)
-option(DREAMCAST_ALIGNED_TRANSFORMS "Align BSP transform blocks and prefetch cached results" OFF)
-set(DREAMCAST_BSP_SMALL_CODE "O3" CACHE STRING "Bounds/raster function optimization: O3, O2 or Os")
-if(NOT DREAMCAST_BSP_SMALL_CODE MATCHES "^(O3|O2|Os)$")
-  message(FATAL_ERROR "DREAMCAST_BSP_SMALL_CODE must be O3, O2 or Os")
-endif()
 if(PLATFORM_DREAMCAST)
   add_compile_definitions(STATS=$<BOOL:${DREAMCAST_LEGACY_STATS}>)
-  add_compile_definitions(DC_COMPACT_SPANS=$<BOOL:${DREAMCAST_COMPACT_SPANS}>
-    DC_ALIGNED_TRANSFORMS=$<BOOL:${DREAMCAST_ALIGNED_TRANSFORMS}>
-    DC_BSP_SMALL_CODE="${DREAMCAST_BSP_SMALL_CODE}")
 endif()
 if(PLATFORM_DREAMCAST)
   add_compile_definitions(DC_FRAME_PROFILE=$<BOOL:${DREAMCAST_FRAME_PROFILE}>)
