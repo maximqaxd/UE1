@@ -6,6 +6,32 @@
 
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
 
+const char* appDCResolveCampaignMap( const char* Map )
+{
+	static const char* const Aliases[][2] = {
+		{"Dig","Dig1"}, {"DasaCellars","DasaCellars1"}, {"Ruins","Ruins1"},
+		{"Chizra","Chizra1"}, {"Terraniux","Terraniux1"},
+		{"IsvKran32","IsvKran32A"}, {"SkyTown","SkyTown1"}
+	};
+	const char* Base=Map;
+	for( const char* P=Map; *P; ++P ) if( *P=='/' || *P=='\\' ) Base=P+1;
+	char Name[128];
+	appStrncpy(Name,Base,ARRAY_COUNT(Name));
+	if( char* Extension=appStrchr(Name,'.') )
+	{
+		if( appStricmp(Extension,".unr") ) return Map;
+		*Extension=0;
+	}
+	for( INT i=0; i<ARRAY_COUNT(Aliases); ++i )
+		if( !appStricmp(Name,Aliases[i][0]) )
+		{
+			char Path[160];
+			appSprintf(Path,"../Maps/%s.dcs",Aliases[i][1]);
+			return appFSize(Path)>0 ? Aliases[i][1] : Map;
+		}
+	return Map;
+}
+
 struct FDCStreamFile
 {
 	char Name[64];

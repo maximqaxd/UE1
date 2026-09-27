@@ -10,6 +10,7 @@
 #include "UnDCFrameProfile.h"
 #include "UnRender.h"
 #include "UnNet.h"
+#include "UnDCVMU.h"
 
 /*-----------------------------------------------------------------------------
 	Object class implementation.
@@ -300,6 +301,64 @@ struct FDCChizraState
 static FDCChizraState GDCChizraStates[6];
 static UBOOL GDCChizraBaptistryOpen = 0;
 
+// Pointer-free campaign state accompanies the full serialized level package.
+struct FDCVMUState
+{
+	DWORD Version;
+	char Player[64];
+	FDCChizraState Chizra[6];
+	UBOOL Baptistry;
+	BYTE TerraniuxPending[2][8], TerraniuxEver[8], TerraniuxOpen, SkyTownPending[2];
+};
+static char GDCVMUPlayer[64];
+static char GDCVMUFile[128];
+static INT GDCVMUReadySlot = -1;
+static void DCVMUCaptureState(ULevel* Level, TArray<BYTE>& Bytes)
+{
+	FDCVMUState S = {};
+	S.Version = 1;
+	for (INT i = 0; i < Level->Num(); ++i)
+		if (APlayerPawn* P = Cast<APlayerPawn>(Level->Actors(i)))
+			if (P->Player)
+			{
+				appStrncpy(S.Player, P->GetName(), sizeof(S.Player));
+				break;
+			}
+	appMemcpy(S.Chizra, GDCChizraStates, sizeof(S.Chizra));
+	S.Baptistry = GDCChizraBaptistryOpen;
+	appMemcpy(S.TerraniuxPending, GDCTerraniuxPending, sizeof(S.TerraniuxPending));
+	appMemcpy(S.TerraniuxEver, GDCTerraniuxEver, sizeof(S.TerraniuxEver));
+	S.TerraniuxOpen = GDCTerraniuxOpen;
+	appMemcpy(S.SkyTownPending, GDCSkyTownPending, sizeof(S.SkyTownPending));
+	Bytes.Empty();
+	Bytes.Add(sizeof(S));
+	appMemcpy(&Bytes(0), &S, sizeof(S));
+}
+static UBOOL DCVMURestoreState(const TArray<BYTE>& Bytes)
+{
+	if (Bytes.Num() != sizeof(FDCVMUState))
+		return 0;
+	const FDCVMUState& S = *(const FDCVMUState*)&Bytes(0);
+	if (S.Version != 1 || !S.Player[0] || S.Player[63])
+		return 0;
+	for (INT i = 0; i < 6; ++i)
+	{
+		if (S.Chizra[i].Count < 0 || S.Chizra[i].Count > DC_CHIZRA_RECORDS)
+			return 0;
+		for (INT j = 0; j < S.Chizra[i].Count; ++j)
+			if (S.Chizra[i].Records[j].Name[DC_CHIZRA_NAME_BYTES - 1])
+				return 0;
+	}
+	appMemcpy(GDCChizraStates, S.Chizra, sizeof(S.Chizra));
+	GDCChizraBaptistryOpen = S.Baptistry;
+	appMemcpy(GDCTerraniuxPending, S.TerraniuxPending, sizeof(S.TerraniuxPending));
+	appMemcpy(GDCTerraniuxEver, S.TerraniuxEver, sizeof(S.TerraniuxEver));
+	GDCTerraniuxOpen = S.TerraniuxOpen;
+	appMemcpy(GDCSkyTownPending, S.SkyTownPending, sizeof(S.SkyTownPending));
+	appStrcpy(GDCVMUPlayer, S.Player);
+	return 1;
+}
+
 static INT DCChizraPart( ULevel* Level )
 {
 	if( !Level ) return INDEX_NONE;
@@ -588,6 +647,7 @@ static UBOOL DCCanRestartTravel( const FURL& URL )
 		&& !URL.HasOption("push")
 		&& !URL.HasOption("pop")
 		&& !URL.HasOption("load")
+		&& !URL.GetOption("load=",NULL)
 		&& !URL.HasOption("failed");
 }
 #endif
@@ -776,8 +836,23 @@ void UGameEngine::Init()
 			GDCSessionTravel ? GDCSessionItems :
 #endif
 			"";
-		if( !GLevel->SpawnPlayActor( Viewport, ROLE_SimulatedProxy, URL, InitialItems, Error256 ) )
-			appErrorf( Error256 );
+#if defined(PLATFORM_DREAMCAST)
+		APlayerPawn* SavedPlayer = NULL;
+		if (GDCVMUReadySlot >= 0)
+			for (INT i = 0; i < GLevel->Num(); ++i)
+				if (GLevel->Actors(i) && !appStricmp(GLevel->Actors(i)->GetName(), GDCVMUPlayer))
+					SavedPlayer = Cast<APlayerPawn>(GLevel->Actors(i));
+		if (GDCVMUReadySlot >= 0 && !SavedPlayer)
+			appErrorf("Saved player is absent from VMU snapshot");
+		if (SavedPlayer)
+		{
+			SavedPlayer->SetPlayer(Viewport);
+			GDCVMUReadySlot = -1;
+		}
+		else
+#endif
+			if (!GLevel->SpawnPlayActor(Viewport, ROLE_SimulatedProxy, URL, InitialItems, Error256))
+			appErrorf(Error256);
 #if defined(PLATFORM_DREAMCAST)
 		if( GDCSessionTravel )
 			DCConsumeSessionTravel();
@@ -826,6 +901,7 @@ void UGameEngine::Init()
 		appDCStreamFinish();
 		appDCStreamClose();
 	}
+	DCVMURefreshMenus();
 	if( (!GLevel || !GLevel->NetDriver) && !GDCGameLinkersReleased )
 	{
 		DCReleaseGameLinkers();
@@ -906,10 +982,19 @@ UBOOL UGameEngine::Exec( const char* Cmd, FOutputDevice* Out )
 			Out->Logf( "Start failed: %s", Error256 );
 		return 1;
 	}
-	else if( ParseCommand(&Str,"SAVEGAME") )
+#if defined(PLATFORM_DREAMCAST)
+	else if (ParseCommand(&Str, "DCVMULOAD"))
 	{
-		if( !GIsEditor && appIsDigit(Str[0]) && Str[1]==0 )
-			SaveGame( appAtoi(Str) );
+		char Target[64], Error[256];
+		appSprintf(Target, "?load=%d", appAtoi(Str));
+		Browse(FURL(&LastURL, Target, TRAVEL_Partial), Error);
+		return 1;
+	}
+#endif
+	else if (ParseCommand(&Str, "SAVEGAME"))
+	{
+		if (!GIsEditor && appIsDigit(Str[0]) && Str[1] == 0)
+			SaveGame(appAtoi(Str));
 		return 1;
 	}
 	else if( ParseCommand( &Cmd, "CANCEL" ) )
@@ -998,20 +1083,8 @@ UBOOL UGameEngine::Browse( FURL URL, char* Error256 )
 #if defined(PLATFORM_DREAMCAST)
 	// Existing campaign teleporters retain their legacy map names. Keep each
 	// portal suffix while routing to the first half of a split map.
-	if( !appStricmp(*URL.Map,"Dig") && appFSize("../Maps/Dig1.dcs")>0 )
-		URL.Map="Dig1";
-	if( !appStricmp(*URL.Map,"DasaCellars") && appFSize("../Maps/DasaCellars1.dcs")>0 )
-		URL.Map="DasaCellars1";
-	if( !appStricmp(*URL.Map,"Ruins") && appFSize("../Maps/Ruins1.dcs")>0 )
-		URL.Map="Ruins1";
-	if( !appStricmp(*URL.Map,"Chizra") && appFSize("../Maps/Chizra1.dcs")>0 )
-		URL.Map="Chizra1";
-	if( !appStricmp(*URL.Map,"Terraniux") && appFSize("../Maps/Terraniux1.dcs")>0 )
-		URL.Map="Terraniux1";
-	if( !appStricmp(*URL.Map,"IsvKran32") && appFSize("../Maps/IsvKran32A.dcs")>0 )
-		URL.Map="IsvKran32A";
-	if( !appStricmp(*URL.Map,"SkyTown") && appFSize("../Maps/SkyTown1.dcs")>0 )
-		URL.Map="SkyTown1";
+	const char* ResolvedMap=appDCResolveCampaignMap(*URL.Map);
+	if( ResolvedMap!=*URL.Map ) URL.Map=ResolvedMap;
 #endif
 
 	// Crack the URL.
@@ -1067,34 +1140,77 @@ UBOOL UGameEngine::Browse( FURL URL, char* Error256 )
 		URL = LastURL;
 		unguard;
 	}
-	else if( (Option=URL.GetOption("load=",NULL))!=NULL )
+	else if ((Option = URL.GetOption("load=", NULL)) != NULL)
 	{
 		// Handle restarting.
 		guard(LoadURL);
 		char Temp[256], Error256[256];
-		appSprintf( Temp, "%s\\Save%i.usa?load", GSys->SavePath, appAtoi(Option) );
-		if( LoadMap(FURL(&LastURL,Temp,TRAVEL_Partial),NULL,Error256) )
+#if defined(PLATFORM_DREAMCAST)
+		if (!GDCSessionTravel)
+		{
+			char Map[64], File[128], Failure[256];
+			TArray<BYTE> State;
+			if (!DCVMULoad(appAtoi(Option), Map, File, State, Failure))
+			{
+				SetProgress("VMU load failed", Failure, 8.f);
+				debugf("DCVMU %s", Failure);
+				return 0;
+			}
+			if (State.Num() != sizeof(FDCVMUState))
+			{
+				SetProgress("VMU load failed", "Incompatible campaign state", 8.f);
+				return 0;
+			}
+			char Target[128];
+			appSprintf(Target, "%s?load=%d", Map, appAtoi(Option));
+			DCSetSessionTravel(GLevel, FURL(NULL, Target, TRAVEL_Absolute), "");
+			if (!DCVMURestoreState(State))
+			{
+				GDCSessionTravel = 0;
+				SetProgress("VMU load failed", "Invalid campaign state", 8.f);
+				return 0;
+			}
+			appStrcpy(GDCVMUFile, File);
+			GDCVMUReadySlot = appAtoi(Option);
+			GIsRunning = 0;
+			return 1;
+		}
+		if (GDCVMUReadySlot != appAtoi(Option))
+			return 0;
+		appSprintf(Temp, "%s?load", GDCVMUFile);
+#else
+		appSprintf(Temp, "%s\\Save%i.usa?load", GSys->SavePath, appAtoi(Option));
+#endif
+		if (LoadMap(FURL(&LastURL, Temp, TRAVEL_Partial), NULL, Error256))
 		{
 			// Copy the hub stack.
 			INT i;
-			for( i=0; i<GLevel->GetLevelInfo()->HubStackLevel; i++ )
+			for (i = 0; i < GLevel->GetLevelInfo()->HubStackLevel; i++)
 			{
 				char Src[256], Dest[256];
-				appSprintf( Src, "%s\\Save%i%i.usa", GSys->SavePath, appAtoi(Option), i );
-				appSprintf( Dest, "%s\\Game%i.usa", GSys->SavePath, i );
-				appCopyFile( Src, Dest );
+				appSprintf(Src, "%s\\Save%i%i.usa", GSys->SavePath, appAtoi(Option), i);
+				appSprintf(Dest, "%s\\Game%i.usa", GSys->SavePath, i);
+				appCopyFile(Src, Dest);
 			}
-			while( 1 )
+			while (1)
 			{
-				appSprintf( Temp, "%s\\Game%i.usa", GSys->SavePath, i++ );
-				if( appFSize(Temp)<=0 )
+				appSprintf(Temp, "%s\\Game%i.usa", GSys->SavePath, i++);
+				if (appFSize(Temp) <= 0)
 					break;
-				appUnlink( Temp );
+				appUnlink(Temp);
 			}
 			LastURL = GLevel->URL;
 			return 1;
 		}
-		else return 0;
+		else
+		{
+#if defined(PLATFORM_DREAMCAST)
+			GDCVMUReadySlot = -1;
+			GDCVMUPlayer[0] = 0;
+			debugf("DCVMU snapshot load failed: %s", Error256);
+#endif
+			return 0;
+		}
 		unguard;
 	}
 
@@ -1564,8 +1680,11 @@ ULevel* UGameEngine::LoadMap( const FURL& URL, UPendingLevel* Pending, char* Err
 	// Scripts have initialized their movers and pickups, but the moving-brush
 	// tracker and arriving player are not yet present. Restore semantic state
 	// here so the tracker builds collision from the final keyframe.
-	DCChizraRestore(GLevel);
-	DCTerraniuxRestore(GLevel);
+	if(!URL.HasOption("load"))
+	{
+		DCChizraRestore(GLevel);
+		DCTerraniuxRestore(GLevel);
+	}
 #endif
 
 	// Cleanup profiling.
@@ -1632,8 +1751,11 @@ ULevel* UGameEngine::LoadMap( const FURL& URL, UPendingLevel* Pending, char* Err
 
 	// Successfully started local level.
 #if defined(PLATFORM_DREAMCAST)
-	DCTerraniuxReplay(GLevel);
-	DCSkyTownReplay(GLevel);
+	if(!URL.HasOption("load"))
+	{
+		DCTerraniuxReplay(GLevel);
+		DCSkyTownReplay(GLevel);
+	}
 #endif
 	return GLevel;
 	unguard;
@@ -2011,23 +2133,59 @@ void UGameEngine::Tick( FLOAT DeltaSeconds )
 //
 // Save the current game state to a file.
 //
-void UGameEngine::SaveGame( INT Position )
+void UGameEngine::SaveGame(INT Position)
 {
 	guard(UGameEngine::SaveGame);
 	char Filename[256];
-	appMkdir( GSys->SavePath );
-	appSprintf( Filename, "%s\\Save%i.usa", GSys->SavePath, Position );
-	GLevel->GetLevelInfo()->LevelAction=LEVACT_Saving;
+#if defined(PLATFORM_DREAMCAST)
+	if (Position < 0 || Position > 9 || GLevel->NetDriver || GLevel->GetLevelInfo()->HubStackLevel)
+	{
+		SetProgress("VMU save failed", "Requires single-player, slot 0-9 and no active hub stack",
+					8.f);
+		return;
+	}
+	char VMUError[256];
+	if (!DCVMUCanSave(VMUError))
+	{
+		SetProgress("VMU save failed", VMUError, 8.f);
+		return;
+	}
+	appStrcpy(GSys->SavePath, "/ram");
+	appSprintf(Filename, "/ram/%s.usa", GLevel->GetParent()->GetName());
+#else
+	appMkdir(GSys->SavePath);
+	appSprintf(Filename, "%s\\Save%i.usa", GSys->SavePath, Position);
+#endif
+	GLevel->GetLevelInfo()->LevelAction = LEVACT_Saving;
 	PaintProgress();
-	GSystem->BeginSlowTask( LocalizeProgress("Saving"), 1, 0 );
-	if( GLevel->BrushTracker )
+	GSystem->BeginSlowTask(LocalizeProgress("Saving"), 1, 0);
+	if (GLevel->BrushTracker)
 	{
 		GLevel->BrushTracker->Exit();
 		delete GLevel->BrushTracker;
 	}
-	GLevel->CleanupDestroyed( 1 );
-	if( GObj.SavePackage( GLevel->GetParent(), GLevel, 0, Filename ) )
+	GLevel->CleanupDestroyed(1);
+	if (GObj.SavePackage(GLevel->GetParent(), GLevel, 0, Filename))
 	{
+#if defined(PLATFORM_DREAMCAST)
+		TArray<BYTE> State;
+		DCChizraCapture(GLevel);
+		DCTerraniuxCapture(GLevel);
+		DCVMUCaptureState(GLevel, State);
+		char Error[256];
+		if (DCVMUSave(Position, Filename, GLevel->GetParent()->GetName(), State, Error))
+			SetProgress("VMU save complete", "Full world saved", 5.f);
+		else
+		{
+			debugf("DCVMU save failed: %s", Error);
+			SetProgress("VMU save failed", Error, 8.f);
+		}
+		DCVMURefreshMenus();
+		// A newly-created snapshot is only staging. Keep a loaded snapshot
+		// while the current level may still have file-backed readers.
+		if (appStricmp(Filename, GDCVMUFile))
+			appUnlink(Filename);
+#else
 		// Copy the hub stack.
 		INT i;
 		for( i=0; i<GLevel->GetLevelInfo()->HubStackLevel; i++ )
@@ -2044,7 +2202,15 @@ void UGameEngine::SaveGame( INT Position )
 				break;
 			appUnlink( Filename );
 		}
+#endif
 	}
+#if defined(PLATFORM_DREAMCAST)
+	else
+	{
+		SetProgress("VMU save failed","Could not finalize RAM snapshot; previous VMU save kept",8.f);
+		DCVMURefreshMenus();
+	}
+#endif
 	for( INT i=0; i<GLevel->Num(); i++ )
 		if( Cast<AMover>(GLevel->Actors(i)) )
 			Cast<AMover>(GLevel->Actors(i))->SavedPos = FVector(-1,-1,-1);

@@ -3,6 +3,7 @@
 
 #include "KOSDrv.h"
 #include "UnRender.h"
+#include "UnDCVMU.h"
 
 IMPLEMENT_CLASS( UKOSClient );
 
@@ -57,6 +58,8 @@ void UKOSClient::Init( UEngine* InEngine )
 
 	// Init base.
 	UClient::Init( InEngine );
+	appStrcpy(GSys->SavePath,"/ram");
+	DCVMUStartup();
 
 
 	unguard;

@@ -268,7 +268,7 @@ public:
 		appStrcpy( Filename, InFilename );
 
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
-		if( appDCStreamActive() )
+		if( appDCStreamActive() && appStrnicmp(Filename,"/ram/",5) )
 		{
 			Eof = appDCStreamFileSize( Filename );
 			if( Eof < 0 )
@@ -345,7 +345,7 @@ public:
 		INT ReadOffset = Tell();
 		INT Count = 1;
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
-		if( appDCStreamActive() )
+		if( appDCStreamActive() && !File )
 		{
 			appDCStreamRead( Filename, ReadOffset, V, Length );
 		}

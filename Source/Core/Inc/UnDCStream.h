@@ -2,6 +2,9 @@
 
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
 struct FDCStreamStore;
+// Resolve legacy campaign names before both startup stream selection and Browse.
+// Returns Map unchanged when no installed split replacement exists.
+CORE_API const char* appDCResolveCampaignMap( const char* Map );
 
 // A bounded, reference-counted blob location in the DAT that supplied it.
 // Copies retain the store; unloading a level must not invalidate Entry textures.

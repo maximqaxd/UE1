@@ -541,11 +541,20 @@ void UKOSViewport::TickJoystick( maple_device_t* Dev, const FLOAT DeltaTime )
 		MenuStartArmed = false;
 		if( ProfileModifier && RenDev )
 		{
+			// Delayed commands execute outside input polling. Both triggers plus
+			// left/down provide controller-only VMU quick save/load (slot 9).
+			if(LeftTriggerDown && Actor && (ProfilePressed & (CONT_DPAD_LEFT|CONT_DPAD_DOWN)))
+			{
+				Actor->bDelayedCommand=1;
+				appStrcpy(Actor->DelayedCommand,(ProfilePressed & CONT_DPAD_LEFT)?"SaveGame 9":"DCVMULOAD 9");
+			}
 			// One command per press; a diagonal cannot toggle two settings.
-			if( ProfilePressed & CONT_DPAD_RIGHT )
+			else if( ProfilePressed & CONT_DPAD_RIGHT )
 				RenDev->Exec( LeftTriggerDown ? "DCSPANMODE" : "DCPPAGE", GSystem );
 			else if( ProfilePressed & CONT_DPAD_UP )
+			{
 				RenDev->Exec(LeftTriggerDown ? "DCLIGHTRATE" : "DCPDUMP", GSystem);
+			}
 			else if( ProfilePressed & CONT_DPAD_DOWN ) RenDev->Exec("DCPOVERLAY", GSystem);
 			else if( ProfilePressed & CONT_DPAD_LEFT ) RenDev->Exec("DCPDETAIL", GSystem);
 		}

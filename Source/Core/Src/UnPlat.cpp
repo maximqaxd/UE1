@@ -14,6 +14,7 @@
 #include <io.h>
 #elif defined(PLATFORM_DREAMCAST)
 #include <kos.h>
+#include <kos/fs_ramdisk.h>
 #include <dirent.h>
 #else
 #error "Unsupported platform."
@@ -864,6 +865,12 @@ UBOOL appFindPackageFile( const char* In, const FGuid* Guid, char* Out )
 
 	// Try file as specified.
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
+	// Only explicit RAM snapshots bypass strict dependency-stream resolution.
+	if( !appStrnicmp(In,"/ram/",5) && appFSize(In)>=0 )
+	{
+		appStrcpy(Out,In);
+		return 1;
+	}
 	if( appDCStreamActive() )
 	{
 		// No filesystem probe or loose fallback while replaying a dependency stream.
@@ -995,10 +1002,21 @@ CORE_API void appCreateTempFilename( const char* Path, char* Result256 )
 //
 // Move a file and overwrite the destination.
 //
+#if defined(PLATFORM_DREAMCAST)
+#include "DCRamMove.h"
+#endif
 CORE_API UBOOL appMoveFile( const char* Src, const char* Dest )
 {
 	guard(appMoveFile);
 
+#if defined(PLATFORM_DREAMCAST)
+	if(!appStrncmp(Src,"/ram/",5) && !appStrncmp(Dest,"/ram/",5))
+	{
+		const UBOOL Success=DCMoveRamFile(Src,Dest);
+		if(!Success)debugf(NAME_Warning,"Error transferring RAM file '%s' to '%s'",Src,Dest);
+		return Success;
+	}
+#endif
 	unlink( Dest );
 
 #ifdef PLATFORM_WIN32

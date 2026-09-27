@@ -179,8 +179,13 @@ CORE_API void VARARGS appThrowf( const char* Fmt, ... );
 //
 #if defined(PLATFORM_DREAMCAST)
 extern CORE_API UBOOL GDCLegacyTimers;
+#if DC_FRAME_PROFILE
 #define uclock(Timer)   {if(GDCLegacyTimers) Timer -= appCycles();}
 #define uunclock(Timer) {if(GDCLegacyTimers) Timer += appCycles();}
+#else
+#define uclock(Timer) {}
+#define uunclock(Timer) {}
+#endif
 #else
 #define uclock(Timer)   {Timer -= appCycles();}
 #define uunclock(Timer) {Timer += appCycles()-34;}
