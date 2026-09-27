@@ -23,3 +23,8 @@ Source/UnrealED/obj
 __pycache__/
 *.py[cod]
 /research/utdc/utdc-current-report.json
+
+# Local tooling and notes are not part of the source distribution.
+*.py
+*.[mM][dD]
+![rR][eE][aA][dD][mM][eE].[mM][dD]
