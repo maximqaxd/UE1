@@ -5,15 +5,15 @@
 #include <arch/timer.h>
 
 // Inclusive stage timers: recursion counts once, nested stages overlap.
-ENGINE_API UBOOL GDCFrameProfileEnabled = 1;
-ENGINE_API UBOOL GDCFrameProfileDetailed = 1;
-ENGINE_API UBOOL GDCFrameProfileOverlay = 1;
+ENGINE_API UBOOL GDCFrameProfileEnabled = DC_FRAME_PROFILE;
+ENGINE_API UBOOL GDCFrameProfileDetailed = DC_FRAME_PROFILE;
+ENGINE_API UBOOL GDCFrameProfileOverlay = DC_FRAME_PROFILE && DC_PROFILE_OVERLAY;
 ENGINE_API INT GDCFrameProfilePage = 0;
 ENGINE_API INT GDCSpanMode = 1;
 ENGINE_API INT GDCStationaryLightHz = 5;
-ENGINE_API UBOOL GDCMeshOIXActive = 0;
 ENGINE_API UBOOL GDCMeshOptimize = 1;
 // Use the integer KOS timer directly; single-only floating point loses
+#if DC_FRAME_PROFILE
 // microsecond precision when an absolute timestamp is converted to DOUBLE.
 static struct FDCFrameProfile
 {
@@ -31,7 +31,7 @@ static struct FDCFrameProfile
 	FLOAT CountDisplay[DCFC_Count];
 	DWORD TimerReads;
 	QWORD TimerReadsSum;
-	char Lines[36][128];
+	char Lines[39][128];
 } GDCFrame;
 
 ENGINE_API void DCFrameProfileReset()
@@ -41,10 +41,9 @@ ENGINE_API void DCFrameProfileReset()
 
 ENGINE_API void DCFrameProfileReport( FOutputDevice* Out )
 {
-	Out->Logf("DCPROFILE detail=%d overlay=%d legacy=%d TA=SQ mesh_OIX=%d; completed 30-tick window",
-		GDCFrameProfileDetailed, GDCFrameProfileOverlay, GDCLegacyTimers,
-		GDCMeshOIXActive);
-	for( INT i = 0; i < 36; ++i )
+	Out->Logf("DCPROFILE detail=%d overlay=%d legacy=%d TA=SQ; completed 30-tick window",
+		GDCFrameProfileDetailed, GDCFrameProfileOverlay, GDCLegacyTimers);
+	for( INT i = 0; i < 39; ++i )
 		if( GDCFrame.Lines[i][0] ) Out->Log(GDCFrame.Lines[i]);
 }
 
@@ -155,10 +154,9 @@ ENGINE_API void DCFrameEnd()
 		}
 		const FLOAT* T = GDCFrame.Display;
 		const FLOAT* C = GDCFrame.CountDisplay;
-		appSprintf(GDCFrame.Lines[0], "DC %.1f FPS frame %.1f worst %.1f D%d TA:SQ M-OIX:%s",
+		appSprintf(GDCFrame.Lines[0], "DC %.1f FPS frame %.1f worst %.1f D%d TA:SQ",
 			GDCFrame.FrameMS > 0 ? 1000.f/GDCFrame.FrameMS : 0.f,
-			GDCFrame.FrameMS, GDCFrame.WorstMS, GDCFrameProfileDetailed,
-			GDCMeshOIXActive ? "ON" : "OFF");
+			GDCFrame.FrameMS, GDCFrame.WorstMS, GDCFrameProfileDetailed);
 		appSprintf(GDCFrame.Lines[1], "tick %.1f game %.1f world %.1f wait %.1f", GDCFrame.WorkMS, T[DCFS_Game], T[DCFS_World], T[DCFS_Wait]);
 		appSprintf(GDCFrame.Lines[2], "BSP %.1f clip %.1f raster %.1f span %.1f", T[DCFS_BSP], T[DCFS_Clip], T[DCFS_Raster], T[DCFS_Span]);
 		appSprintf(GDCFrame.Lines[3], "dyn %.1f mesh %.1f light %.1f legacy %d", T[DCFS_Dynamics], T[DCFS_Mesh], T[DCFS_Light], GDCLegacyTimers);
@@ -185,10 +183,9 @@ ENGINE_API void DCFrameEnd()
 		appSprintf(GDCFrame.Lines[15], "BSP bound %.2f merge %.2f drawlist %.2f timer %.0f",
 			T[DCFS_BSPBound], T[DCFS_BSPMergeSearch], T[DCFS_BSPDrawList],
 			GDCFrame.TimerReadsSum / (FLOAT)GDCFrame.Frames);
-		appSprintf(GDCFrame.Lines[16], "hdr %.0f compile %.2fms stable %.0f addr %.0f state %.0f",
+		appSprintf(GDCFrame.Lines[16], "hdr %.0f compile %.2fms hit %.0f miss %.0f LMbatch %.0f",
 			GDCFrame.HeaderCount, T[DCFS_HeaderCompile],
-			C[DCFC_HeaderUploadStable], C[DCFC_HeaderUploadAddress],
-			C[DCFC_HeaderUploadState]);
+			C[DCFC_HeaderCacheHit], C[DCFC_HeaderCacheMiss], C[DCFC_WorldBatchPolys]);
 		appSprintf(GDCFrame.Lines[17], "READ peak DT %.2f LM %.2f other %.2f ms",
 			GDCFrame.StageWorst[DCFS_ReadDT] * 0.001f,
 			GDCFrame.StageWorst[DCFS_ReadLightmap] * 0.001f,
@@ -238,6 +235,16 @@ ENGINE_API void DCFrameEnd()
 			C[DCFC_MeshVertexUnique], C[DCFC_MeshLightPairs],
 			C[DCFC_MeshLightRadiusReject], C[DCFC_MeshLightEvaluated],
 			C[DCFC_MeshCookedNormals]);
+		appSprintf(GDCFrame.Lines[36], "draw cache+check %.2f setup %.2f emit %.2f",
+			T[DCFS_MeshDrawCache], T[DCFS_MeshDrawSetup], T[DCFS_MeshDrawEmit]);
+		appSprintf(GDCFrame.Lines[37], "draw fallback %.2f other %.2f",
+			T[DCFS_MeshDrawFallback], Max(0.f,T[DCFS_MeshDraw]-T[DCFS_MeshDrawCache]
+				-T[DCFS_MeshDrawSetup]-T[DCFS_MeshDrawEmit]-T[DCFS_MeshDrawFallback]));
+		appSprintf(GDCFrame.Lines[38], "other attach %.2f cleanup %.2f rest %.2f single %.0f",
+			T[DCFS_MeshDrawAttachment], T[DCFS_MeshDrawCleanup],
+			Max(0.f,T[DCFS_MeshDraw]-T[DCFS_MeshDrawCache]-T[DCFS_MeshDrawSetup]
+				-T[DCFS_MeshDrawEmit]-T[DCFS_MeshDrawFallback]
+				-T[DCFS_MeshDrawAttachment]-T[DCFS_MeshDrawCleanup]), C[DCFC_MeshDirectSingles]);
 		appMemset(GDCFrame.StageWorst, 0, sizeof(GDCFrame.StageWorst));
 		GDCFrame.TimerReadsSum = 0;
 		GDCFrame.IntervalSum = GDCFrame.WorkSum = GDCFrame.BytesSum = GDCFrame.HeadersSum = 0;
@@ -247,10 +254,18 @@ ENGINE_API void DCFrameEnd()
 
 ENGINE_API void DCFrameDraw( UCanvas* Canvas )
 {
+#if DC_PROFILE_OVERLAY
 	if( !GDCFrameProfileEnabled || !GDCFrameProfileOverlay || !Canvas || !Canvas->SmallFont ) return;
 	DC_FRAME_SCOPE(DCFS_Overlay);
-	for( INT i = 0; i < 9; ++i )
+	for( INT i = 0; i < (GDCFrameProfilePage==3 ? 12 : 9); ++i )
 		Canvas->Printf(Canvas->SmallFont, 4, 24 + i * 10, "%s", GDCFrame.Lines[GDCFrameProfilePage * 9 + i]);
+#endif
 }
+#else
+ENGINE_API void DCFrameProfileReport( FOutputDevice* Out )
+{
+	Out->Logf("Frame profiling compiled out (DREAMCAST_FRAME_PROFILE=OFF)");
+}
+#endif
 
 #endif

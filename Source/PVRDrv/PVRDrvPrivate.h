@@ -45,7 +45,6 @@ class DLL_EXPORT UPVRRenderDevice : public URenderDevice
 	// Options.
 	UBOOL NoFiltering;
 	UBOOL UseTriStrips;
-	UBOOL UseMeshOIX;
 	UBOOL UseVQDynamicLightmaps;
 	UBOOL UseHardwareMeshCull;
 	UBOOL MeshDrawScope;
@@ -123,6 +122,17 @@ class DLL_EXPORT UPVRRenderDevice : public URenderDevice
 		UBOOL MipMapped;
 		FLOAT UMult, VMult, UPan, VPan;
 	};
+	struct FWorldLightDraw
+	{
+		FTexState Tex;
+		DWORD Flags;
+		INT First, Count;
+		FLOAT MinX, MinY, MaxX, MaxY;
+	};
+	FWorldLightDraw WorldLightDraws[16];
+	pvr_vertex_t WorldLightVertices[256];
+	INT WorldLightCount, WorldLightVertexCount;
+	FSceneNode* WorldLightFrame;
 
 	// Texture upload buffer;
 	BYTE* Compose;
@@ -219,9 +229,10 @@ class DLL_EXPORT UPVRRenderDevice : public URenderDevice
 	virtual void DrawGouraudPolygon( FSceneNode* Frame, FTextureInfo& Texture, FTransTexture** Pts, INT NumPts, DWORD PolyFlags, FSpanBuffer* SpanBuffer ) override;
 	virtual void DrawGouraudTriStrip( FSceneNode* Frame, FTextureInfo& Texture, FTransTexture** Pts, INT NumPts, DWORD PolyFlags, FSpanBuffer* SpanBuffer ) override;
 	virtual void BeginCookedMesh() override;
+	virtual void FlushWorldLightmaps() override;
+	virtual INT DrawIndexedMeshRanges( FSceneNode* Frame, FTextureInfo& Texture, const FTransTexture* Samples, FDCMeshDrawCache& Cache, const FDCMeshDrawRange* Ranges, INT Count, DWORD PolyFlags ) override;
 	virtual UBOOL DrawIndexedMeshStrip( FSceneNode* Frame, FTextureInfo& Texture, const FTransTexture* Samples, const _WORD* Indices, const _WORD* UVs, INT Count, UBOOL OddStart, DWORD PolyFlags ) override;
 	virtual void EndCookedMesh() override;
-	virtual UBOOL DrawCookedMeshStrip( FSceneNode* Frame, FTextureInfo& Texture, FTransTexture** Pts, INT NumPts, DWORD PolyFlags, FSpanBuffer* SpanBuffer, INT MeshletId ) override;
 	virtual void DrawTile( FSceneNode* Frame, FTextureInfo& Texture, FLOAT X, FLOAT Y, FLOAT XL, FLOAT YL, FLOAT U, FLOAT V, FLOAT UL, FLOAT VL, FSpanBuffer* Span, FLOAT Z, FPlane Light, FPlane Fog, DWORD PolyFlags ) override;
 	virtual void EndFlash() override;
 	virtual void GetStats( char* Result ) override;
@@ -252,7 +263,7 @@ class DLL_EXPORT UPVRRenderDevice : public URenderDevice
 	void* TwiddleTextureMipP8( const FMipmap* Mip );
 	void* ConvertTextureMipI8( const FMipmap* Mip, const FColor* Palette );
 	void* ConvertTextureMipBGRA7777( const FMipmap* Mip );
-	void* ConvertTextureMipBGRA7777Alpha( const FMipmap* Mip );
+	void* ConvertTextureMipBGRA7777Alpha( const FMipmap* Mip, INT UClamp, INT VClamp );
 	void* VerticalUpscale( const INT USize, const INT VSize, const INT VTimes );
 	void PrintTextureCPUProfile( INT Frames );
 	void PrintMemStats() const;

@@ -22,6 +22,23 @@ enum ELockRenderFlags
 //
 // A low-level 3D rendering device.
 //
+#if defined(PLATFORM_DREAMCAST)
+// Shared projected attributes; UVs and strip termination remain corner-local.
+struct FDCMeshDrawVertex { FLOAT X, Y, Z; DWORD ARGB; };
+struct FDCMeshDrawCache
+{
+	FDCMeshDrawVertex* Vertices;
+	BYTE* State; // 0: unvisited, 1: direct-safe, 2: needs clipping
+	INT Count;
+};
+struct FDCMeshDrawRange
+{
+	const _WORD* Indices;
+	const _WORD* UVs;
+	INT Count;
+	UBOOL OddStart;
+};
+#endif
 class ENGINE_API URenderDevice : public USubsystem
 {
 	DECLARE_ABSTRACT_CLASS(URenderDevice,USubsystem,CLASS_Config)
@@ -80,9 +97,12 @@ class ENGINE_API URenderDevice : public USubsystem
 #if defined(PLATFORM_DREAMCAST)
 	// Optional cooked-mesh submission phase. Meshlet ids are local to one mesh.
 	virtual void BeginCookedMesh() {}
+	virtual void FlushWorldLightmaps() {}
 	virtual void EndCookedMesh() {}
-	virtual UBOOL DrawCookedMeshStrip( FSceneNode* Frame, FTextureInfo& Info, FTransTexture** Pts, INT NumPts, DWORD PolyFlags, FSpanBuffer* Span, INT MeshletId ) { return 0; }
 	virtual UBOOL DrawIndexedMeshStrip( FSceneNode* Frame, FTextureInfo& Info, const FTransTexture* Samples, const _WORD* Indices, const _WORD* UVs, INT Count, UBOOL OddStart, DWORD PolyFlags ) { return 0; }
+	// Returns the consumed prefix; the first rejected range and its successors
+	// have emitted nothing, so the caller can fall back without reordering.
+	virtual INT DrawIndexedMeshRanges( FSceneNode* Frame, FTextureInfo& Info, const FTransTexture* Samples, FDCMeshDrawCache& Cache, const FDCMeshDrawRange* Ranges, INT Count, DWORD PolyFlags ) { return 0; }
 #endif
 	virtual void DrawTile( FSceneNode* Frame, FTextureInfo& Info, FLOAT X, FLOAT Y, FLOAT XL, FLOAT YL, FLOAT U, FLOAT V, FLOAT UL, FLOAT VL, class FSpanBuffer* Span, FLOAT Z, FPlane Color, FPlane Fog, DWORD PolyFlags )=0;
 	virtual void Draw2DLine( FSceneNode* Frame, FPlane Color, DWORD LineFlags, FVector P1, FVector P2 )=0;

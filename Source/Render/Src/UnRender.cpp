@@ -508,7 +508,9 @@ void URender::PostRender( FSceneNode* Frame )
 {
 	guard(URender::PostRender);
 #if defined(PLATFORM_DREAMCAST)
+#if DC_PROFILE_OVERLAY
 	DCFrameDraw(Frame->Viewport->Canvas);
+#endif
 #endif
 
 	// Draw whatever stats were requested.
@@ -904,6 +906,34 @@ static void DCLoadPipeCoords( const FCoords& C )
 	R3.x = 0.f;       R3.y = 0.f;       R3.z = 0.f;       R3.w = 1.f;
 	shz_xmtrx_load_rows_4x4( &R0, &R1, &R2, &R3 );
 }
+static FTransform* DCPipePool=NULL;
+static INT DCPipeRemaining=0;
+// Nested scene traversal owns its own block; never retain a pointer beyond
+// the VectorMem mark which owns it (sky/portal recursion can pop that mark).
+struct FDCPipePoolScope
+{
+	FTransform* Saved; INT Remaining;
+	FDCPipePoolScope() : Saved(DCPipePool), Remaining(DCPipeRemaining)
+	{ DCPipePool=NULL; DCPipeRemaining=0; }
+	~FDCPipePoolScope() { DCPipePool=Saved; DCPipeRemaining=Remaining; }
+};
+static SHZ_NO_INLINE __attribute__((cold)) void DCRefillPipePoints(FMemStack& Mem)
+{
+#if DC_ALIGNED_TRANSFORMS
+		struct SHZ_ALIGNAS(32) FPipeBlock { FTransform Points[32]; };
+		static_assert(sizeof(FTransform)==32,"BSP transform stride changed");
+		DCPipePool=New<FPipeBlock>(Mem,1,32)->Points;
+#else
+		DCPipePool=New<FTransform>(Mem,32);
+#endif
+		DCPipeRemaining=32;
+}
+static FTransform* DCAllocPipePoint(FMemStack& Mem)
+{
+	if( !DCPipeRemaining ) DCRefillPipePoints(Mem);
+	--DCPipeRemaining;
+	return DCPipePool++;
+}
 #endif
 
 //
@@ -963,6 +993,38 @@ static void Pipe( FTransform& Result, const FSceneNode* Frame, const FVector& In
 //
 // Clipping helper.
 //
+#if defined(PLATFORM_DREAMCAST)
+// Return both flag reductions by value, so no caller alias forces a spill.
+static SHZ_NO_INLINE __attribute__((noclone)) DWORD DCGatherBspPoints(
+	const FVert* Verts, INT Count, FTransform** Dest)
+{
+	FTransform** const Cache=URender::PointCache;
+	BYTE* const Stamps=URender::PointCacheStamps;
+	const BYTE Generation=URender::PointCacheGeneration;
+	const FVector* const Points=GPoints;
+	const FSceneNode* const Frame=GFrame;
+	DWORD Reject=FVF_OutReject, Codes=0;
+	for(INT I=0;I<Count;++I)
+	{
+		const INT Index=Verts[I].pVertex;
+		FTransform* Point;
+		if(Stamps[Index]!=Generation)
+		{
+			Point=DCAllocPipePoint(URender::VectorMem);
+			Pipe(*Point,Frame,Points[Index]);
+			Cache[Index]=Point;
+			Stamps[Index]=Generation;
+			DCFrameCount(DCFC_Points);
+			STAT(GStat.NumPoints++);
+		}
+		else Point=Cache[Index];
+		Dest[I]=Point;
+		Reject &= Point->Flags;
+		Codes |= Point->Flags;
+	}
+	return Reject | (Codes<<8);
+}
+#endif
 static FLOAT Dot[FBspNode::MAX_FINAL_VERTICES];
 
 static inline INT Clip( FTransform** Dest, FTransform** Src, INT SrcNum )
@@ -1008,22 +1070,13 @@ INT URender::ClipBspSurf( INT iNode, FTransform**& Result )
 	{
 		DC_FRAME_SCOPE(DCFS_Transform);
 #if defined(PLATFORM_DREAMCAST)
-		// XMTRX was loaded once at OccludeBsp entry.
-#endif
+		const DWORD Codes=DCGatherBspPoints(VertPool,NumPts,LocalPts);
+		Outcode=(BYTE)Codes;
+		AllCodes=(BYTE)(Codes>>8);
+#else
 		for( INT i=0; i<NumPts; i++ )
 		{
 			INT pPoint = VertPool[i].pVertex;
-#if defined(PLATFORM_DREAMCAST)
-			if( PointCacheStamps[pPoint] != PointCacheGeneration )
-			{
-				PointCacheStamps[pPoint] = PointCacheGeneration;
-				PointCache[pPoint] = new(VectorMem)FTransform;
-				DCFrameCount(DCFC_Points);
-				Pipe( *PointCache[pPoint], GFrame, GPoints[pPoint] );
-				STAT(GStat.NumPoints++);
-			}
-			FTransform* Point = PointCache[pPoint];
-#else
 			FStampedPoint& S = PointCache[pPoint];
 			if( S.Stamp != Stamp )
 			{
@@ -1033,12 +1086,12 @@ INT URender::ClipBspSurf( INT iNode, FTransform**& Result )
 				STAT(GStat.NumPoints++);
 			}
 			FTransform* Point = S.Point;
-#endif
 			LocalPts[i] = Point;
 			BYTE Flags  = Point->Flags;
 			Outcode    &= Flags;
 			AllCodes   |= Flags;
 		}
+#endif
 	}
 	if( Outcode )
 	{
@@ -1219,6 +1272,14 @@ FSceneNode* URender::CreateChildFrame
 	{
 		// Make a new scene frame.
 		Frame				= new(GSceneMem)FSceneNode(*Parent);
+#if defined(PLATFORM_DREAMCAST)
+		Frame->DCMirrorApertures = NULL;
+		Frame->DCMirrorView = 0;
+		FSceneNode* Root=Parent;
+		while( Root->Parent ) Root=Root->Parent;
+		Frame->DCViewId=Root->DCNextViewId++;
+		check(Frame->DCViewId<256);
+#endif
 		Frame->Span        	= new(GSceneMem)FSpanBuffer;
 		Frame->Viewport     = Parent->Viewport;
 		Frame->Level		= Level;
@@ -1269,6 +1330,9 @@ FRasterSpan HackRaster[480];//max y res 480!!
 FRasterSpan HackRaster[1200];//max y res 1200!!
 #endif
 INT RasterStartY, RasterEndY, RasterStartX, RasterEndX;
+#if defined(PLATFORM_DREAMCAST)
+__attribute__((optimize(DC_BSP_SMALL_CODE),noinline))
+#endif
 static UBOOL SetupRaster( FTransform** Pts, INT NumPts, FSpanBuffer* Span, INT EndY )
 {
 	guard(SetupRaster);
@@ -1396,6 +1460,9 @@ void URender::GetVisibleSurfs( UViewport* Viewport, TArray<INT>& iSurfs )
 // Checks whether the node's bouding box is totally occluded.  Returns 0 if
 // total occlusion, 1 if all or partial visibility.
 //
+#if defined(PLATFORM_DREAMCAST)
+__attribute__((optimize(DC_BSP_SMALL_CODE),noinline))
+#endif
 UBOOL URender::BoundVisible
 (
 	FSceneNode*		Frame,
@@ -1777,8 +1844,12 @@ void Traverse( FSceneNode* Frame, INT iNode )
 		Traverse( Frame, Node->iChild[1-IsFront] );	
 }
 
+
 void URender::OccludeBsp( FSceneNode* Frame )
 {
+#if defined(PLATFORM_DREAMCAST)
+	FDCPipePoolScope PipePoolScope;
+#endif
 	UModel*				Model;
 	FSpanBuffer			ZoneSpanBuffer[UBspNodes::MAX_ZONES];
 	FSpanBuffer*		SpanBuffer;
@@ -1788,6 +1859,7 @@ void URender::OccludeBsp( FSceneNode* Frame )
 	FBspNode*			Node;
 	FBspSurf*			Poly;
 	FNodeStack*			Stack;
+	FNodeStack*          FreeStack = NULL;
 	FTransform 			**Pts;
 	FVector				Origin;
 	DWORD				PolyFlags, PolyFlagMask, ExtraPolyFlags;
@@ -2004,7 +2076,12 @@ void URender::OccludeBsp( FSceneNode* Frame )
 				Stack->Pass  		= PASS_Plane;
 
 				FNodeStack* Next	= Stack;
-				Stack				= New<FNodeStack>(GMem);
+				if( FreeStack )
+				{
+					Stack = FreeStack;
+					FreeStack = FreeStack->Next;
+				}
+				else Stack = New<FNodeStack>(GMem);
 				Stack->Next			= Next;
 
 				iNode				= Node->iChild[IsFront];
@@ -2088,7 +2165,10 @@ void URender::OccludeBsp( FSceneNode* Frame )
 
 				// Setup.
 				uclock(GStat.RasterTime);
-				if( !SetupRaster( Pts, NumPts, (Node->NodeFlags & NF_PolyOccluded) ? SpanBuffer : NULL, Frame->Y ) )
+				if(
+#if defined(PLATFORM_DREAMCAST)
+#endif
+					!SetupRaster( Pts, NumPts, (Node->NodeFlags & NF_PolyOccluded) ? SpanBuffer : NULL, Frame->Y ) )
 				{
 					uunclock(GStat.RasterTime);
 					goto NextCoplanar;
@@ -2191,6 +2271,8 @@ void URender::OccludeBsp( FSceneNode* Frame )
 						Coords,
 						Toggle ? NULL : &Bounds
 					);
+					// Keep the existing merged sky span/frustum visibility. Do not
+					// impose an additional per-BSP-piece mirror aperture on skies.
 					unguard;
 				}
 				else if
@@ -2214,7 +2296,7 @@ void URender::OccludeBsp( FSceneNode* Frame )
 					Bounds.MinX = RasterStartX;
 					Bounds.MaxX = RasterEndX;
 
-					CreateChildFrame
+					FSceneNode* MirrorFrame = CreateChildFrame
 					(
 						Frame,
 						&TempDrawList->Span,
@@ -2226,6 +2308,16 @@ void URender::OccludeBsp( FSceneNode* Frame )
 						Frame->Coords.MirrorByPlane(Node->Plane),
 						Toggle ? NULL : &Bounds
 					);
+#if defined(PLATFORM_DREAMCAST)
+					FDCPortalAperture* Aperture = new(GSceneMem) FDCPortalAperture;
+					Aperture->Count = NumPts;
+					Aperture->Points = New<FVector>(GSceneMem,NumPts);
+					for( INT p=0; p<NumPts; ++p )
+						Aperture->Points[p] = FVector(Pts[p]->ScreenX,Pts[p]->ScreenY,0);
+					Aperture->Next = MirrorFrame->DCMirrorApertures;
+					MirrorFrame->DCMirrorApertures = Aperture;
+					MirrorFrame->DCMirrorView = 1;
+#endif
 					DrawBin = 0;
 					if( !(PolyFlags & PF_NoOcclude) )
 					{
@@ -2449,7 +2541,12 @@ void URender::OccludeBsp( FSceneNode* Frame )
 		// Return from recursion, noting that the node we're returning to is guaranteed visible if the
 		// child we're processing now is visible.
 		PopStack:
-		Stack = Stack->Next;
+		{
+			FNodeStack* Retired = Stack;
+			Stack = Stack->Next;
+			Retired->Next = FreeStack;
+			FreeStack = Retired;
+		}
 		if( !Stack )
 			break;
 
@@ -2847,6 +2944,10 @@ void URender::DrawFrame( FSceneNode* Frame )
 			if( Surface.LightMap || Surface.FogMap )
 				GLightManager->FinishSurf();
 		}
+#if defined(PLATFORM_DREAMCAST)
+		// Do not let reordered opaque lightmaps cross actors or pass boundaries.
+		Viewport->RenDev->FlushWorldLightmaps();
+#endif
 		if( Viewport->RenDev->SpanBased ? Pass==2 : Pass==1 )
 			for( FDynamicSprite* Sprite = Frame->Sprite; Sprite; Sprite=Sprite->RenderNext )
 				DrawActorSprite( Frame, Sprite );

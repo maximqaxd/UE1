@@ -45,11 +45,31 @@ struct FSavedPoly;
 // the view of the world to render.
 //
 class FSpanBuffer;
+#if defined(PLATFORM_DREAMCAST)
+// Convex BSP pieces of a mirror opening, in the parent view's screen space.
+struct FDCPortalAperture
+{
+	FDCPortalAperture* Next;
+	INT Count;
+	FVector* Points;
+};
+#endif
 struct FBspDrawList;
 struct FDynamicSprite;
 struct ENGINE_API FSceneNode
 {
-	FSceneNode() {}
+	FSceneNode() {
+#if defined(PLATFORM_DREAMCAST)
+		DCMirrorApertures = NULL;
+		DCMirrorView = 0;
+		DCViewId=0; DCNextViewId=1;
+#endif
+	}
+#if defined(PLATFORM_DREAMCAST)
+	FDCPortalAperture* DCMirrorApertures;
+	UBOOL DCMirrorView;
+	INT DCViewId, DCNextViewId;
+#endif
 	// Variables.
 	UViewport*		Viewport;	// Viewport the scene frame is attached to.
 	ULevel*			Level;		// Level this scene is being rendered from.

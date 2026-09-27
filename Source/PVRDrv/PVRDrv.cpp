@@ -279,56 +279,6 @@ static pvr_list_t     GPVRDirectList = (pvr_list_t)-1;
 static INT            GPVRCurrentPass = -1;
 static pvr_dr_state_t GPVRDRState;
 
-// Cooked opaque meshes alone may use the SH-4's 8 KiB OIX scratch. The
-// P2 aliases are essential: CCR changes must not execute from cached P1.
-static UBOOL GPVRMeshOIXSupported = 0;
-static UBOOL GPVRMeshOIXEntered = 0;
-static INT GPVRMeshlet = INDEX_NONE;
-static INT GPVRMeshScratchCount = 0;
-static const FSceneNode* GPVRMeshFrame = NULL;
-static const FTextureInfo* GPVRMeshTexture = NULL;
-static const FTransTexture* GPVRMeshKeys[256];
-static pvr_vertex_t* const GPVRMeshScratch = (pvr_vertex_t*)0x92000000;
-
-static void PVRMeshOIXEnterImpl()
-{
-	const int Mask = irq_disable();
-	dcache_purge_all();
-	volatile uint32_t* CCR = (volatile uint32_t*)0xFF00001C;
-	*CCR |= (1u << 7);
-	for( INT i=0; i<16; ++i ) __asm__ __volatile__("nop");
-	for( uintptr_t Address=0x92000000; Address<0x92002000; Address+=32 )
-		__asm__ __volatile__("movca.l r0,@%0" : : "r"(Address) : "memory");
-	irq_restore(Mask);
-}
-
-static void PVRMeshOIXLeaveImpl()
-{
-	const int Mask = irq_disable();
-	dcache_inval_range(0x92000000, 8192);
-	dcache_purge_all();
-	volatile uint32_t* CCR = (volatile uint32_t*)0xFF00001C;
-	*CCR &= ~(1u << 7);
-	for( INT i=0; i<16; ++i ) __asm__ __volatile__("nop");
-	irq_restore(Mask);
-}
-
-static void (*const PVRMeshOIXEnterP2)() = (void(*)())(((uintptr_t)&PVRMeshOIXEnterImpl & 0x1FFFFFFF) | 0xA0000000);
-static void (*const PVRMeshOIXLeaveP2)() = (void(*)())(((uintptr_t)&PVRMeshOIXLeaveImpl & 0x1FFFFFFF) | 0xA0000000);
-
-static void PVRMeshOIXLeave()
-{
-	if( GPVRMeshOIXEntered )
-	{
-		PVRMeshOIXLeaveP2();
-		GPVRMeshOIXEntered = 0;
-		GPVRMeshlet = INDEX_NONE;
-		GPVRMeshScratchCount = 0;
-		GPVRMeshFrame = NULL;
-		GPVRMeshTexture = NULL;
-	}
-}
-
 static void PVRStartList( pvr_list_t List )
 {
 	check( GPVRDirectList == (pvr_list_t)-1 );
@@ -350,15 +300,34 @@ static inline UBOOL PVRBeginDraw( pvr_list_t List, DWORD MaxBytes )
 	return List == GPVRDirectList;
 }
 
+static inline void PVRMirrorWrite(const void* Data)
+{
+	DWORD* Out=(DWORD*)pvr_dr_target(GPVRDRState);
+	const DWORD* In=(const DWORD*)Data;
+	for( INT i=0; i<8; ++i ) Out[i]=In[i];
+	pvr_dr_commit(Out);
+}
+
+#include "PVRMirrorClip.h"
+
 static inline void* PVRAlloc32( pvr_list_t List )
 {
 	check( List == GPVRDirectList );
+	if( GPVRMirrorFrame ) return &GPVRMirrorScratch;
 	return pvr_dr_target( GPVRDRState );
 }
 
 static inline void PVRCommit32( pvr_list_t List, void* Dst )
 {
 	check( List == GPVRDirectList );
+	if( GPVRMirrorFrame )
+	{
+		const DWORD Command=*(const DWORD*)Dst;
+		if( (Command & 0xE0000000u)==PVR_CMD_VERTEX )
+			PVRMirrorVertex(*(const pvr_vertex_t*)Dst);
+		else PVRMirrorWrite(Dst);
+		return;
+	}
 	pvr_dr_commit( Dst );
 }
 
@@ -388,6 +357,13 @@ struct FPVRHeaderCache
 	UBOOL TextureMipMapped;
 };
 static FPVRHeaderCache GPVRHeaderCache[PVR_LIST_PT_POLY + 1];
+struct FPVRCompiledHeader
+{
+	FPVRHeaderCache State;
+	pvr_list_t List;
+	pvr_poly_hdr_t Header;
+};
+static FPVRCompiledHeader GPVRCompiledHeaders[64];
 
 static inline void PVRInvalidateHeaders()
 {
@@ -545,7 +521,6 @@ void UPVRRenderDevice::InternalClassInitializer( UClass* Class )
 	guardSlow(UPVRRenderDevice::InternalClassInitializer);
 	new(Class, "NoFiltering",     RF_Public)UBoolProperty( CPP_PROPERTY(NoFiltering),     "Options", CPF_Config );
 	new(Class, "UseTriStrips",    RF_Public)UBoolProperty( CPP_PROPERTY(UseTriStrips),    "Options", CPF_Config );
-	new(Class, "UseMeshOIX",      RF_Public)UBoolProperty( CPP_PROPERTY(UseMeshOIX),      "Options", CPF_Config );
 	new(Class, "UseVQDynamicLightmaps", RF_Public)UBoolProperty( CPP_PROPERTY(UseVQDynamicLightmaps), "Options", CPF_Config );
 	new(Class, "DistanceFog",     RF_Public)UBoolProperty( CPP_PROPERTY(DistanceFog),     "Options", CPF_Config );
 	new(Class, "Overbright",      RF_Public)UBoolProperty( CPP_PROPERTY(Overbright),      "Options", CPF_Config );
@@ -564,7 +539,6 @@ UPVRRenderDevice::UPVRRenderDevice()
 {
 	NoFiltering = false;
 	UseTriStrips = true;
-	UseMeshOIX = false;
 	UseVQDynamicLightmaps = true;
 	// CPU culling avoids lighting and submitting hidden faces. The PVR's
 	// backface test occurs only after those costs have already been paid.
@@ -597,6 +571,8 @@ UPVRRenderDevice::UPVRRenderDevice()
 UBOOL UPVRRenderDevice::Init( UViewport* InViewport )
 {
 	guard(UPVRRenderDevice::Init)
+	WorldLightCount=WorldLightVertexCount=0; WorldLightFrame=NULL;
+	appMemset(GPVRCompiledHeaders,0,sizeof(GPVRCompiledHeaders));
 
 #if defined(PLATFORM_DREAMCAST)
 	if( !GPVRSessionInitialized )
@@ -611,18 +587,9 @@ UBOOL UPVRRenderDevice::Init( UViewport* InViewport )
 	PVRPoolInit();
 #endif
 
-	// Flycast builds without OIX must never receive ocbwb-backed mesh data.
-	// Probe once, outside a scene, and retain the normal SQ strip path there.
-	GPVRMeshOIXSupported = 0;
-	if( UseMeshOIX )
-	{
-		PVRMeshOIXEnterP2();
-		*(volatile BYTE*)GPVRMeshScratch = 0x5A;
-		GPVRMeshOIXSupported = (*(volatile BYTE*)GPVRMeshScratch == 0x5A);
-		PVRMeshOIXLeaveP2();
-	}
-	debugf( NAME_Log, "PVR mesh OIX: %s", !UseMeshOIX ? "disabled by config" :
-		GPVRMeshOIXSupported ? "enabled" : "unsupported, using SQ" );
+	// Reserve a far reciprocal-depth range for sky BSP. KOS defaults to a
+	// 0.0001 background depth, which would reject the scaled sky vertices.
+	pvr_set_zclip(1.0e-36f);
 
 	// Volumetric fog costs a third translucent pass per surface plus the
 	// per-texel Volumetric() loop in FLightManager, so it is opt-in.
@@ -692,6 +659,8 @@ void UPVRRenderDevice::Exit()
 void UPVRRenderDevice::Flush()
 {
 	guard(UPVRRenderDevice::Flush);
+	WorldLightCount=WorldLightVertexCount=0; WorldLightFrame=NULL;
+	appMemset(GPVRCompiledHeaders,0,sizeof(GPVRCompiledHeaders));
 
 	ResetTexture();
 	PVRInvalidateHeaders();
@@ -727,16 +696,24 @@ UBOOL UPVRRenderDevice::Exec( const char* Cmd, FOutputDevice* Out )
 #if defined(PLATFORM_DREAMCAST)
 	if( ParseCommand(&Cmd, "DCPDETAIL") )
 	{
+#if DC_FRAME_PROFILE
 		GDCFrameProfileDetailed = !GDCFrameProfileDetailed;
 		DCFrameProfileReset();
 		Out->Logf("Detailed profiling %s; wait 30 ticks", GDCFrameProfileDetailed ? "on" : "off");
+#else
+		DCFrameProfileReport(Out);
+#endif
 		return true;
 	}
 	if( ParseCommand(&Cmd, "DCPOVERLAY") )
 	{
+#if DC_FRAME_PROFILE && DC_PROFILE_OVERLAY
 		GDCFrameProfileOverlay = !GDCFrameProfileOverlay;
 		DCFrameProfileReset();
 		Out->Logf("Profile overlay %s; wait 30 ticks", GDCFrameProfileOverlay ? "on" : "off");
+#else
+		Out->Logf("Profile overlay compiled out (DREAMCAST_PROFILE_OVERLAY=OFF)");
+#endif
 		return true;
 	}
 	if( ParseCommand(&Cmd, "DCPPAGE") )
@@ -792,16 +769,24 @@ UBOOL UPVRRenderDevice::Exec( const char* Cmd, FOutputDevice* Out )
 	}
 	if( ParseCommand(&Cmd, "DCLEGACYTIMERS") )
 	{
+#if DC_FRAME_PROFILE
 		GDCLegacyTimers = !GDCLegacyTimers;
 		Out->Logf("Legacy timers %s", GDCLegacyTimers ? "on" : "off");
+#else
+		DCFrameProfileReport(Out);
+#endif
 		return true;
 	}
 #endif
 #if defined(PLATFORM_DREAMCAST)
 	if( ParseCommand(&Cmd, "DCPROFILE") )
 	{
+#if DC_FRAME_PROFILE
 		GDCFrameProfileEnabled = !GDCFrameProfileEnabled;
 		Out->Logf("Frame profile %s", GDCFrameProfileEnabled ? "on" : "off");
+#else
+		DCFrameProfileReport(Out);
+#endif
 		return true;
 	}
 #endif
@@ -815,15 +800,16 @@ UBOOL UPVRRenderDevice::Exec( const char* Cmd, FOutputDevice* Out )
 void UPVRRenderDevice::Lock( FPlane FlashScale, FPlane FlashFog, FPlane ScreenClear, DWORD RenderLockFlags, BYTE* InHitData, INT* InHitSize )
 {
 	guard(UPVRRenderDevice::Lock);
-	PVRMeshOIXLeave();
-	GDCMeshOIXActive = 0;
+	PVRMirrorSetFrame(NULL);
 	MeshDrawScope = false;
 
 	++TextureFrame;
 #if defined(PLATFORM_DREAMCAST)
+#if DC_FRAME_PROFILE
 	pvr_stats_t ProfileStats;
 	if( pvr_get_stats(&ProfileStats) == 0 )
 		DCFrameGPU(ProfileStats.frame_count, ProfileStats.rnd_last_time, ProfileStats.vtx_buffer_used);
+#endif
 #endif
 
 	PVRInvalidateHeaders();
@@ -845,11 +831,11 @@ void UPVRRenderDevice::Lock( FPlane FlashScale, FPlane FlashFog, FPlane ScreenCl
 
 void UPVRRenderDevice::BeginRenderPass( INT Pass )
 {
+	FlushWorldLightmaps();
 	check( Pass >= 0 && Pass <= 2 );
 	check( GPVRCurrentPass >= 0 && Pass >= GPVRCurrentPass );
 	while( GPVRCurrentPass < Pass )
 	{
-		PVRMeshOIXLeave();
 		PVRFinishList();
 		++GPVRCurrentPass;
 		const pvr_list_t List = GPVRCurrentPass == 1 ? PVR_LIST_PT_POLY : PVR_LIST_TR_POLY;
@@ -877,8 +863,9 @@ UBOOL UPVRRenderDevice::WantsMeshFlags( DWORD PolyFlags ) const
 void UPVRRenderDevice::Unlock( UBOOL Blit )
 {
 	guard(UPVRRenderDevice::Unlock);
+	FlushWorldLightmaps();
+	PVRMirrorSetFrame(NULL); // Flash/HUD are never reflected view geometry.
 	DC_FRAME_SCOPE(DCFS_Submit);
-	PVRMeshOIXLeave();
 
 	// KOS may close each list only once. DrawWorld and the HUD have already
 	// submitted directly to OP, PT and TR in that order.
@@ -928,6 +915,7 @@ void UPVRRenderDevice::Unlock( UBOOL Blit )
 //
 DWORD UPVRRenderDevice::AdjustFlags( DWORD PolyFlags ) const
 {
+	if( CurrentSceneNode.bIsSky ) PolyFlags &= ~PF_Occlude;
 	if( !(PolyFlags & (PF_Translucent|PF_Modulated)) && !CurrentSceneNode.bIsSky )
 		PolyFlags |= PF_Occlude;
 	else if( PolyFlags & PF_Translucent )
@@ -991,6 +979,22 @@ void UPVRRenderDevice::EmitHeader( pvr_list_t List, DWORD PolyFlags, const FTexS
 #if defined(PLATFORM_DREAMCAST)
 	DCFrameHeader();
 #endif
+	// Both state objects have static zero initialization (including padding).
+	// Full equality, not the hash alone, protects all hardware state changes.
+	const DWORD Hash=((uintptr_t)Texture>>5) ^ ((uintptr_t)Texture>>13)
+		^ ((uintptr_t)Texture>>19) ^ TextureFormat ^ StateBits
+		^ (DWORD)List*17 ^ (DWORD)Cull*7 ^ (NoDepth ? 31 : 0);
+	FPVRCompiledHeader& Compiled=GPVRCompiledHeaders[Hash & 63];
+	if( Compiled.State.Valid && Compiled.List==List
+		&& !appMemcmp(&Compiled.State,&Cache,sizeof(Cache)) )
+	{
+		DCFrameCount(DCFC_HeaderCacheHit);
+		pvr_poly_hdr_t* Out=(pvr_poly_hdr_t*)PVRAlloc32(List);
+		*Out=Compiled.Header;
+		PVRCommit32(List,Out);
+		return;
+	}
+	DCFrameCount(DCFC_HeaderCacheMiss);
 
 	pvr_poly_cxt_t Cxt;
 	if( Tex && Tex->Tex )
@@ -1092,6 +1096,7 @@ void UPVRRenderDevice::EmitHeader( pvr_list_t List, DWORD PolyFlags, const FTexS
 		DC_FRAME_SCOPE(DCFS_HeaderCompile);
 		pvr_poly_compile( &Hdr, &Cxt );
 	}
+	Compiled.State=Cache; Compiled.List=List; Compiled.Header=Hdr;
 
 	pvr_poly_hdr_t* Out = (pvr_poly_hdr_t*)PVRAlloc32( List );
 	*Out = Hdr;
@@ -1102,17 +1107,51 @@ void UPVRRenderDevice::EmitHeader( pvr_list_t List, DWORD PolyFlags, const FTexS
 	World surfaces.
 -----------------------------------------------------------------------------*/
 
+void UPVRRenderDevice::FlushWorldLightmaps()
+{
+	if( !WorldLightCount ) return;
+	check(GPVRDirectList==PVR_LIST_TR_POLY);
+	// Stable insertion sort of a tiny, screen-disjoint batch only.
+	for( INT i=1; i<WorldLightCount; ++i )
+	{
+		FWorldLightDraw Item=WorldLightDraws[i]; INT j=i;
+		while( j && WorldLightDraws[j-1].Tex.Key>Item.Tex.Key )
+		{ WorldLightDraws[j]=WorldLightDraws[j-1]; --j; }
+		WorldLightDraws[j]=Item;
+	}
+	if( WorldLightCount>1 ) DCFrameCount(DCFC_WorldBatchPolys,WorldLightCount);
+	for( INT i=0; i<WorldLightCount; ++i )
+	{
+		const FWorldLightDraw& D=WorldLightDraws[i];
+		EmitHeader(PVR_LIST_TR_POLY,D.Flags,&D.Tex,0);
+		for( INT v=0; v<D.Count; ++v )
+		{
+			pvr_vertex_t* Out=(pvr_vertex_t*)PVRAlloc32(PVR_LIST_TR_POLY);
+			*Out=WorldLightVertices[D.First+v];
+			PVRCommit32(PVR_LIST_TR_POLY,Out);
+		}
+	}
+	WorldLightCount=WorldLightVertexCount=0;
+	WorldLightFrame=NULL;
+}
+
 void UPVRRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& Surface, FSurfaceFacet& Facet )
 {
 	guard(UPVRRenderDevice::DrawComplexSurface);
+	const UBOOL BatchCandidate=GPVRDirectList==PVR_LIST_TR_POLY
+		&& Surface.LightMap && !Surface.FogMap
+		&& !(Surface.PolyFlags & (PF_Translucent|PF_Modulated|PF_Highlighted|PF_Masked|PF_Invisible|PF_Portal));
+	if( !BatchCandidate || (WorldLightCount && WorldLightFrame!=Frame) ) FlushWorldLightmaps();
 
 	check(Surface.Texture);
 
 	SetSceneNode( Frame );
 
-	// @HACK: Don't draw translucent and masked parts of the sky. The PVR has
-	// no mid-scene depth clear, so portals and sky share one depth range.
-	if( CurrentSceneNode.bIsSky && ( Surface.PolyFlags & (PF_Translucent|PF_Masked) ) )
+	// Sky layers are emitted normally; their depth is placed behind the
+	// world below, without flattening reciprocal W (which distorts UVs).
+	// Invisible mirror masks used to paint black and overwrite the reflected
+	// view's depth. Reflection geometry is now clipped to its opening instead.
+	if( (Surface.PolyFlags & (PF_Mirrored|PF_Invisible))==(PF_Mirrored|PF_Invisible) )
 		return;
 
 	const DWORD BaseFlags = AdjustFlags( Surface.PolyFlags );
@@ -1141,6 +1180,10 @@ void UPVRRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& Surf
 		CaptureTexState( Light );
 		LightFlags = PF_Modulated | (Surface.PolyFlags & PF_Masked);
 	}
+	// Only immutable preloaded VQ pages can survive deferred binding safely.
+	const UBOOL BatchLight=BatchCandidate && !DrawBase && !CurrentSceneNode.bIsSky
+		&& (Light.Key & ((QWORD)1<<63)) && (Light.Format & PVR_TXRFMT_VQ_ENABLE);
+	if( !BatchLight ) FlushWorldLightmaps();
 
 	// Volumetric light shafts, when the device advertises fog maps.
 	FTexState Fog;
@@ -1231,13 +1274,46 @@ void UPVRRenderDevice::DrawComplexSurface( FSceneNode* Frame, FSurfaceInfo& Surf
 		// Lightmap modulate pass.
 		if( DrawLight && PVRBeginDraw( PVR_LIST_TR_POLY, MaxBytes ) )
 		{
-			EmitHeader( PVR_LIST_TR_POLY, LightFlags, &Light, 0 );
 			for( i = 0; i < Count; ++i )
 			{
 				Verts[i].U = ( Dots[i][0] - Light.UPan ) * Light.UMult;
 				Verts[i].V = ( Dots[i][1] - Light.VPan ) * Light.VMult;
 			}
-			PVREmitConvexStrip( PVR_LIST_TR_POLY, Verts, Count );
+			if( BatchLight && Count<=256 )
+			{
+				FLOAT MinX=Verts[0].SX, MaxX=MinX, MinY=Verts[0].SY, MaxY=MinY;
+				for( i=1; i<Count; ++i )
+				{ MinX=Min(MinX,Verts[i].SX); MaxX=Max(MaxX,Verts[i].SX);
+				  MinY=Min(MinY,Verts[i].SY); MaxY=Max(MaxY,Verts[i].SY); }
+				UBOOL Overlap=0;
+				for( i=0; i<WorldLightCount; ++i )
+				{
+					const FWorldLightDraw& D=WorldLightDraws[i];
+					// One-pixel guard also preserves shared-edge rasterization order.
+					Overlap |= !(MaxX+1<D.MinX || MinX>D.MaxX+1 || MaxY+1<D.MinY || MinY>D.MaxY+1);
+				}
+				if( Overlap || WorldLightCount==16 || WorldLightVertexCount+Count>256 ) FlushWorldLightmaps();
+				WorldLightFrame=Frame;
+				FWorldLightDraw& D=WorldLightDraws[WorldLightCount++];
+				D.Tex=Light; D.Flags=LightFlags; D.First=WorldLightVertexCount; D.Count=Count;
+				D.MinX=MinX; D.MaxX=MaxX; D.MinY=MinY; D.MaxY=MaxY;
+				INT Lo=2, Hi=Count-1;
+				for( i=0; i<Count; ++i )
+				{
+					const INT Index=i<2 ? i : (i&1) ? Lo++ : Hi--;
+					const FPVRVert& V=Verts[Index];
+					pvr_vertex_t& Out=WorldLightVertices[WorldLightVertexCount++];
+					Out.flags=i==Count-1 ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
+					Out.x=V.SX; Out.y=V.SY; Out.z=V.SZ; Out.u=V.U; Out.v=V.V;
+					Out.argb=V.ARGB; Out.oargb=0;
+				}
+			}
+			else
+			{
+				FlushWorldLightmaps();
+				EmitHeader(PVR_LIST_TR_POLY,LightFlags,&Light,0);
+				PVREmitConvexStrip(PVR_LIST_TR_POLY,Verts,Count);
+			}
 		}
 
 		// Volumetric fog pass.
@@ -1320,7 +1396,7 @@ static void PVREmitClippedTriangle( pvr_list_t List, const FSceneNode* Frame, co
 void UPVRRenderDevice::DrawGouraudPolygon( FSceneNode* Frame, FTextureInfo& Texture, FTransTexture** Pts, INT NumPts, DWORD PolyFlags, FSpanBuffer* SpanBuffer )
 {
 	guard(UPVRRenderDevice::DrawGouraudPolygon);
-	PVRMeshOIXLeave();
+	FlushWorldLightmaps();
 
 	if( NumPts < 3 || NumPts > FBspNode::MAX_FINAL_VERTICES )
 		return;
@@ -1384,7 +1460,7 @@ void UPVRRenderDevice::DrawGouraudPolygon( FSceneNode* Frame, FTextureInfo& Text
 void UPVRRenderDevice::DrawGouraudTriStrip( FSceneNode* Frame, FTextureInfo& Texture, FTransTexture** Pts, INT NumPts, DWORD PolyFlags, FSpanBuffer* SpanBuffer )
 {
 	guard(UPVRRenderDevice::DrawGouraudTriStrip);
-	PVRMeshOIXLeave();
+	FlushWorldLightmaps();
 
 	if( NumPts < 3 )
 		return;
@@ -1445,27 +1521,108 @@ void UPVRRenderDevice::DrawGouraudTriStrip( FSceneNode* Frame, FTextureInfo& Tex
 
 void UPVRRenderDevice::BeginCookedMesh()
 {
-	PVRMeshOIXLeave();
+	FlushWorldLightmaps();
 	MeshBatchFrame = NULL;
 	MeshBatchTexture = NULL;
 	MeshDrawScope = true;
-	GPVRMeshlet = INDEX_NONE;
-	GPVRMeshScratchCount = 0;
 }
 
 void UPVRRenderDevice::EndCookedMesh()
 {
-	PVRMeshOIXLeave();
 	MeshBatchFrame = NULL;
 	MeshBatchTexture = NULL;
 	MeshDrawScope = false;
+}
+
+INT UPVRRenderDevice::DrawIndexedMeshRanges( FSceneNode* Frame, FTextureInfo& Texture,
+	const FTransTexture* Samples, FDCMeshDrawCache& Cache,
+	const FDCMeshDrawRange* Ranges, INT Count, DWORD PolyFlags )
+{
+	if( !MeshDrawScope
+		|| (PolyFlags & (PF_Environment|PF_Unlit|PF_Invisible)) ) return 0;
+	const DWORD Flags=AdjustFlags(PolyFlags);
+	const pvr_list_t List=ListFor(Flags);
+	if( List!=GPVRDirectList ) return Count;
+	INT Ready=0;
+	{
+	DC_FRAME_SCOPE(DCFS_MeshDrawCache);
+	// Validate/cache the accepted prefix as a block: no timers per vertex or
+	// strip, and no TA writes until we know exactly which ranges can proceed.
+	for( ; Ready<Count; ++Ready )
+	{
+		const FDCMeshDrawRange& Range=Ranges[Ready];
+		if( Range.Count<3 ) goto CacheDone;
+		// Validate the whole strip before its header/vertices. Only immutable
+		// native samples enter this cache; fallback operates on corner copies.
+		for( INT i=0; i<Range.Count; ++i )
+		{
+			const INT Index=Range.Indices[i];
+			if( Index>=Cache.Count ) goto CacheDone;
+			if( !Cache.State[Index] )
+			{
+				const FTransTexture& P=Samples[Index];
+				if( P.Flags || P.Point.Z<PVR_NEAR_Z ) Cache.State[Index]=2;
+				else
+				{
+					FDCMeshDrawVertex& V=Cache.Vertices[Index];
+					V.X=P.ScreenX; V.Y=P.ScreenY; V.Z=P.RZ;
+					V.ARGB=PVRPackLight(P.Light);
+					Cache.State[Index]=1;
+				}
+			}
+			if( Cache.State[Index]!=1 ) goto CacheDone;
+		}
+	}
+	}
+CacheDone:
+	if( !Ready ) return 0;
+	FLOAT UScale, VScale;
+	{
+		DC_FRAME_SCOPE(DCFS_MeshDrawSetup);
+		UScale=Texture.UScale*Texture.USize/256.0;
+		VScale=Texture.VScale*Texture.VSize/256.0;
+		{
+			if( MeshBatchFrame!=Frame || MeshBatchTexture!=&Texture || MeshBatchFlags!=PolyFlags )
+			{
+				SetSceneNode(Frame); SetTexture(Texture,PolyFlags & PF_Masked,0.f);
+				MeshBatchFrame=Frame; MeshBatchTexture=&Texture; MeshBatchFlags=PolyFlags;
+			}
+			FTexState Tex; CaptureTexState(Tex);
+			const pvr_cull_mode_t Cull=UseHardwareMeshCull && Frame->Mirror==1.f
+				&& Frame->NearClip.W==0.f && (Flags & (PF_TwoSided|PF_Flat))==PF_Flat
+				? PVR_CULLING_CCW : PVR_CULLING_NONE;
+			EmitHeader(List,Flags,&Tex,0,Cull);
+		}
+	}
+	{
+	DC_FRAME_SCOPE(DCFS_MeshDrawEmit);
+	for( INT r=0; r<Ready; ++r )
+	{
+		const FDCMeshDrawRange& Range=Ranges[r];
+		for( INT i=-INT(Range.OddStart); i<Range.Count; ++i )
+		{
+			const INT Corner=Max(i,0);
+			const FDCMeshDrawVertex& P=Cache.Vertices[Range.Indices[Corner]];
+			const DWORD UV=Range.UVs[Corner];
+			pvr_vertex_t* V=(pvr_vertex_t*)PVRAlloc32(List);
+			V->flags=i==Range.Count-1 ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
+			V->x=P.X; V->y=P.Y; V->z=P.Z;
+			V->u=((UV&255)*UScale)*TexInfo.UMult;
+			V->v=((UV>>8)*VScale)*TexInfo.VMult;
+			V->argb=(PolyFlags & PF_Modulated) ? 0xffffffffu : P.ARGB;
+			V->oargb=0;
+			PVRCommit32(List,V);
+		}
+	}
+	}
+	return Ready;
 }
 
 UBOOL UPVRRenderDevice::DrawIndexedMeshStrip( FSceneNode* Frame, FTextureInfo& Texture,
 	const FTransTexture* Samples, const _WORD* Indices, const _WORD* UVs,
 	INT Count, UBOOL OddStart, DWORD PolyFlags )
 {
-	if( !MeshDrawScope || GPVRMeshOIXSupported || Count < 3
+	if( !MeshDrawScope || Count < 3
 		|| (PolyFlags & (PF_Environment|PF_Unlit|PF_Invisible)) )
 		return 0;
 	const DWORD Flags = AdjustFlags(PolyFlags);
@@ -1507,83 +1664,6 @@ UBOOL UPVRRenderDevice::DrawIndexedMeshStrip( FSceneNode* Frame, FTextureInfo& T
 	return 1;
 }
 
-UBOOL UPVRRenderDevice::DrawCookedMeshStrip( FSceneNode* Frame, FTextureInfo& Texture,
-	FTransTexture** Pts, INT NumPts, DWORD PolyFlags, FSpanBuffer* SpanBuffer, INT MeshletId )
-{
-	// Cooked opaque strips use OIX by default, including short strips. All
-	// other lists and near-plane clipping retain the direct-SQ renderer.
-	if( !GPVRMeshOIXSupported || NumPts < 3 || NumPts > 256
-		|| GPVRDirectList != PVR_LIST_OP_POLY )
-		return 0;
-	const DWORD Flags = AdjustFlags(PolyFlags);
-	if( ListFor(Flags) != PVR_LIST_OP_POLY )
-		return 0;
-	for( INT i=0; i<NumPts; ++i )
-		if( Pts[i]->Point.Z < PVR_NEAR_Z )
-			return 0;
-
-	// Texture setup may stream, upload, or yield. Keep OIX only across runs
-	// that use the already-bound state; end the phase before any new bind.
-	if( !GPVRMeshOIXEntered || GPVRMeshFrame != Frame || GPVRMeshTexture != &Texture )
-	{
-		PVRMeshOIXLeave();
-		SetSceneNode(Frame);
-		SetTexture(Texture, (PolyFlags & PF_Masked), 0.f);
-		GPVRMeshFrame = Frame;
-		GPVRMeshTexture = &Texture;
-	}
-	FTexState Tex;
-	CaptureTexState(Tex);
-	if( !PVRBeginDraw(PVR_LIST_OP_POLY, 32 + NumPts * 32) )
-		return 1;
-	const pvr_cull_mode_t Cull = MeshDrawScope && UseHardwareMeshCull
-		&& Frame->Mirror == 1.f && Frame->NearClip.W == 0.f
-		&& (Flags & (PF_TwoSided|PF_Flat|PF_Invisible)) == PF_Flat
-		&& !(Flags & (PF_Environment|PF_Unlit))
-		? PVR_CULLING_CCW : PVR_CULLING_NONE;
-	EmitHeader(PVR_LIST_OP_POLY, Flags, &Tex, 0, Cull);
-
-	// Each cooker meshlet has at most 128 source vertices. Reserve up to 256
-	// cache lines for UV seams, and recycle those lines on a meshlet change.
-	if( GPVRMeshlet != MeshletId || GPVRMeshScratchCount + NumPts > 256 )
-	{
-		appMemset(GPVRMeshKeys, 0, sizeof(GPVRMeshKeys));
-		GPVRMeshScratchCount = 0;
-		GPVRMeshlet = MeshletId;
-	}
-	if( !GPVRMeshOIXEntered )
-	{
-		PVRMeshOIXEnterP2();
-		GPVRMeshOIXEntered = 1;
-	}
-
-	const UBOOL Modulated = (PolyFlags & PF_Modulated) != 0;
-	for( INT i=0; i<NumPts; ++i )
-	{
-		const FTransTexture* P = Pts[i];
-		INT Slot = ((uintptr_t)P >> 4) & 255;
-		while( GPVRMeshKeys[Slot] && GPVRMeshKeys[Slot] != P )
-			Slot = (Slot + 1) & 255;
-		pvr_vertex_t* Vtx = &GPVRMeshScratch[Slot];
-		if( !GPVRMeshKeys[Slot] )
-		{
-			GPVRMeshKeys[Slot] = P;
-			++GPVRMeshScratchCount;
-			Vtx->x = P->ScreenX;
-			Vtx->y = P->ScreenY;
-			Vtx->z = P->RZ;
-		}
-		Vtx->flags = (i == NumPts - 1) ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
-		Vtx->u = P->U * TexInfo.UMult;
-		Vtx->v = P->V * TexInfo.VMult;
-		Vtx->argb = Modulated ? 0xFFFFFFFFu : PVRPackLight(P->Light);
-		Vtx->oargb = 0;
-		__asm__ __volatile__("ocbwb @%0" : : "r"(Vtx) : "memory");
-	}
-	GDCMeshOIXActive = 1;
-	return 1;
-}
-
 /*-----------------------------------------------------------------------------
 	Tiles.
 -----------------------------------------------------------------------------*/
@@ -1591,6 +1671,7 @@ UBOOL UPVRRenderDevice::DrawCookedMeshStrip( FSceneNode* Frame, FTextureInfo& Te
 void UPVRRenderDevice::DrawTile( FSceneNode* Frame, FTextureInfo& Texture, FLOAT X, FLOAT Y, FLOAT XL, FLOAT YL, FLOAT U, FLOAT V, FLOAT UL, FLOAT VL, FSpanBuffer* Span, FLOAT Z, FPlane Light, FPlane Fog, DWORD PolyFlags )
 {
 	guard(UPVRRenderDevice::DrawTile);
+	FlushWorldLightmaps();
 	if( GPVRDirectList != PVR_LIST_TR_POLY )
 		return;
 
@@ -1622,9 +1703,9 @@ void UPVRRenderDevice::DrawTile( FSceneNode* Frame, FTextureInfo& Texture, FLOAT
 
 	// Screen-space overlay depth. Ordering between tiles comes from submission
 	// order, so every tile can share one depth in front of the world.
-	const FLOAT TileZ = OverlayZUI;
+	const FLOAT TileZ = GPVRMirrorFrame ? Frame->Proj.Z / Max(Z,1.f) : OverlayZUI;
 
-	EmitHeader( List, PolyFlags, &Tex, /*NoDepth=*/1 );
+	EmitHeader( List, PolyFlags, &Tex, /*NoDepth=*/GPVRMirrorFrame ? 0 : 1 );
 
 	const DWORD ARGB = ( PolyFlags & PF_Modulated ) ? 0xFFFFFFFFu : PVRPackLight( Light );
 
@@ -1741,6 +1822,8 @@ void UPVRRenderDevice::ClearZ( FSceneNode* Frame )
 
 void UPVRRenderDevice::SetSceneNode( FSceneNode* Frame )
 {
+	if( WorldLightCount && WorldLightFrame!=Frame ) FlushWorldLightmaps();
+	PVRMirrorSetFrame(Frame);
 	MeshBatchFrame = NULL;
 	guard(UPVRRenderDevice::SetSceneNode);
 
@@ -1771,6 +1854,15 @@ void UPVRRenderDevice::SetSceneNode( FSceneNode* Frame )
 	{
 		AActor* ZoneActor = Frame->Level->Model->Nodes->Zones[Frame->ZoneNumber].ZoneActor;
 		CurrentSceneNode.bIsSky = ( Cast<ASkyZoneInfo>( ZoneActor ) != NULL );
+	}
+	// Sky has an explicit opening mask now. Restore the previously visible
+	// 2^-24 range, once at final submission (also covers sky sprites/meshes).
+	if( CurrentSceneNode.bIsSky )
+	{
+		// Route sky vertices through depth scaling, but only clip against
+		// genuine ancestor mirrors, never individual fake-backdrop pieces.
+		GPVRMirrorFrame=Frame;
+		GPVRMirrorDepthScale=1.f/16777216.f;
 	}
 
 	if( Frame->FX != CurrentSceneNode.FX || Frame->FY != CurrentSceneNode.FY ||
@@ -2784,11 +2876,11 @@ void* UPVRRenderDevice::ConvertTextureMipBGRA7777( const FMipmap* Mip )
 // they cannot go through the RGB565 path above. Four bits of alpha is ample
 // for a volumetric gradient.
 //
-void* UPVRRenderDevice::ConvertTextureMipBGRA7777Alpha( const FMipmap* Mip )
+void* UPVRRenderDevice::ConvertTextureMipBGRA7777Alpha( const FMipmap* Mip, INT UClamp, INT VClamp )
 {
-	const INT USize = Mip->USize;
-	const INT VSize = Mip->VSize;
-	const FColor* Src = (const FColor*)Mip->DataPtr;
+	const INT USize = Max(MinTexSize, Mip->USize);
+	const INT VSize = Max(MinTexSize, Mip->VSize);
+	const FColor* Pixels = (const FColor*)Mip->DataPtr;
 	const DWORD Count = USize * VSize;
 	const DWORD StartCycles = appCycles();
 
@@ -2796,8 +2888,12 @@ void* UPVRRenderDevice::ConvertTextureMipBGRA7777Alpha( const FMipmap* Mip )
 	_WORD* Dst = (_WORD*)Compose;
 
 	// Source components are 7-bit (BGRA7777); shift down to 4.
-	for( DWORD i = 0; i < Count; ++i, ++Src )
+	for( INT y = 0; y < VSize; ++y )
+	for( INT x = 0; x < USize; ++x )
 	{
+		// The light manager only fills the clamped rectangle, not POT padding.
+		const FColor* Src = Pixels + Min(y * Mip->VSize / VSize, VClamp-1) * Mip->USize
+			+ Min(x * Mip->USize / USize, UClamp-1);
 		*Dst++ = (_WORD)( ((Src->A & 0x78) << 9)
 		                | ((Src->R & 0x78) << 5)
 		                | ((Src->G & 0x78) << 1)
@@ -3474,12 +3570,14 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, UBOOL NewTexture, UBOO
 		Bind->PaletteBank = INDEX_NONE;
 		Bind->PaletteMasked = 0;
 	}
-	else if( (Info.CacheID & 0xFF) == CID_RenderFogMap
-		&& Mip0->USize >= MinTexSize && Mip0->VSize >= MinTexSize )
+	else if( (Info.CacheID & 0xFF) == CID_RenderFogMap )
 	{
 		// Volumetric fog map: ARGB4444 so the coverage alpha survives.
-		void* Lin = ConvertTextureMipBGRA7777Alpha( Mip0 );
-		const INT SizeBytes = Mip0->USize * Mip0->VSize * 2;
+		void* Lin = ConvertTextureMipBGRA7777Alpha( Mip0,
+			Clamp(Info.UClamp,1,Mip0->USize), Clamp(Info.VClamp,1,Mip0->VSize) );
+		const INT USize = Max(MinTexSize, Mip0->USize);
+		const INT VSize = Max(MinTexSize, Mip0->VSize);
+		const INT SizeBytes = USize * VSize * 2;
 		if( Bind->Tex && Bind->SizeBytes != SizeBytes )
 		{
 			PVRPoolFree( Bind->Tex );
@@ -3496,8 +3594,8 @@ void UPVRRenderDevice::UploadTexture( FTextureInfo& Info, UBOOL NewTexture, UBOO
 		}
 		pvr_txr_load( Lin, Bind->Tex, SizeBytes );
 		Bind->DCFormat = PVR_TXRFMT_ARGB4444 | PVR_TXRFMT_NONTWIDDLED;
-		Bind->DCWidth = Mip0->USize;
-		Bind->DCHeight = Mip0->VSize;
+		Bind->DCWidth = USize;
+		Bind->DCHeight = VSize;
 		Bind->DCMipMapped = 0;
 		Bind->PaletteBank = INDEX_NONE;
 		Bind->PaletteMasked = 0;

@@ -325,21 +325,31 @@ static UBOOL EmitMeshStrip
 	const FDCMeshRun&	Run,
 	INT					FirstSlot,
 	INT					LastSlot,
-	FTransTexture**		Pts,
-	FTransTexture*		Corners,
+	FTransTexture**&		Pts,
+	FTransTexture*&		Corners,
+	INT&                Capacity,
 	const TArray<_WORD>* Indices=NULL, const TArray<_WORD>* UVs=NULL
 )
 {
 	guardSlow(EmitMeshStrip);
 
 	// The PVR fast path consumes immutable samples and separate corner UVs.
-	// Returning false leaves clipping, OIX and unusual materials on the old path.
+	// Returning false leaves clipping and unusual materials on the old path.
 	const _WORD* NativeIndices = Indices ? &(*Indices)(Run.First+FirstSlot) : &Mesh->DCIndices(Run.First+FirstSlot);
 	const _WORD* NativeUVs = UVs ? &(*UVs)(Run.First+FirstSlot) : &Mesh->DCUVs(Run.First+FirstSlot);
 	if( Frame->Viewport->RenDev->DrawIndexedMeshStrip(Frame,Info,Samples,NativeIndices,NativeUVs,
 		LastSlot-FirstSlot+1,FirstSlot&1,PolyFlags) )
 		return 1;
 
+	// The direct indexed path needs no corner-copy storage. Allocate only on
+	// its first fallback, growing for a longer range if necessary.
+	const INT Needed=LastSlot-FirstSlot+1;
+	if( Needed>Capacity )
+	{
+		Pts=New<FTransTexture*>(GMem,Needed+1);
+		Corners=New<FTransTexture>(GMem,Needed);
+		Capacity=Needed;
+	}
 	INT Num = 0;
 	for( INT Slot=FirstSlot; Slot<=LastSlot; Slot++ )
 	{
@@ -366,8 +376,7 @@ static UBOOL EmitMeshStrip
 		Pts[Num++] = &V;
 	}
 
-	if( !Frame->Viewport->RenDev->DrawCookedMeshStrip( Frame, Info, Pts, Num, PolyFlags, SpanBuffer, Run.Reserved ) )
-		Frame->Viewport->RenDev->DrawGouraudTriStrip( Frame, Info, Pts, Num, PolyFlags, SpanBuffer );
+	Frame->Viewport->RenDev->DrawGouraudTriStrip( Frame, Info, Pts, Num, PolyFlags, SpanBuffer );
 	return 1;
 
 	unguardSlow;
@@ -524,7 +533,8 @@ static INT DCBuildVisibleRanges(FSceneNode* Frame, UMesh* Mesh, FTransTexture* S
 
 static void DCDrawVisibleRanges(FSceneNode* Frame, UMesh* Mesh, FTransTexture* Samples,
 	FSpanBuffer* Span, DWORD ExtraFlags, FDCVisibleRange* Ranges, INT Count,
-	FTransTexture** StripPts, FTransTexture* StripCorners, UBOOL UseStrips, const FDCMeshView& View)
+	FTransTexture**& StripPts, FTransTexture*& StripCorners, INT& StripCapacity,
+	UBOOL UseStrips, const FDCMeshView& View, FDCMeshDrawCache* DrawCache)
 {
 	for( INT r=0; r<Count; ++r )
 	{
@@ -535,9 +545,49 @@ static void DCDrawVisibleRanges(FSceneNode* Frame, UMesh* Mesh, FTransTexture* S
 		if( !(Flags & PF_Invisible) && !Frame->Viewport->RenDev->WantsMeshFlags(Flags) ) continue;
 		FTextureInfo& Info=Textures[Mat.Texture] && !(Flags & PF_Environment) ? TextureInfo[Mat.Texture] : EnvironmentInfo;
 		UScale=Info.UScale*Info.USize/256.0; VScale=Info.VScale*Info.VSize/256.0;
-		if( UseStrips && Range.Last>Range.First && (Flags & PF_Flat)
+		if( UseStrips && DrawCache && (Flags & PF_Flat)
+			&& !(Flags & (PF_Environment|PF_Unlit|PF_Invisible)) )
+		{
+			FDCMeshDrawRange Batch[32];
+			INT BatchCount=0;
+			{
+			DC_FRAME_SCOPE(DCFS_MeshDrawSetup);
+			// Contiguous ranges only: no material sorting of translucent draws,
+			// attachment replay or exceptional materials across this boundary.
+			for( INT b=r; b<Count && BatchCount<32; ++b )
+			{
+				const FDCVisibleRange& R=Ranges[b];
+				const FDCMeshRun& Next=(*View.Runs)(R.Run);
+				// A singleton is a valid three-vertex strip, including odd restarts.
+				if( Next.Material!=Run.Material || R.Last<R.First ) break;
+				FDCMeshDrawRange& B=Batch[BatchCount++];
+				B.Indices=&(*View.Indices)(Next.First+R.First-2);
+				B.UVs=&(*View.UVs)(Next.First+R.First-2);
+				B.Count=R.Last-R.First+3; B.OddStart=(R.First-2)&1;
+			}
+			}
+			if( BatchCount )
+			{
+				const INT Done=Frame->Viewport->RenDev->DrawIndexedMeshRanges(
+					Frame,Info,Samples,*DrawCache,Batch,BatchCount,Flags);
+				if( Done )
+				{
+					INT Tris=0, Singles=0;
+					for( INT b=0; b<Done; ++b )
+					{ Tris+=Batch[b].Count-2; Singles+=Batch[b].Count==3; }
+					DCFrameCount(DCFC_MeshStripTris,Tris);
+					DCFrameCount(DCFC_MeshDirectSingles,Singles);
+					r+=Done-1;
+					continue;
+				}
+			}
+		}
+		// Includes legacy strips, corner copies, clipping and fallback submission.
+		// Attachment-only work is a measured component of OTHER.
+		DC_FRAME_SCOPE_NAMED(FallbackScope, (Flags & PF_Invisible) ? DCFS_MeshDrawAttachment : DCFS_MeshDrawFallback);
+		if( UseStrips && Range.Last>=Range.First && (Flags & PF_Flat)
 			&& !(Flags & (PF_Environment|PF_Invisible))
-			&& EmitMeshStrip(Frame,Mesh,Samples,Span,Info,Flags,Run,Range.First-2,Range.Last,StripPts,StripCorners,View.Indices,View.UVs) )
+			&& EmitMeshStrip(Frame,Mesh,Samples,Span,Info,Flags,Run,Range.First-2,Range.Last,StripPts,StripCorners,StripCapacity,View.Indices,View.UVs) )
 		{
 			DCFrameCount(DCFC_MeshStripTris,Range.Last-Range.First+1);
 			continue;
@@ -585,6 +635,7 @@ struct FDCPreparedMesh
 	INT Count;
 	FDCVisibleRange* Ranges;
 	INT NumRanges;
+	FDCMeshDrawCache* DrawCache;
 	UBOOL Lod;
 };
 static FDCPreparedMesh* GDCPreparedMeshes = NULL;
@@ -721,10 +772,12 @@ void URender::DrawMesh
 				&& Prepared->InputFlags==ExtraFlags && !appMemcmp(&Prepared->Coords,&Coords,sizeof(Coords)) )
 				break;
 	}
-	const INT CacheBytes = sizeof(FDCPreparedMesh) + Mesh->FrameVerts*sizeof(FTransTexture)
+	const INT CacheBytes = sizeof(FDCPreparedMesh) + sizeof(FDCMeshDrawCache)
+		+ Mesh->FrameVerts*(sizeof(FTransTexture)+sizeof(FDCMeshDrawVertex)+sizeof(BYTE))
 		+ TriangleCount*sizeof(FDCVisibleRange);
 	CacheEligible = CacheEligible && (Prepared || GDCPreparedMeshBytes+CacheBytes <= 128*1024);
 	if( CacheEligible && !Prepared ) GDCPreparedMeshBytes += CacheBytes;
+	FDCPreparedMesh* DrawCacheOwner=Prepared;
 #endif
 
 #if 0
@@ -1443,6 +1496,8 @@ void URender::DrawMesh
 			Entry->Count=VisibleTriangles;
 			Entry->Ranges=NativeRanges; Entry->NumRanges=NumNativeRanges;
 			Entry->Lod=View.Lod;
+			Entry->DrawCache=NULL;
+			DrawCacheOwner=Entry;
 		}
 #endif
 		}
@@ -1466,33 +1521,37 @@ void URender::DrawMesh
 			&& Frame->Mirror != -1;
 		FTransTexture** StripPts = NULL;
 		FTransTexture* StripCorners = NULL;
-		if( UseStrips )
+		INT StripCapacity=0;
+		FDCMeshDrawCache* DrawCache=DrawCacheOwner ? DrawCacheOwner->DrawCache : NULL;
+		if( UseStrips && NativeRanges && !DrawCache )
 		{
-			INT MaxRun = 0;
-			for( INT r=0; r<View.Runs->Num(); r++ )
-				MaxRun = Max<INT>( MaxRun, (*View.Runs)(r).Count );
-			if( MaxRun >= 3 && Mesh->FrameVerts > 0 )
-			{
-				StripPts   = New<FTransTexture*>( GMem, MaxRun+1 );
-				StripCorners = New<FTransTexture>( GMem, MaxRun );
-			}
-			else
-			{
-				UseStrips = 0;
-			}
+			DC_FRAME_SCOPE(DCFS_MeshDrawCache);
+			FMemStack& DrawMem=DrawCacheOwner ? GSceneMem : GMem;
+			DrawCache=New<FDCMeshDrawCache>(DrawMem);
+			DrawCache->Count=Mesh->FrameVerts;
+			DrawCache->Vertices=New<FDCMeshDrawVertex>(DrawMem,Mesh->FrameVerts);
+			DrawCache->State=New<BYTE>(DrawMem,Mesh->FrameVerts);
+			appMemset(DrawCache->State,0,Mesh->FrameVerts);
+			if( DrawCacheOwner ) DrawCacheOwner->DrawCache=DrawCache;
 		}
-		Frame->Viewport->RenDev->BeginCookedMesh();
+		{
+			DC_FRAME_SCOPE(DCFS_MeshDrawCleanup);
+			Frame->Viewport->RenDev->BeginCookedMesh();
+		}
 		FDCMeshTriangleCursor DCDrawCursor( *Mesh );
 #endif
 
 #if defined(PLATFORM_DREAMCAST)
 		if( NativeRanges )
 			DCDrawVisibleRanges(Frame,Mesh,Samples,SpanBuffer,ExtraFlags,NativeRanges,NumNativeRanges,
-				StripPts,StripCorners,UseStrips,View);
+				StripPts,StripCorners,StripCapacity,UseStrips,View,DrawCache);
 		else
 #endif
 		for( INT i=0; i<VisibleTriangles; i++ )
 		{
+#if defined(PLATFORM_DREAMCAST)
+			DC_FRAME_SCOPE(DCFS_MeshDrawFallback);
+#endif
 			// Set up the triangle.
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
 			FMeshTri& Tri = TriPool[i].Tri;
@@ -1524,7 +1583,7 @@ void URender::DrawMesh
 						&& TriPool[End+1].Tri.TextureIndex == Tri.TextureIndex )
 						End++;
 
-					if( End > i )
+					if( End >= i )
 					{
 						INT Index = Tri.TextureIndex;
 						FTextureInfo& StripInfo = Textures[Index] ? TextureInfo[Index] : EnvironmentInfo;
@@ -1532,7 +1591,7 @@ void URender::DrawMesh
 						VScale = StripInfo.VScale * StripInfo.VSize / 256.0;
 						if( EmitMeshStrip( Frame, Mesh, Samples, SpanBuffer, StripInfo, StripFlags,
 								Mesh->DCRuns(Run), TriPool[i].StripVert - 2, TriPool[End].StripVert,
-								StripPts, StripCorners ) )
+								StripPts, StripCorners, StripCapacity ) )
 						{
 							STAT(GStat.MeshSubCount += End - i + 1);
 							DCFrameCount( DCFC_MeshStripTris, End - i + 1 );
@@ -1602,6 +1661,8 @@ void URender::DrawMesh
 			}
 		}
 #if defined(PLATFORM_DREAMCAST)
+		{
+		DC_FRAME_SCOPE(DCFS_MeshDrawCleanup);
 		Frame->Viewport->RenDev->EndCookedMesh();
 #endif
 #if defined(PLATFORM_DREAMCAST)
@@ -1609,6 +1670,7 @@ void URender::DrawMesh
 #endif
 			GLightManager->FinishActor();
 #if defined(PLATFORM_DREAMCAST)
+		}
 		DCFrameLeave( DCFS_MeshDraw );
 #endif
 		unguardSlow;

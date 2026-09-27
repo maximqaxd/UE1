@@ -1,5 +1,13 @@
 #pragma once
 
+#ifndef DC_FRAME_PROFILE
+#define DC_FRAME_PROFILE 0
+#endif
+
+#ifndef DC_PROFILE_OVERLAY
+#define DC_PROFILE_OVERLAY 0
+#endif
+
 #if defined(PLATFORM_DREAMCAST)
 enum EDCFrameStage
 {
@@ -53,6 +61,12 @@ enum EDCFrameStage
 	DCFS_MeshVertexFog,
 	DCFS_MeshVertexProject,
 	DCFS_MeshDraw,
+	DCFS_MeshDrawCache,
+	DCFS_MeshDrawSetup,
+	DCFS_MeshDrawEmit,
+	DCFS_MeshDrawFallback,
+	DCFS_MeshDrawAttachment,
+	DCFS_MeshDrawCleanup,
 	DCFS_Count
 };
 enum EDCFrameCount
@@ -88,6 +102,8 @@ enum EDCFrameCount
 	DCFC_MeshPassSkipped, DCFC_MeshPreparedReuse, DCFC_MeshPoseReuse,
 	DCFC_MeshletReject,
 	DCFC_MeshLod,
+	DCFC_MeshDirectSingles,
+	DCFC_HeaderCacheHit, DCFC_HeaderCacheMiss, DCFC_WorldBatchPolys,
 	DCFC_Count
 };
 ENGINE_API void DCFrameCount( INT Counter, DWORD Amount = 1 );
@@ -98,8 +114,6 @@ extern ENGINE_API INT GDCFrameProfilePage;
 // 0 = original; 1 = no output fragments; 2 = diagnostic opaque-span bypass.
 extern ENGINE_API INT GDCSpanMode;
 extern ENGINE_API INT GDCStationaryLightHz;
-// Set only while a mesh actually uses the on-chip OIX work area.
-extern ENGINE_API UBOOL GDCMeshOIXActive;
 extern ENGINE_API UBOOL GDCMeshOptimize;
 ENGINE_API void DCFrameProfileReset();
 ENGINE_API void DCFrameProfileReport( FOutputDevice* Out );
@@ -114,6 +128,7 @@ ENGINE_API void DCFrameHeader();
 ENGINE_API void DCFrameGPU( DWORD Frame, QWORD Nanoseconds, DWORD VertexBytes );
 extern ENGINE_API UBOOL GDCFrameProfileEnabled;
 
+#if DC_FRAME_PROFILE
 class FDCFrameScope
 {
 	INT Stage;
@@ -124,6 +139,24 @@ public:
 #define DC_FRAME_SCOPE(Stage) FDCFrameScope DCFrameScope(Stage)
 #define DC_FRAME_SCOPE_NAMED(Name, Stage) FDCFrameScope Name(Stage)
 #define DC_FRAME_COUNT(Counter) DCFrameCount(Counter)
+#else
+// Discard arguments as well as calls: profiling must not evaluate hot-path work.
+#define DCFrameBegin(...) ((void)0)
+#define DCFrameEnd(...) ((void)0)
+#define DCFrameEnter(...) ((void)0)
+#define DCFrameLeave(...) ((void)0)
+#define DCFrameCount(...) ((void)0)
+#define DCFrameMeshLightStats(...) ((void)0)
+#define DCFrameUploadBytes(...) ((void)0)
+#define DCFrameHeader(...) ((void)0)
+#define DCFrameGPU(...) ((void)0)
+#define DCFrameDraw(...) ((void)0)
+#define DCFrameProfileReset(...) ((void)0)
+class FDCFrameScope { public: explicit FDCFrameScope(INT) {} };
+#define DC_FRAME_SCOPE(Stage)
+#define DC_FRAME_SCOPE_NAMED(Name, Stage)
+#define DC_FRAME_COUNT(Counter)
+#endif
 #else
 #define DC_FRAME_SCOPE(Stage)
 #define DC_FRAME_SCOPE_NAMED(Name, Stage)

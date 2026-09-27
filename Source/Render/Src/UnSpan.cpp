@@ -14,7 +14,7 @@ struct FDCSpanWork
     const UBOOL Enabled;
     FDCSpanWork()
 		: Links(0), Fragments(0), Outputs(0), ScreenSplits(0),
-          Enabled(GDCFrameProfileEnabled && GDCFrameProfileDetailed) {}
+          Enabled(DC_FRAME_PROFILE && GDCFrameProfileEnabled && GDCFrameProfileDetailed) {}
 
     ~FDCSpanWork()
     {
@@ -40,7 +40,7 @@ struct FDCSpanWork
 
 #define UPDATE_PREVLINK(START,END)\
 {\
-	TopSpan         = New<FSpan>(*Mem,1,4);\
+	TopSpan         = New<FSpan>(*Mem,1,DC_SPAN_ALIGN);\
     *PrevLink       = TopSpan;\
     TopSpan->Start  = START;\
     TopSpan->End    = END;\
@@ -52,7 +52,7 @@ struct FDCSpanWork
 {\
     DC_SPAN_FRAGMENT();\
     DC_SPAN_OUTPUT();\
-    NewSpan         = New<FSpan>(*Mem,1,4);\
+    NewSpan         = New<FSpan>(*Mem,1,DC_SPAN_ALIGN);\
     *PrevLink       = NewSpan;\
     NewSpan->Start  = START;\
     NewSpan->End    = END;\
@@ -98,6 +98,10 @@ void FSpanBuffer::AllocIndex( int AllocStartY, int AllocEndY, FMemStack* MemStac
 void FSpanBuffer::AllocIndexForScreen( INT SXR, INT SYR, FMemStack* MemStack )
 {
     guard(FSpanBuffer::AllocIndexForScreen);
+#if defined(PLATFORM_DREAMCAST) && DC_COMPACT_SPANS
+    if(SXR<0 || SXR>32767 || SYR<0 || SYR>32767)
+        appErrorf("Compact span viewport out of range: %dx%d",SXR,SYR);
+#endif
     int  i;
 
     Mem     = MemStack;
@@ -109,7 +113,7 @@ void FSpanBuffer::AllocIndexForScreen( INT SXR, INT SYR, FMemStack* MemStack )
 #endif
 
     Index       = New<FSpan*>(*Mem,SYR,4);
-    FSpan *List = New<FSpan>(*Mem,SYR,4);
+    FSpan *List = New<FSpan>(*Mem,SYR,DC_SPAN_POOL_ALIGN);
     for( i=0; i<SYR; i++ )
     {
         Index[i]        = &List[i];
@@ -310,7 +314,7 @@ INT FSpanBuffer::CopyFromRasterUpdate( FSpanBuffer& Screen, INT RasterStartY, IN
         {
             // Add partial chunk to span buffer.
             Accept = 1;
-            UPDATE_PREVLINK_ALLOC(Line->X[0],Min(Line->X[1], ScreenSpan->End));
+            UPDATE_PREVLINK_ALLOC(Line->X[0],Min(Line->X[1], (INT)ScreenSpan->End));
 
             // See if span entirely encloses raster; if so, break span
             // up into two pieces and we're done.
@@ -320,7 +324,7 @@ INT FSpanBuffer::CopyFromRasterUpdate( FSpanBuffer& Screen, INT RasterStartY, IN
                 // the same memory pool as the destination.
                 DC_SPAN_FRAGMENT();
                 DC_SPAN_SPLIT();
-                NewScreenSpan        = New<FSpan>(*Screen.Mem,1,4);
+                NewScreenSpan        = New<FSpan>(*Screen.Mem,1,DC_SPAN_ALIGN);
                 NewScreenSpan->Start = Line->X[1];
                 NewScreenSpan->End   = ScreenSpan->End;
                 NewScreenSpan->Next  = ScreenSpan->Next;
@@ -421,6 +425,104 @@ INT FSpanBuffer::TestRaster( INT RasterStartY, INT RasterEndY, FRasterSpan* Rast
 	return 0;
 }
 
+#if defined(PLATFORM_DREAMCAST)
+#define DC_SPAN_KERNEL SHZ_NO_INLINE __attribute__((noclone))
+#define DC_SPAN_COLD SHZ_NO_INLINE __attribute__((cold))
+#else
+#define DC_SPAN_KERNEL
+#define DC_SPAN_COLD
+#endif
+static DC_SPAN_COLD void DCRefillUpdateSpans(FSpanBuffer& Buffer)
+{
+	Buffer.UpdateSpanPool = New<FSpan>(*Buffer.Mem, 32, DC_SPAN_POOL_ALIGN);
+	Buffer.UpdateSpanRemaining = 32;
+}
+
+// Keep the row loop out of OccludeBsp's large register/stack working set.
+static DC_SPAN_KERNEL INT DCUpdateSpanKernel(FSpanBuffer& Buffer, INT FirstY,
+	INT LastY, INT RasterStartY, FRasterSpan* Raster, FDCSpanWork& SpanWork)
+{
+	if(FirstY>=LastY)return 0; // Do not form pointers outside empty intersections.
+	FSpan** Row = Buffer.Index + (FirstY-Buffer.StartY);
+	FRasterSpan* Line = Raster + (FirstY-RasterStartY);
+	INT Remaining = LastY-FirstY;
+	INT ValidDelta = 0;
+	INT Visible = 0;
+	for(; Remaining; --Remaining, ++Row, ++Line)
+	{
+		const INT RasterStart = Line->X[0];
+		const INT RasterEnd = Line->X[1];
+		if( RasterStart >= RasterEnd )
+			continue;
+
+		FSpan** PreviousLink = Row;
+		FSpan* Span = *PreviousLink;
+		while( Span && Span->End <= RasterStart )
+		{
+#if DC_FRAME_PROFILE
+			if( SpanWork.Enabled ) ++SpanWork.Links;
+#endif
+			PreviousLink = &Span->Next;
+			Span = Span->Next;
+		}
+		if( !Span )
+			continue;
+#if DC_FRAME_PROFILE
+		if( SpanWork.Enabled ) ++SpanWork.Links;
+#endif
+
+		if( Span->Start < RasterStart )
+		{
+			Visible = 1;
+			if( Span->End > RasterEnd )
+			{
+				// Split nodes survive until buffer release; allocate them in batches.
+				if( !Buffer.UpdateSpanRemaining )DCRefillUpdateSpans(Buffer);
+				FSpan* Right = Buffer.UpdateSpanPool++;
+				--Buffer.UpdateSpanRemaining;
+				Right->Start = RasterEnd;
+				Right->End = Span->End;
+				Right->Next = Span->Next;
+				Span->Next = Right;
+				Span->End = RasterStart;
+				++ValidDelta;
+#if DC_FRAME_PROFILE
+				if( SpanWork.Enabled ) ++SpanWork.Fragments;
+				DC_SPAN_SPLIT();
+#endif
+				continue;
+			}
+			Span->End = RasterStart;
+			PreviousLink = &Span->Next;
+			Span = Span->Next;
+		}
+
+		FSpan* FirstRemoved = Span;
+		while( Span && Span->End <= RasterEnd )
+		{
+#if DC_FRAME_PROFILE
+			if( SpanWork.Enabled ) ++SpanWork.Links;
+#endif
+			Visible = 1;
+			Span = Span->Next;
+			--ValidDelta;
+		}
+		// No observer runs inside this walk. Publish the surviving suffix once.
+		if( Span != FirstRemoved )
+			*PreviousLink = Span;
+		if( Span && Span->Start < RasterEnd )
+		{
+#if DC_FRAME_PROFILE
+			if( SpanWork.Enabled ) ++SpanWork.Links;
+#endif
+			Visible = 1;
+			Span->Start = RasterEnd;
+		}
+	}
+	Buffer.ValidLines += ValidDelta;
+	return Visible;
+}
+
 INT FSpanBuffer::TestRasterUpdate( INT RasterStartY, INT RasterEndY, FRasterSpan* Raster )
 {
 	DC_FRAME_SCOPE_NAMED(SpanUpdateScope, DCFS_SpanUpdate);
@@ -429,75 +531,7 @@ INT FSpanBuffer::TestRasterUpdate( INT RasterStartY, INT RasterEndY, FRasterSpan
 	DCFrameCount(DCFC_Spans, Max(0, RasterEndY - RasterStartY));
 	const INT FirstY = Max(RasterStartY, StartY);
 	const INT LastY = Min(RasterEndY, EndY);
-	INT Visible = 0;
-	for( INT Y = FirstY; Y < LastY; ++Y )
-	{
-		const FRasterSpan& Line = Raster[Y - RasterStartY];
-		const INT RasterStart = Line.X[0];
-		const INT RasterEnd = Line.X[1];
-		if( RasterStart >= RasterEnd )
-			continue;
-
-		FSpan** PreviousLink = &Index[Y - StartY];
-		FSpan* Span = *PreviousLink;
-		while( Span && Span->End <= RasterStart )
-		{
-			if( SpanWork.Enabled ) ++SpanWork.Links;
-			PreviousLink = &Span->Next;
-			Span = Span->Next;
-		}
-		if( !Span )
-			continue;
-		if( SpanWork.Enabled ) ++SpanWork.Links;
-
-		if( Span->Start < RasterStart )
-		{
-			Visible = 1;
-			if( Span->End > RasterEnd )
-			{
-				// The raster cuts a hole in this screen span. This node is
-				// required for future polygons even though no output is retained.
-				// Split nodes live until the span buffer is released. Reserve a
-				// small run at once instead of invoking the mem-stack allocator
-				// for each scanline cut.
-				if( !UpdateSpanRemaining )
-				{
-					UpdateSpanPool = New<FSpan>(*Mem, 32, 4);
-					UpdateSpanRemaining = 32;
-				}
-				FSpan* Right = UpdateSpanPool++;
-				--UpdateSpanRemaining;
-				Right->Start = RasterEnd;
-				Right->End = Span->End;
-				Right->Next = Span->Next;
-				Span->Next = Right;
-				Span->End = RasterStart;
-				++ValidLines;
-				if( SpanWork.Enabled ) ++SpanWork.Fragments;
-				DC_SPAN_SPLIT();
-				continue;
-			}
-			Span->End = RasterStart;
-			PreviousLink = &Span->Next;
-			Span = Span->Next;
-		}
-
-		while( Span && Span->End <= RasterEnd )
-		{
-			if( SpanWork.Enabled ) ++SpanWork.Links;
-			Visible = 1;
-			*PreviousLink = Span->Next;
-			Span = Span->Next;
-			--ValidLines;
-		}
-		if( Span && Span->Start < RasterEnd )
-		{
-			if( SpanWork.Enabled ) ++SpanWork.Links;
-			Visible = 1;
-			Span->Start = RasterEnd;
-		}
-	}
-	return Visible;
+	return DCUpdateSpanKernel(*this, FirstY, LastY, RasterStartY, Raster, SpanWork);
 }
 #endif
 
@@ -573,7 +607,7 @@ INT FSpanBuffer::CopyFromRaster( FSpanBuffer& Screen, INT RasterStartY, INT Rast
             Accept = 1;
 
             // Add partial chunk to temporary span buffer.
-            UPDATE_PREVLINK_ALLOC(Line->X[0],Min(Line->X[1], ScreenSpan->End));
+            UPDATE_PREVLINK_ALLOC(Line->X[0],Min(Line->X[1], (INT)ScreenSpan->End));
             ScreenSpan = ScreenSpan->Next;
             DC_SPAN_VISIT();
             if( !ScreenSpan )
@@ -687,7 +721,7 @@ void FSpanBuffer::MergeWith( const FSpanBuffer& Other )
             if( OtherSpan->End < ThisSpan->Start )
             {
 				// Link OtherSpan in completely before ThisSpan.
-                *PrevLink = TempSpan= New<FSpan>(*Mem,1,4);
+                *PrevLink = TempSpan= New<FSpan>(*Mem,1,DC_SPAN_ALIGN);
                 TempSpan->Start     = OtherSpan->Start;
                 TempSpan->End       = OtherSpan->End;
                 TempSpan->Next      = ThisSpan;
@@ -736,7 +770,7 @@ void FSpanBuffer::MergeWith( const FSpanBuffer& Other )
         while( OtherSpan )
         {
 			// Just append spans from OtherSpan.
-            *PrevLink = TempSpan    = New<FSpan>(*Mem,1,4);
+            *PrevLink = TempSpan    = New<FSpan>(*Mem,1,DC_SPAN_ALIGN);
             TempSpan->Start         = OtherSpan->Start;
             TempSpan->End           = OtherSpan->End;
             PrevLink                = &TempSpan->Next;
