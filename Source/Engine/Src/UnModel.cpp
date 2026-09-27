@@ -38,7 +38,13 @@ void UDatabase::Serialize( FArchive& Ar )
 	check(!GetMainFrame());
 	if( Ar.Ver() >= 40 )//oldver
 	{
-		Ar << DbNum << DbMax;
+		if( Ar.IsStateArchive() && Ar.IsSaving() )
+		{
+			INT Capacity = DbNum;
+			Ar << DbNum << Capacity;
+		}
+		else
+			Ar << DbNum << DbMax;
 	}
 	else
 	{

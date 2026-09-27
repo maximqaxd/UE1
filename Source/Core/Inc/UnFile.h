@@ -423,7 +423,7 @@ inline void* operator new(size_t Size )
 	return appMalloc( Size, "new" );
 	unguard;
 }
-inline void operator delete( void* Ptr )
+inline void operator delete( void* Ptr ) noexcept
 {
 	guard( "operator delete" );
 	appFree( Ptr );

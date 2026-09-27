@@ -115,6 +115,7 @@ struct FPropertyTag
 			ArIsSaving = 1;
 		}
 		INT Size;
+		UBOOL IsStateArchive() const {return SaveAr.IsStateArchive();}
 	private:
 		FArchive& SaveAr;
 		FArchive& operator<<( UObject*& Obj )
@@ -550,6 +551,14 @@ void UStruct::SerializeTaggedProperties( FArchive& Ar, BYTE* Data, UClass* Defau
 					INT Offset = It->Offset + Index*It->GetElementSize();
 					if( !It->Matches( Data, (Offset+It->GetElementSize()<=DefaultsCount) ? Defaults : NULL, Index) )
 					{
+						if( Ar.IsStateArchive() && Cast<UObjectProperty>(*It) )
+						{
+							UObject* Value = *(UObject**)(Data+Offset);
+							UObject* Default = Offset+It->GetElementSize()<=DefaultsCount
+								? *(UObject**)(Defaults+Offset) : NULL;
+							// Viewports and other transient references serialize as null.
+							if( Ar.MapObject(Value)==Ar.MapObject(Default) ) continue;
+						}
  						FPropertyTag Tag( Ar, *It, Index, Data + Offset );
 						Ar << Tag;
 						Tag.SerializeTaggedProperty( Ar, *It, Data + Offset );

@@ -1602,7 +1602,9 @@ void FMovingBrushTracker::UpdateBrushes( AActor** Actors, int Num )
 	for( i=0; i<NumGroupActors; i++ )
 	{
 		AMover* Actor = GroupActors[i];
-		if( Actor->SavedPos==Actor->Location && Actor->SavedRot==Actor->Rotation )
+		// Saved transforms survive serialization, but a new tracker owns no brush
+		// geometry yet. Only an already-assimilated brush can skip insertion.
+		if( Actor->bAssimilated && Actor->SavedPos==Actor->Location && Actor->SavedRot==Actor->Rotation )
 		{
 			GroupActors[i] = NULL;
 		}

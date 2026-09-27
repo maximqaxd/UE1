@@ -3392,7 +3392,7 @@ IMPLEMENT_CLASS(UEnum);
 FArchive& operator<<( FArchive& Ar, FCompactIndex& I )
 {
 	guard(FCompactIndex<<);
-	if( (!Ar.IsLoading() && !Ar.IsSaving()) || Ar.Ver()<=31 )
+	if( Ar.IsStateArchive() || (!Ar.IsLoading() && !Ar.IsSaving()) || Ar.Ver()<=31 )
 	{
 		Ar << I.Value;
 	}

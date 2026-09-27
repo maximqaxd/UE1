@@ -25,6 +25,8 @@ public:
 	virtual INT MapName( FName* Name ) {return 0;}
 	virtual INT MapObject( UObject* Object ) {return 0;}
 	virtual void CountBytes( INT Count ) {}
+	// Canonical world-state archives use fixed indices and omit allocation hints.
+	virtual UBOOL IsStateArchive() const {return 0;}
 
 	// Hardcoded datatype routines that may not be overridden.
 	FArchive& ByteOrderSerialize( void* V, INT Length )

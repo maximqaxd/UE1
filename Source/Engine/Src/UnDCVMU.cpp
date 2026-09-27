@@ -1,5 +1,6 @@
 #include "EnginePrivate.h"
 #include "UnDCVMU.h"
+#include "UnDCState.h"
 #if defined(PLATFORM_DREAMCAST)
 #include <dc/maple.h>
 #include <dc/maple/vmu.h>
@@ -81,7 +82,7 @@ static UBOOL VMUHeaderValid(const vmu_pkg_t& PackageInfo)
 	if (strcmp(PackageInfo.app_id, "UNREAL_DC") || PackageInfo.data_len < (int)sizeof(FVMUHeader))
 		return 0;
 	const FVMUHeader* Header = (const FVMUHeader*)PackageInfo.data;
-	if (memcmp(Header->Magic, "UE1SAVE", 8) || Header->Version != 1 || !Header->SaveBytes ||
+	if (memcmp(Header->Magic, "UE1SAVE", 8) || (Header->Version != 1 && Header->Version != 2) || !Header->SaveBytes ||
 		Header->SaveBytes > VMUMaxSave || Header->StateBytes > VMUMaxState)
 		return 0;
 	int Index = 0;
@@ -173,7 +174,7 @@ void DCVMURefreshMenus()
 		}
 	}
 }
-UBOOL DCVMUSave(INT Slot, const char* File, const char* Map, const TArray<BYTE>& State, char* Error)
+UBOOL DCVMUSave(INT Slot, const char* File, const char* Map, const TArray<BYTE>& State, char* Error, UBOOL Canonical)
 {
 	if (Slot < 0 || Slot > 9)
 	{
@@ -192,9 +193,19 @@ UBOOL DCVMUSave(INT Slot, const char* File, const char* Map, const TArray<BYTE>&
 		appStrcpy(Error, "Cannot open full-world snapshot");
 		return 0;
 	}
-	fseek(Snapshot, 0, SEEK_END);
+	if (fseek(Snapshot, 0, SEEK_END))
+	{
+		fclose(Snapshot);
+		appStrcpy(Error, "Cannot seek RAM save snapshot; previous save kept");
+		return 0;
+	}
 	long Size = ftell(Snapshot);
-	rewind(Snapshot);
+	if (fseek(Snapshot, 0, SEEK_SET))
+	{
+		fclose(Snapshot);
+		appStrcpy(Error, "Cannot rewind RAM save snapshot; previous save kept");
+		return 0;
+	}
 	if (Size <= 0 || Size > VMUMaxSave || State.Num() > VMUMaxState)
 	{
 		fclose(Snapshot);
@@ -210,7 +221,7 @@ UBOOL DCVMUSave(INT Slot, const char* File, const char* Map, const TArray<BYTE>&
 	}
 	FVMUHeader Header = {};
 	memcpy(Header.Magic, "UE1SAVE", 8);
-	Header.Version = 1;
+	Header.Version = Canonical ? 2 : 1;
 	Header.SaveBytes = Size;
 	Header.StateBytes = State.Num();
 	appStrncpy(Header.Map, Map, sizeof(Header.Map));
@@ -232,6 +243,7 @@ UBOOL DCVMUSave(INT Slot, const char* File, const char* Map, const TArray<BYTE>&
 	uLong CRC = crc32(0, NULL, 0);
 	int StatePos = 0;
 	long ReadBytes = 0;
+	bool ReadFailed = false;
 	while (Result == Z_OK)
 	{
 		int ChunkBytes = 0;
@@ -241,15 +253,21 @@ UBOOL DCVMUSave(INT Slot, const char* File, const char* Map, const TArray<BYTE>&
 			memcpy(Buffer, &State(StatePos), ChunkBytes);
 			StatePos += ChunkBytes;
 		}
-		else
+		else if (ReadBytes < Size)
 		{
-			ChunkBytes = fread(Buffer, 1, sizeof(Buffer), Snapshot);
+			const size_t Wanted = Min((long)sizeof(Buffer), Size - ReadBytes);
+			ChunkBytes = fread(Buffer, 1, Wanted, Snapshot);
 			ReadBytes += ChunkBytes;
+			if ((size_t)ChunkBytes != Wanted)
+			{
+				ReadFailed = true;
+				break;
+			}
 		}
 		CRC = crc32(CRC, Buffer, ChunkBytes);
 		Stream.next_in = Buffer;
 		Stream.avail_in = ChunkBytes;
-		const int Flush = (!ChunkBytes) ? Z_FINISH : Z_NO_FLUSH;
+		const int Flush = StatePos == State.Num() && ReadBytes == Size ? Z_FINISH : Z_NO_FLUSH;
 		do
 		{
 			Result = deflate(&Stream, Flush);
@@ -258,13 +276,21 @@ UBOOL DCVMUSave(INT Slot, const char* File, const char* Map, const TArray<BYTE>&
 			break;
 	}
 	int PayloadBytes = sizeof(Header) + Stream.total_out;
+	const uLong Consumed = Stream.total_in;
+	const unsigned SpaceLeft = Stream.avail_out;
+	debugf("DCVMU pack world=%ld state=%d read=%ld consumed=%lu packed=%d remaining=%u z=%d read_error=%d",
+		Size, State.Num(), ReadBytes, Consumed, PayloadBytes, SpaceLeft, Result, (int)ReadFailed);
 	deflateEnd(&Stream);
 	fclose(Snapshot);
-	if (Result != Z_STREAM_END || ReadBytes != Size)
+	if (ReadFailed || Result != Z_STREAM_END || ReadBytes != Size || Consumed != Size + State.Num())
 	{
 		free(Payload);
-		appStrcpy(Error,
-				  "Full save does not fit VMU compression budget (100 KB); previous save kept");
+		if (ReadFailed || ReadBytes != Size)
+			appStrcpy(Error, "RAM snapshot read failed; previous save kept");
+		else if (!SpaceLeft && Result != Z_STREAM_END)
+			appStrcpy(Error, "Full save exceeds 100 KB VMU payload budget; previous save kept");
+		else
+			appSprintf(Error, "Save compression failed (zlib %d); previous save kept", Result);
 		return 0;
 	}
 	Header.CRC = CRC;
@@ -356,7 +382,7 @@ UBOOL DCVMULoad(INT Slot, char* Map, char* File, TArray<BYTE>& State, char* Erro
 	}
 	FVMUHeader Header;
 	memcpy(&Header, PackageInfo.data, sizeof(Header));
-	appSprintf(File, "/ram/%s.usa", Header.Map);
+	appSprintf(File, "/ram/%s.%s", Header.Map, Header.Version == 2 ? "dsv" : "usa");
 	FILE* Snapshot = fopen(File, "wb");
 	if (!Snapshot)
 	{
@@ -414,6 +440,17 @@ UBOOL DCVMULoad(INT Slot, char* Map, char* File, TArray<BYTE>& State, char* Erro
 		return 0;
 	}
 	appStrcpy(Map, Header.Map);
+	if (Header.Version == 2)
+	{
+		char Baseline[256];
+		appSprintf(Baseline, "/cd/Maps/%s.dsb", Map);
+		if (!DCCheckWorldState(Map, Baseline, File, Error))
+		{
+			remove(File);
+			State.Empty();
+			return 0;
+		}
+	}
 	return 1;
 }
 #endif

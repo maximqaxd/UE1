@@ -24,6 +24,53 @@ void UModel::SerializeLightBits( FArchive& Ar )
 {
 	guard(UModel::SerializeLightBits);
 
+	if( Ar.IsStateArchive() )
+	{
+		// State archives are not linker files. Preserve the DAT-backed payload
+		// without casting the archive to FArchiveFileLoad or retaining a copy.
+		Ar << LightRawSize << LightBlockOffsets;
+		INT Count = LightStreamData.Size() ? LightStreamData.Size() : LightBits.Num();
+		Ar << Count;
+		if( Count < 0 || Count > 16*1024*1024 ) appErrorf("Invalid state lighting size");
+		if( Ar.IsLoading() && (!LightStreamData.Size() || Count != LightStreamData.Size()) )
+		{
+			LightStreamData = FDCStreamSlice();
+			LightBits.SetNum(Count);
+		}
+		BYTE Buffer[1024], Original[1024];
+		for( INT Offset=0; Offset<Count; )
+		{
+			INT Bytes = Min(Count-Offset, (INT)sizeof(Buffer));
+			if( Ar.IsSaving() )
+			{
+				if( LightStreamData.Size() ) LightStreamData.ReadRange(Offset, Buffer, Bytes);
+				else appMemcpy(Buffer, &LightBits(Offset), Bytes);
+			}
+			Ar.Serialize(Buffer, Bytes);
+			if( Ar.IsLoading() )
+			{
+				if( LightStreamData.Size() )
+				{
+					LightStreamData.ReadRange(Offset, Original, Bytes);
+					if( appMemcmp(Buffer, Original, Bytes) )
+					{
+						LightBits.SetNum(Count);
+						LightStreamData.Read(&LightBits(0));
+						LightStreamData = FDCStreamSlice();
+					}
+				}
+				if( !LightStreamData.Size() ) appMemcpy(&LightBits(Offset), Buffer, Bytes);
+			}
+			Offset += Bytes;
+		}
+		if( Ar.IsLoading() )
+		{
+			GDCLightCacheModel = NULL;
+			GDCLightPackedModel = NULL;
+		}
+		return;
+	}
+
 	if( !Ar.IsLoading() && !Ar.IsSaving() )
 	{
 		Ar << LightBits << LightBlockOffsets;

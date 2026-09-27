@@ -159,6 +159,41 @@ static DWORD DCStreamPosition = 0;
 static DWORD DCStreamCurrent[3];
 static DWORD DCStreamRemaining = 0;
 
+struct FDCIndexedRead
+{
+	DWORD File, Start, Count, Physical;
+};
+static TArray<FDCIndexedRead> DCIndexedReads;
+static UBOOL DCIndexed = 0;
+
+static INT CDECL DCCompareReads(const void* A, const void* B)
+{
+	const FDCIndexedRead& X = *(const FDCIndexedRead*)A;
+	const FDCIndexedRead& Y = *(const FDCIndexedRead*)B;
+	if (X.File != Y.File) return X.File < Y.File ? -1 : 1;
+	if (X.Start != Y.Start) return X.Start < Y.Start ? -1 : 1;
+	return X.Count < Y.Count ? -1 : X.Count > Y.Count ? 1 : 0;
+}
+
+static const FDCIndexedRead& DCFindRead(INT File, DWORD Offset, DWORD Count)
+{
+	INT Low=0, High=DCIndexedReads.Num();
+	while (Low<High)
+	{
+		INT Mid=Low+(High-Low)/2;
+		const FDCIndexedRead& R=DCIndexedReads(Mid);
+		if (R.File<(DWORD)File || (R.File==(DWORD)File && R.Start<=Offset)) Low=Mid+1;
+		else High=Mid;
+	}
+	for (INT i=Low-1; i>=0 && DCIndexedReads(i).File==(DWORD)File; --i)
+	{
+		const FDCIndexedRead& R=DCIndexedReads(i);
+		if (Offset>=R.Start && Offset-R.Start<R.Count && Count<=R.Count-(Offset-R.Start)) return R;
+	}
+	appErrorf("Saved world needs uncooked dependency: file=%d offset=%u count=%u", File, Offset, Count);
+	return DCIndexedReads(0);
+}
+
 static const char* DCStreamBaseName( const char* Path )
 {
 	const char* Name = Path;
@@ -329,6 +364,8 @@ void appDCStreamClose()
 		DCStream = NULL;
 	}
 	DCStreamFiles.Empty();
+	DCIndexedReads.Empty();
+	DCIndexed = 0;
 	DCStreamLinkerIndices.Empty();
 	DCStreamRemaining = 0;
 	DCStreamFlags = 0;
@@ -462,6 +499,33 @@ void appDCStreamOpen( const char* Path )
 #endif
 }
 
+void appDCStreamUseIndexedReads()
+{
+	if (!DCStream || DCStreamRecords || DCStreamRemaining || DCIndexed)
+		appErrorf("Indexed stream mode must be selected before reading dependencies");
+	if (DCStreamRecordCount > DCStreamSize/12) appErrorf("Invalid indexed stream record count");
+	DCIndexedReads.SetNum(DCStreamRecordCount);
+	DWORD Position=DCStreamPosition;
+	for (INT i=0; i<DCIndexedReads.Num(); ++i)
+	{
+		FDCIndexedRead& R=DCIndexedReads(i);
+		if (Position>DCStreamSize || DCStreamSize-Position<12 ||
+			appFseek(DCStream, Position, USEEK_SET) || appFread(&R, 1, 12, DCStream)!=12)
+			appErrorf("Truncated indexed dependency directory");
+		R.Physical=Position+12;
+		if (R.File>=(DWORD)DCStreamFiles.Num() || !R.Count || R.Count>DCStreamSize-R.Physical ||
+			R.Start>DCStreamFiles(R.File).Size || R.Count>DCStreamFiles(R.File).Size-R.Start)
+			appErrorf("Invalid indexed dependency extent");
+		Position=R.Physical+R.Count;
+		appDCLoadingProgress(0.1f * (FLOAT)(i+1) / (FLOAT)DCIndexedReads.Num());
+	}
+	if (Position!=DCStreamSize) appErrorf("Indexed dependency length mismatch");
+	appQsort(&DCIndexedReads(0), DCIndexedReads.Num(), sizeof(FDCIndexedRead), DCCompareReads);
+	DCIndexed=1;
+	debugf("DCSTREAM indexed_restore records=%d bytes=%d", DCIndexedReads.Num(),
+		DCIndexedReads.Num()*(INT)sizeof(FDCIndexedRead));
+}
+
 static void DCStreamPrepareRecord( const char* Filename, INT Offset )
 {
 	if( DCStreamRemaining )
@@ -496,6 +560,17 @@ void appDCStreamCapture( const char* Filename, INT Offset, INT Length, FDCStream
 	if( !DCStream || Length <= 0 )
 	{
 		appErrorf( "Cannot capture inactive or empty DAT resource" );
+	}
+	if (DCIndexed)
+	{
+		const FDCIndexedRead& R=DCFindRead(DCStreamFind(Filename), Offset, Length);
+		FDCStreamSlice NewSlice;
+		NewSlice.Store=DCStreamBacking;
+		++DCStreamBacking->References;
+		NewSlice.Physical=R.Physical+Offset-R.Start;
+		NewSlice.Length=Length;
+		Slice=NewSlice;
+		return;
 	}
 	DCStreamPrepareRecord( Filename, Offset );
 	INT File = DCStreamFind( Filename );
@@ -586,6 +661,16 @@ void appDCStreamRead( const char* Filename, INT Offset, void* Data, INT Length )
 	}
 	while( Length )
 	{
+		if (DCIndexed)
+		{
+			const FDCIndexedRead& R=DCFindRead(File, Offset, 1);
+			INT Count=Min(Length, (INT)(R.Count-((DWORD)Offset-R.Start)));
+			if (appFseek(DCStream, R.Physical+Offset-R.Start, USEEK_SET) ||
+				appFread(Data, 1, Count, DCStream)!=(DWORD)Count)
+				appErrorf("Indexed dependency read failed");
+			Offset+=Count; Length-=Count; Data=(BYTE*)Data+Count;
+			continue;
+		}
 		DCStreamPrepareRecord( Filename, Offset );
 		if( DCStreamCurrent[0] != (DWORD)File || DCStreamCurrent[1] != (DWORD)Offset )
 		{
@@ -610,6 +695,7 @@ void appDCStreamRead( const char* Filename, INT Offset, void* Data, INT Length )
 
 void appDCStreamFinish()
 {
+	if (DCIndexed) return;
 	if( !DCStream || DCStreamRemaining || DCStreamRecords != DCStreamRecordCount
 		|| DCStreamPosition != DCStreamSize )
 	{

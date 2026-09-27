@@ -289,7 +289,15 @@ public:
 	friend FArchive& operator<<( FArchive& Ar, FBspNode& N )
 	{
 		guard(FBspNode<<);
-		Ar << N.Plane << N.ZoneMask << N.NodeFlags << AR_INDEX(N.iVertPool) << AR_INDEX(N.iSurf);
+		Ar << N.Plane << N.ZoneMask;
+		if( Ar.IsStateArchive() && Ar.IsSaving() )
+		{
+			BYTE Flags = N.NodeFlags & ~(NF_PolyOccluded | NF_BoxOccluded);
+			Ar << Flags;
+		}
+		else
+			Ar << N.NodeFlags;
+		Ar << AR_INDEX(N.iVertPool) << AR_INDEX(N.iSurf);
 		Ar << AR_INDEX(N.iChild[0]) << AR_INDEX(N.iChild[1]) << AR_INDEX(N.iChild[2]);
 		Ar << AR_INDEX(N.iCollisionBound) << AR_INDEX(N.iRenderBound);
 		Ar << N.iZone[0] << N.iZone[1];

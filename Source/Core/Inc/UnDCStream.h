@@ -31,6 +31,8 @@ CORE_API UBOOL appDCReadDependencyFile( const char* Filename, INT Offset, void* 
 CORE_API UBOOL appDCCaptureDependencyFile( const char* Filename, INT Offset, INT Length, FDCStreamSlice& Slice );
 // Checked dependency-order replay. This is not the indexed DCD1 reader.
 CORE_API void appDCStreamOpen( const char* Path );
+// Save restoration loads dependencies in object-reference order, not startup order.
+CORE_API void appDCStreamUseIndexedReads();
 CORE_API void appDCStreamFinish();
 CORE_API void appDCStreamClose();
 // Close() only unmounts; slices may retain resource handles across mounts.

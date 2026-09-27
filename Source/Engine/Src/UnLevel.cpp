@@ -170,7 +170,7 @@ void ULevel::Serialize( FArchive& Ar )
 		Ar << TravelNames << TravelItems;
 
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
-	if( Ar.IsLoading() )
+	if( Ar.IsLoading() && !Ar.IsStateArchive() )
 		LoadDCLightmaps();
 #endif
 

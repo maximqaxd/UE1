@@ -7,6 +7,7 @@
 #include "DCUtilPrivate.h"
 #include "UnRender.h"
 #include "UnDCStream.h"
+#include "UnDCState.h"
 
 extern CORE_API FGlobalPlatform GTempPlatform;
 extern DLL_IMPORT UBOOL GTickDue;
@@ -478,6 +479,7 @@ void FDCUtil::InitEngine()
 		if( !Parse(appCmdLine(),"STREAM=",SessionPath,ARRAY_COUNT(SessionPath)) )
 			appErrorf( "VERIFYSESSION requires STREAM=<map.dcs>" );
 		appDCStreamOpen( SessionPath );
+		if( ParseParam(appCmdLine(), "DCSTATEINDEXED") ) appDCStreamUseIndexedReads();
 	}
 #endif
 
@@ -509,6 +511,15 @@ void FDCUtil::InitEngine()
 	// Init engine.
 	Engine = ConstructClassObject<UEngine>( EngineClass );
 	Engine->Init();
+#if defined(DC_RESOURCE_COOKER)
+	char StateTestPath[1024], StateTestError[256];
+	if( Parse(appCmdLine(), "DCTESTSTATE=", StateTestPath, ARRAY_COUNT(StateTestPath)) )
+	{
+		UGameEngine* Game = Cast<UGameEngine>(Engine);
+		if( !Game || !DCTestWorldState(Game->GLevel, StateTestPath, StateTestError) )
+			appErrorf("DCSTATE native test failed: %s", Game ? StateTestError : "Game engine required");
+	}
+#endif
 	if( BakeLightmaps )
 	{
 		char Command[2304];
@@ -1007,6 +1018,15 @@ void FDCUtil::AuditSplit( const char* MapPath, const char* OutPath )
 			Node.Plane.X, Node.Plane.Y, Node.Plane.Z,
 			BoundsMin.X, BoundsMin.Y, BoundsMin.Z,
 			BoundsMax.X, BoundsMax.Y, BoundsMax.Z );
+		if( Surf && Surf->Texture &&
+			((Back > 0 && Back < Zones && Cast<ASkyZoneInfo>(Model->Nodes->Zones[Back].ZoneActor)) ||
+			 (Front > 0 && Front < Zones && Cast<ASkyZoneInfo>(Model->Nodes->Zones[Front].ZoneActor))) )
+		{
+			UTexture* Texture=Surf->Texture;
+			fprintf(Out,"SKYTEXTURE\t%d\t%d\t%d\t%s\t%08x\t%08x\t%d\t%d\t%d\n",
+				i,Back,Front,Texture->GetPathName(),Flags,Texture->PolyFlags,
+				Texture->USize,Texture->VSize,(INT)Texture->Format);
+		}
 	}
 	for( INT i = 0; i < Level->Num(); ++i )
 	{

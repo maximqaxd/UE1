@@ -11,6 +11,7 @@
 #include "UnRender.h"
 #include "UnNet.h"
 #include "UnDCVMU.h"
+#include "UnDCState.h"
 
 /*-----------------------------------------------------------------------------
 	Object class implementation.
@@ -20,6 +21,15 @@ IMPLEMENT_CLASS(UGameEngine);
 
 #if defined(PLATFORM_DREAMCAST) || defined(DC_RESOURCE_COOKER)
 extern CORE_API void appDCSetLinkerTablesReleased( UBOOL Released );
+
+static void DCAttachSavedPlayer(APlayerPawn* Pawn, UViewport* Viewport)
+{
+	if (Viewport->Actor) Viewport->Actor->Player = NULL;
+	Pawn->Player = Viewport;
+	Viewport->Actor = Pawn;
+	// SetPlayer invokes Possess, which resets saved pawn properties/script state.
+	debugf("DCSTATE viewport_reattached player=%s", Pawn->GetName());
+}
 
 static UBOOL GDCGameLinkersReleased = 0;
 
@@ -315,7 +325,11 @@ static char GDCVMUFile[128];
 static INT GDCVMUReadySlot = -1;
 static void DCVMUCaptureState(ULevel* Level, TArray<BYTE>& Bytes)
 {
-	FDCVMUState S = {};
+	// The campaign ledger alone exceeds the Dreamcast's 32 KB thread stack.
+	// Populate the owned output buffer directly, without a local struct copy.
+	Bytes.Empty();
+	Bytes.AddZeroed(sizeof(FDCVMUState));
+	FDCVMUState& S = *(FDCVMUState*)&Bytes(0);
 	S.Version = 1;
 	for (INT i = 0; i < Level->Num(); ++i)
 		if (APlayerPawn* P = Cast<APlayerPawn>(Level->Actors(i)))
@@ -330,9 +344,6 @@ static void DCVMUCaptureState(ULevel* Level, TArray<BYTE>& Bytes)
 	appMemcpy(S.TerraniuxEver, GDCTerraniuxEver, sizeof(S.TerraniuxEver));
 	S.TerraniuxOpen = GDCTerraniuxOpen;
 	appMemcpy(S.SkyTownPending, GDCSkyTownPending, sizeof(S.SkyTownPending));
-	Bytes.Empty();
-	Bytes.Add(sizeof(S));
-	appMemcpy(&Bytes(0), &S, sizeof(S));
 }
 static UBOOL DCVMURestoreState(const TArray<BYTE>& Bytes)
 {
@@ -846,8 +857,23 @@ void UGameEngine::Init()
 			appErrorf("Saved player is absent from VMU snapshot");
 		if (SavedPlayer)
 		{
-			SavedPlayer->SetPlayer(Viewport);
+			DCAttachSavedPlayer(SavedPlayer, Viewport);
 			GDCVMUReadySlot = -1;
+		}
+		else
+#endif
+#if defined(DC_RESOURCE_COOKER)
+		if( ParseParam(appCmdLine(), "DCSTATEINDEXED") )
+		{
+			APlayerPawn* SavedPlayer = NULL;
+			for( INT i=0; i<GLevel->Num(); ++i )
+				if( APlayerPawn* P=Cast<APlayerPawn>(GLevel->Actors(i)) )
+				{
+					if( SavedPlayer ) appErrorf("DCSTATE test has multiple players");
+					SavedPlayer=P;
+				}
+			if( !SavedPlayer ) appErrorf("DCSTATE test has no saved player");
+			DCAttachSavedPlayer(SavedPlayer, Viewport);
 		}
 		else
 #endif
@@ -1177,7 +1203,10 @@ UBOOL UGameEngine::Browse( FURL URL, char* Error256 )
 		}
 		if (GDCVMUReadySlot != appAtoi(Option))
 			return 0;
-		appSprintf(Temp, "%s?load", GDCVMUFile);
+		if (appStrstr(GDCVMUFile, ".dsv"))
+			appSprintf(Temp, "%s?load", *URL.Map);
+		else
+			appSprintf(Temp, "%s?load", GDCVMUFile);
 #else
 		appSprintf(Temp, "%s\\Save%i.usa?load", GSys->SavePath, appAtoi(Option));
 #endif
@@ -1267,6 +1296,7 @@ UBOOL UGameEngine::Browse( FURL URL, char* Error256 )
 ULevel* UGameEngine::LoadMap( const FURL& URL, UPendingLevel* Pending, char* Error256 )
 {
 	guard(UGameEngine::LoadMap);
+	UBOOL WorldStateRestored = 0;
 	check(!GIsEditor);
 	Error256[0]=0;
 	FString Str;
@@ -1383,6 +1413,27 @@ ULevel* UGameEngine::LoadMap( const FURL& URL, UPendingLevel* Pending, char* Err
 	if( MapParent && Guid )
 		GObj.GetPackageLinker( MapParent, NULL, LOAD_Verify | LOAD_Throw | LOAD_KeepImports | LOAD_NoWarn, NULL, Guid );
 	GLevel = LoadObject<ULevel>( MapParent, "MyLevel", *URL.Map, LOAD_KeepImports | LOAD_NoFail, NULL );
+#if defined(DC_RESOURCE_COOKER)
+	char RestoreFile[1024], RestoreBase[1024], RestoreError[256];
+	if( Parse(appCmdLine(), "DCRESTORESTATE=", RestoreFile, ARRAY_COUNT(RestoreFile)) )
+	{
+		if( !Parse(appCmdLine(), "DCRESTOREBASE=", RestoreBase, ARRAY_COUNT(RestoreBase)) )
+			appErrorf("DCRESTORESTATE requires DCRESTOREBASE");
+		if( !DCReadWorldState(GLevel, RestoreBase, RestoreFile, RestoreError) )
+			appErrorf("DCSTATE cold restore failed: %s", RestoreError);
+		WorldStateRestored = 1;
+	}
+#endif
+#if defined(PLATFORM_DREAMCAST)
+	if (GDCVMUReadySlot >= 0 && appStrstr(GDCVMUFile, ".dsv") && URL.HasOption("load"))
+	{
+		char Baseline[256], StateError[256];
+		appSprintf(Baseline, "/cd/Maps/%s.dsb", GLevel->GetParent()->GetName());
+		if (!DCReadWorldState(GLevel, Baseline, GDCVMUFile, StateError))
+			appErrorf("DCSTATE restore failed: %s", StateError);
+		WorldStateRestored = 1;
+	}
+#endif
 #if defined(PLATFORM_DREAMCAST)
 	appDCDatStats();
 #endif
@@ -1476,6 +1527,16 @@ ULevel* UGameEngine::LoadMap( const FURL& URL, UPendingLevel* Pending, char* Err
 		&& !GLevel->NetDriver
 		&& appDCStreamActive() )
 		DCReleaseGameLinkers();
+#endif
+
+#if defined(DC_RESOURCE_COOKER)
+	if( appStricmp(GLevel->GetParent()->GetName(), "Entry") )
+	{
+		char StateBaseline[1024], StateError[256];
+		if( Parse(appCmdLine(), "DCCOOKSTATE=", StateBaseline, ARRAY_COUNT(StateBaseline)) )
+			if( !DCCookStateBaseline(GLevel, StateBaseline, StateError) )
+				appErrorf("DCSTATE baseline failed: %s", StateError);
+	}
 #endif
 #if defined(PLATFORM_DREAMCAST)
 	DumpMemStatsDC("post-linkers");
@@ -1658,6 +1719,20 @@ ULevel* UGameEngine::LoadMap( const FURL& URL, UPendingLevel* Pending, char* Err
 
 	// Rearrange actors: static first, then others.
 	guard(Rearrange);
+	if (WorldStateRestored)
+	{
+		// Saved actor slots already have runtime ordering. Preserve deletion holes
+		// and actor indices; only the nonserialized traversal boundary is rebuilt.
+		GLevel->iFirstDynamicActor = GLevel->Num();
+		for (INT i=2; i<GLevel->Num(); ++i)
+			if (GLevel->Actors(i) && !GLevel->Actors(i)->bStatic)
+			{
+				GLevel->iFirstDynamicActor = i;
+				break;
+			}
+	}
+	else
+	{
 	TArray<AActor*> Actors;
 	Actors.AddItem(GLevel->Element(0));
 	Actors.AddItem(GLevel->Element(1));
@@ -1674,6 +1749,7 @@ ULevel* UGameEngine::LoadMap( const FURL& URL, UPendingLevel* Pending, char* Err
 	for( i=0; i<Actors.Num(); i++ )
 		GLevel->Element(i) = Actors(i);
 	Actors.Empty();
+	}
 	unguard;
 
 #if defined(PLATFORM_DREAMCAST)
@@ -1718,6 +1794,23 @@ ULevel* UGameEngine::LoadMap( const FURL& URL, UPendingLevel* Pending, char* Err
 		DumpMemStatsDC("pre-movers");
 #endif
 		GLevel->BrushTracker = GNewBrushTracker( GLevel );
+#if defined(DC_RESOURCE_COOKER)
+		if( WorldStateRestored )
+		{
+			INT Movers=0;
+			for( INT i=0; i<GLevel->Num(); ++i )
+			{
+				AActor* Actor=GLevel->Actors(i);
+				if( Actor && Actor->IsMovingBrush() )
+				{
+					if( !Actor->bAssimilated )
+						appErrorf("DCSTATE restored mover missing from tracker: %s", Actor->GetPathName());
+					++Movers;
+				}
+			}
+			debugf("DCSTATE restored_movers_verified=%d", Movers);
+		}
+#endif
 #if defined(PLATFORM_DREAMCAST)
 		DumpMemStatsDC("post-movers");
 #endif
@@ -2151,7 +2244,7 @@ void UGameEngine::SaveGame(INT Position)
 		return;
 	}
 	appStrcpy(GSys->SavePath, "/ram");
-	appSprintf(Filename, "/ram/%s.usa", GLevel->GetParent()->GetName());
+	appSprintf(Filename, "/ram/%s.dsv", GLevel->GetParent()->GetName());
 #else
 	appMkdir(GSys->SavePath);
 	appSprintf(Filename, "%s\\Save%i.usa", GSys->SavePath, Position);
@@ -2163,9 +2256,18 @@ void UGameEngine::SaveGame(INT Position)
 	{
 		GLevel->BrushTracker->Exit();
 		delete GLevel->BrushTracker;
+		GLevel->BrushTracker = NULL;
 	}
 	GLevel->CleanupDestroyed(1);
+#if defined(PLATFORM_DREAMCAST)
+	char Baseline[256], StateError[256];
+	appSprintf(Baseline, "/cd/Maps/%s.dsb", GLevel->GetParent()->GetName());
+	UBOOL StateWritten = DCWriteWorldState(GLevel, Baseline, Filename, StateError);
+	if (!StateWritten) debugf("DCSTATE save failed: %s", StateError);
+	if (StateWritten)
+#else
 	if (GObj.SavePackage(GLevel->GetParent(), GLevel, 0, Filename))
+#endif
 	{
 #if defined(PLATFORM_DREAMCAST)
 		TArray<BYTE> State;
@@ -2173,7 +2275,7 @@ void UGameEngine::SaveGame(INT Position)
 		DCTerraniuxCapture(GLevel);
 		DCVMUCaptureState(GLevel, State);
 		char Error[256];
-		if (DCVMUSave(Position, Filename, GLevel->GetParent()->GetName(), State, Error))
+		if (DCVMUSave(Position, Filename, GLevel->GetParent()->GetName(), State, Error, 1))
 			SetProgress("VMU save complete", "Full world saved", 5.f);
 		else
 		{
@@ -2207,7 +2309,7 @@ void UGameEngine::SaveGame(INT Position)
 #if defined(PLATFORM_DREAMCAST)
 	else
 	{
-		SetProgress("VMU save failed","Could not finalize RAM snapshot; previous VMU save kept",8.f);
+		SetProgress("VMU save failed",StateError,8.f);
 		DCVMURefreshMenus();
 	}
 #endif
