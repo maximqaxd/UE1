@@ -59,7 +59,7 @@ static UBOOL IsDreamcastStarfield( UTexture* Texture )
 		|| !appStricmp(Path, "GenFluid.Sky.Ntskyt");
 }
 
-enum { DCProceduralFrames = 8 };
+enum { DCProceduralFrames = 16, DCProceduralFPS = 16 };
 
 static UBOOL IsAnimatedDreamcastProcedural( UTexture* Texture )
 {
@@ -331,8 +331,8 @@ void FDCUtil::ProcessResources( const char* PackagePath, const char* ResourceDir
 				It->Palette = NULL;
 				It->PrimeCount = 0;
 				It->PrimeCurrent = 0;
-				It->MinFrameRate = 8.f;
-				It->MaxFrameRate = 8.f;
+				It->MinFrameRate = DCProceduralFPS;
+				It->MaxFrameRate = DCProceduralFPS;
 				It->TextureFlags &= ~(TF_Parametric | TF_RealtimeChanged | TF_RealtimePalette | TF_Realtime);
 				if( !AllFramesIdentical )
 				{
@@ -345,7 +345,7 @@ void FDCUtil::ProcessResources( const char* PackagePath, const char* ResourceDir
 				BakeDreamcastProcedural( *It );
 				for( INT Frame = 0; Frame < DCProceduralFrames; ++Frame )
 				{
-					It->Tick( 1.f / 8.f );
+					It->Tick( 1.f / DCProceduralFPS );
 					char Extension[32];
 					snprintf( Extension, sizeof(Extension), "frame%02d.png", Frame );
 					ResourceFile( Path, ARRAY_COUNT(Path), ResourceDir, *It, Extension );
