@@ -125,6 +125,13 @@ void UAICAAudioSubsystem::PostEditChange()
 		DopplerFactor = 0.f;
 	AmbientFactor = Clamp( AmbientFactor, 0.f, 1.f );
 
+	if( Initialized )
+	{
+		for( INT i = 0; i < MAX_SOURCES; ++i )
+			UpdateVoice( i );
+		UpdateMusicBuffers();
+	}
+
 	unguard;
 }
 
@@ -489,28 +496,8 @@ void UAICAAudioSubsystem::UpdateVoice( INT Num )
 	BYTE Volume = CalculateVolume( Voice.Volume, Voice.Location, Voice.Radius );
 	BYTE Pan = LocationToPan( Voice.Location, Voice.Radius );
 
-	// Get stream info to update
-	if( Voice.StreamId < AUDIO_ENGINE_MAX_STREAMS )
-	{
-		// It's a stream - AudioEngine handles updates internally
-		// We could check if it's still playing here if needed
-		struct stream_info* StreamInfo = AudioEngine_getStreamInfo( Voice.StreamId );
-		if( StreamInfo && !StreamInfo->playing )
-		{
-			// Stream finished, stop the voice
-			StopVoice( Num );
-		}
-	}
-	else
-	{
-		// It's an SFX - try to update volume/pan if we can find the channel
-		int aica_channel = AudioEngine_GetSfxChannel( Voice.StreamId );
-		if( aica_channel >= 0 )
-		{
-			// Update volume and pan on the AICA channel
-			aica_volpan_chn( aica_channel, Volume, Pan );
-		}
-	}
+	if( !AudioEngine_Update( Voice.StreamId, Volume, Pan, Pan ) )
+		StopVoice( Num );
 
 	unguard;
 }
@@ -529,6 +516,8 @@ void UAICAAudioSubsystem::StopVoice( INT Num )
 	Voice.Id = 0;
 	Voice.Sound = NULL;
 	Voice.Actor = NULL;
+	Voice.Priority = 0.f;
+	Voice.Looping = false;
 
 	unguard;
 }
@@ -571,6 +560,12 @@ UBOOL UAICAAudioSubsystem::PlaySound( AActor* Actor, INT Id, USound* Sound, FVec
 		return false;
 
 	INT StreamId = (INT)(DWORD)Sound->Handle - 1;
+
+	// AudioEngine has one playback per sample. Retire the previous owner
+	// before restarting it so stale voices cannot stop or repan the new shot.
+	for( INT i = 0; i < MAX_SOURCES; ++i )
+		if( &Voices[i] == Voice || Voices[i].StreamId == StreamId )
+			StopVoice( i );
 
 	Voice->Id = Id;
 	Voice->StreamId = StreamId;
@@ -657,6 +652,15 @@ void UAICAAudioSubsystem::Update( FPointRegion Region, FCoords& Listener )
 			// If not, start it.
 			if( AmbientNum == MAX_SOURCES )
 			{
+				// A sample has one AudioEngine playback. Another emitter must not
+				// steal it every frame and repeatedly restart the first few samples.
+				for( AmbientNum = 0; AmbientNum < MAX_SOURCES; ++AmbientNum )
+					if( Voices[AmbientNum].Sound == Actor->AmbientSound
+						&& Voices[AmbientNum].StreamId != INVALID_STREAM_ID
+						&& SOUND_SLOT_IS( Voices[AmbientNum].Id, SLOT_Ambient ) )
+						break;
+				if( AmbientNum != MAX_SOURCES )
+					continue;
 				FLOAT Vol = AmbientFactor * Actor->SoundVolume / 255.f;
 				FLOAT Rad = Actor->WorldSoundRadius();
 				FLOAT Pitch = Actor->SoundPitch / 64.f;
@@ -851,12 +855,7 @@ void UAICAAudioSubsystem::UpdateMusicBuffers()
 	if( Track->StreamId == INVALID_STREAM_ID )
 		return;
 
-	// The worker thread refills and retires the stream by itself. All this has
-	// to notice is a non-looping track that has reached its end.
-	// TODO: MusicVolume changes and MTRAN_Fade transitions are not applied to a
-	// stream that is already playing; the volume is only sampled at PlayMusic.
-	stream_info* Info = AudioEngine_getStreamInfo( Track->StreamId );
-	if( Info && !Info->playing )
+	if( !AudioEngine_Update( Track->StreamId, MusicVolumeByte(), AICA_PAN_LEFT, AICA_PAN_RIGHT ) )
 	{
 		AudioEngine_Unload( Track->StreamId );
 		Track->StreamId = INVALID_STREAM_ID;

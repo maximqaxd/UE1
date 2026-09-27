@@ -422,9 +422,12 @@ int getSfxChannelIndex(int nStream) {
 }
 
 int AudioEngine_Stop(int nStream) {
+	std::lock_guard<std::mutex> lock(channel_mtx);
+	if( nStream < 0 || nStream >= AUDIO_ENGINE_MAX_STREAMS + AUDIO_ENGINE_MAX_SFX )
+		return -1;
 	if(nStream < AUDIO_ENGINE_MAX_STREAMS) {
 		debugf("Stopping Stream: %d\n", nStream);
-		if(!streams[nStream].fd) {
+		if(!streams[nStream].playing) {
 			return 0;
 		}
 
@@ -452,6 +455,37 @@ int AudioEngine_Stop(int nStream) {
 	}
 
 	return nStream;
+}
+
+bool AudioEngine_Update(int nStream, uint8_t volume, uint8_t panl, uint8_t panr)
+{
+	std::lock_guard<std::mutex> lock(channel_mtx);
+	if( nStream < 0 || nStream >= AUDIO_ENGINE_MAX_STREAMS + AUDIO_ENGINE_MAX_SFX )
+		return false;
+	if( nStream < AUDIO_ENGINE_MAX_STREAMS )
+	{
+		stream_info& stream = streams[nStream];
+		if( !stream.playing ) return false;
+		const uint8_t left = stream.stereo ? panl : (panl + panr) / 2;
+		if( stream.vol != volume || stream.pan[0] != left )
+			aica_volpan_chn(stream.mapped_ch[0], volume, left);
+		if( stream.stereo && (stream.vol != volume || stream.pan[1] != panr) )
+			aica_volpan_chn(stream.mapped_ch[1], volume, panr);
+		stream.vol = volume;
+		stream.pan[0] = left;
+		stream.pan[1] = panr;
+		return true;
+	}
+	nStream -= AUDIO_ENGINE_MAX_STREAMS;
+	const int channel = getSfxChannelIndex(nStream);
+	if( channel < 0 ) return false;
+	sfx_info& sample = sfx[nStream];
+	const uint8_t pan = (panl + panr) / 2;
+	if( sample.vol != volume || sample.pan != pan )
+		aica_volpan_chn(sfx_channels[channel].mapped_ch, volume, pan);
+	sample.vol = volume;
+	sample.pan = pan;
+	return true;
 }
 
 int AudioEngine_Unload(int nStream) {

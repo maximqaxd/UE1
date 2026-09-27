@@ -138,6 +138,8 @@ void AudioEngine_Play(
 	uint32_t loop_offset,
 	uint32_t loop_end = 0 );
 int AudioEngine_Stop(int nStream);
+// Updates a live playback under the channel lock; false means it has ended.
+bool AudioEngine_Update(int nStream, uint8_t volume, uint8_t panl, uint8_t panr);
 int AudioEngine_Unload(int nStream);
 struct sfx_info * AudioEngine_getSfxInfo(int nStream);
 struct stream_info * AudioEngine_getStreamInfo(int nStream);
