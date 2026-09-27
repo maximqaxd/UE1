@@ -13,22 +13,22 @@
 
 // ASCII pixel art: 32x32 monochrome Unreal-inspired U/ring, centered on 48x32.
 static const char* const Logo[32] = {
-	"............########............", "........###############.........",
-	"......#####..........#####......", ".....###................###.....",
-	"....###..................###....", "...###....................###...",
-	"..###......................###..", "..##..###............###....##..",
-	".##...#####........#####.....##.", ".##....######....######......##.",
-	"##......######..######........##", "##.......#####..#####.........##",
-	"##.......#####..#####.........##", "##.......#####..#####.........##",
-	"##.......#####..#####.........##", "##.......#####..#####.........##",
-	"##.......#####..#####.........##", "##.......#####..#####.........##",
-	"##.......#####..#####.........##", "##.......#####..#####.........##",
-	"##.......#####..#####.........##", ".##......############........##.",
-	".##.....#############........##.", "..##...####..########.......##..",
-	"..###.........########.....###..", "...###..........######....###...",
-	"....###...........###....###....", ".....###................###.....",
-	"......#####..........#####......", "........###############.........",
-	"...........##########...........", "................................"};
+    "............########............", "........###############.........",
+    "......#####..........#####......", ".....###................###.....",
+    "....###..................###....", "...###....................###...",
+    "..###......................###..", "..##..###............###....##..",
+    ".##...#####........#####.....##.", ".##....######....######......##.",
+    "##......######..######........##", "##.......#####..#####.........##",
+    "##.......#####..#####.........##", "##.......#####..#####.........##",
+    "##.......#####..#####.........##", "##.......#####..#####.........##",
+    "##.......#####..#####.........##", "##.......#####..#####.........##",
+    "##.......#####..#####.........##", "##.......#####..#####.........##",
+    "##.......#####..#####.........##", ".##......############........##.",
+    ".##.....#############........##.", "..##...####..########.......##..",
+    "..###.........########.....###..", "...###..........######....###...",
+    "....###...........###....###....", ".....###................###.....",
+    "......#####..........#####......", "........###############.........",
+    "...........##########...........", "................................"};
 
 void DCVMUStartup()
 {
@@ -82,21 +82,21 @@ static UBOOL VMUHeaderValid(const vmu_pkg_t& PackageInfo)
 	if (strcmp(PackageInfo.app_id, "UNREAL_DC") || PackageInfo.data_len < (int)sizeof(FVMUHeader))
 		return 0;
 	const FVMUHeader* Header = (const FVMUHeader*)PackageInfo.data;
-	if (memcmp(Header->Magic, "UE1SAVE", 8) || (Header->Version != 1 && Header->Version != 2) || !Header->SaveBytes ||
-		Header->SaveBytes > VMUMaxSave || Header->StateBytes > VMUMaxState)
+	if (memcmp(Header->Magic, "UE1SAVE", 8) || (Header->Version != 1 && Header->Version != 2) ||
+	    !Header->SaveBytes || Header->SaveBytes > VMUMaxSave || Header->StateBytes > VMUMaxState)
 		return 0;
 	int Index = 0;
 	for (; Index < 63 && Header->Map[Index]; ++Index)
 	{
 		char Character = Header->Map[Index];
 		if (!((Character >= 'a' && Character <= 'z') || (Character >= 'A' && Character <= 'Z') ||
-			  (Character >= '0' && Character <= '9') || Character == '_'))
+		      (Character >= '0' && Character <= '9') || Character == '_'))
 			return 0;
 	}
 	return Index > 0 && Header->Map[Index] == 0;
 }
 static int VMURead(maple_device_t* Dev, int Slot, int Bank, void** Data, int* Bytes,
-				   vmu_pkg_t* PackageInfo)
+                   vmu_pkg_t* PackageInfo)
 {
 	char Name[16];
 	VMUName(Name, Slot, Bank);
@@ -104,7 +104,7 @@ static int VMURead(maple_device_t* Dev, int Slot, int Bank, void** Data, int* By
 	if (vmufs_read(Dev, Name, Data, Bytes) < 0)
 		return 0;
 	if (*Bytes < 128 || vmu_pkg_parse((uint8_t*)*Data, *Bytes, PackageInfo) < 0 ||
-		!VMUHeaderValid(*PackageInfo))
+	    !VMUHeaderValid(*PackageInfo))
 	{
 		free(*Data);
 		*Data = NULL;
@@ -158,8 +158,8 @@ void DCVMURefreshMenus()
 	for (TObjectIterator<UClass> MenuClass; MenuClass; ++MenuClass)
 	{
 		if (appStricmp(MenuClass->GetName(), "UnrealSlotMenu") &&
-			appStricmp(MenuClass->GetName(), "UnrealSaveMenu") &&
-			appStricmp(MenuClass->GetName(), "UnrealLoadMenu"))
+		    appStricmp(MenuClass->GetName(), "UnrealSaveMenu") &&
+		    appStricmp(MenuClass->GetName(), "UnrealLoadMenu"))
 			continue;
 		for (TFieldIterator<UStringProperty> SlotProperty(*MenuClass); SlotProperty; ++SlotProperty)
 		{
@@ -168,13 +168,14 @@ void DCVMURefreshMenus()
 			for (int Slot = 0; Slot < 9; ++Slot)
 			{
 				char* Destination = (char*)MenuClass->GetDefaultObject() + SlotProperty->Offset +
-					Slot * SlotProperty->GetElementSize();
+				                    Slot * SlotProperty->GetElementSize();
 				appStrncpy(Destination, Names[Slot], SlotProperty->GetElementSize());
 			}
 		}
 	}
 }
-UBOOL DCVMUSave(INT Slot, const char* File, const char* Map, const TArray<BYTE>& State, char* Error, UBOOL Canonical)
+UBOOL DCVMUSave(INT Slot, const char* File, const char* Map, const TArray<BYTE>& State, char* Error,
+                UBOOL Canonical)
 {
 	if (Slot < 0 || Slot > 9)
 	{
@@ -278,8 +279,10 @@ UBOOL DCVMUSave(INT Slot, const char* File, const char* Map, const TArray<BYTE>&
 	int PayloadBytes = sizeof(Header) + Stream.total_out;
 	const uLong Consumed = Stream.total_in;
 	const unsigned SpaceLeft = Stream.avail_out;
-	debugf("DCVMU pack world=%ld state=%d read=%ld consumed=%lu packed=%d remaining=%u z=%d read_error=%d",
-		Size, State.Num(), ReadBytes, Consumed, PayloadBytes, SpaceLeft, Result, (int)ReadFailed);
+	debugf("DCVMU pack world=%ld state=%d read=%ld consumed=%lu packed=%d remaining=%u z=%d "
+	       "read_error=%d",
+	       Size, State.Num(), ReadBytes, Consumed, PayloadBytes, SpaceLeft, Result,
+	       (int)ReadFailed);
 	deflateEnd(&Stream);
 	fclose(Snapshot);
 	if (ReadFailed || Result != Z_STREAM_END || ReadBytes != Size || Consumed != Size + State.Num())
@@ -326,7 +329,7 @@ UBOOL DCVMUSave(INT Slot, const char* File, const char* Map, const TArray<BYTE>&
 	{
 		free(Package);
 		appSprintf(Error, "VMU needs %d free blocks; has %d. Previous save kept", RequiredBlocks,
-				   Max(0, FreeBlocks));
+		           Max(0, FreeBlocks));
 		return 0;
 	}
 	char Name[16];
@@ -336,8 +339,8 @@ UBOOL DCVMUSave(INT Slot, const char* File, const char* Map, const TArray<BYTE>&
 	int CheckBytes = 0;
 	vmu_pkg_t Checked = {};
 	const UBOOL Valid = Result == 0 &&
-						VMURead(Dev, Slot, Bank == 0 ? 1 : 0, &Check, &CheckBytes, &Checked) &&
-						Checked.data_len == PayloadBytes;
+	                    VMURead(Dev, Slot, Bank == 0 ? 1 : 0, &Check, &CheckBytes, &Checked) &&
+	                    Checked.data_len == PayloadBytes;
 	// Compare the complete stored package, including payload and KOS CRC.
 	UBOOL Verified = Valid && CheckBytes >= PackageBytes && !memcmp(Check, Package, PackageBytes);
 	free(Check);
@@ -353,7 +356,7 @@ UBOOL DCVMUSave(INT Slot, const char* File, const char* Map, const TArray<BYTE>&
 		vmufs_delete(Dev, Name);
 	}
 	debugf("DCVMU saved slot=%d raw=%ld compressed=%d blocks=%d", Slot, Size, PayloadBytes,
-		   RequiredBlocks);
+	       RequiredBlocks);
 	return 1;
 }
 
@@ -407,19 +410,19 @@ UBOOL DCVMULoad(INT Slot, char* Map, char* File, TArray<BYTE>& State, char* Erro
 		Result = inflate(&Stream, Z_NO_FLUSH);
 		int ChunkBytes = sizeof(Buffer) - Stream.avail_out;
 		if ((Result != Z_OK && Result != Z_STREAM_END) ||
-			Total + ChunkBytes > Header.StateBytes + Header.SaveBytes)
+		    Total + ChunkBytes > Header.StateBytes + Header.SaveBytes)
 		{
 			ValidStream = false;
 			break;
 		}
 		CRC = crc32(CRC, Buffer, ChunkBytes);
 		int StateChunkBytes =
-			Total < Header.StateBytes ? Min((DWORD)ChunkBytes, Header.StateBytes - Total) : 0;
+		    Total < Header.StateBytes ? Min((DWORD)ChunkBytes, Header.StateBytes - Total) : 0;
 		if (StateChunkBytes)
 			memcpy(&State(Total), Buffer, StateChunkBytes);
 		if (ChunkBytes > StateChunkBytes &&
-			fwrite(Buffer + StateChunkBytes, 1, ChunkBytes - StateChunkBytes, Snapshot) !=
-				(size_t)(ChunkBytes - StateChunkBytes))
+		    fwrite(Buffer + StateChunkBytes, 1, ChunkBytes - StateChunkBytes, Snapshot) !=
+		        (size_t)(ChunkBytes - StateChunkBytes))
 		{
 			ValidStream = false;
 			break;

@@ -1052,8 +1052,7 @@ void UPVRRenderDevice::EmitHeader( pvr_list_t List, DWORD PolyFlags, const FTexS
 	}
 	else if( List == PVR_LIST_PT_POLY )
 	{
-		// Keep KOS' punch-through blend state: transparent cutout texels must
-		// preserve the background rather than overwrite it with their RGB.
+		// Punch-through requires alpha blending for cutout texels.
 		Cxt.blend.src = PVR_BLEND_SRCALPHA;
 		Cxt.blend.dst = PVR_BLEND_INVSRCALPHA;
 	}
