@@ -59,7 +59,7 @@ static UBOOL IsDreamcastStarfield( UTexture* Texture )
 		|| !appStricmp(Path, "GenFluid.Sky.Ntskyt");
 }
 
-enum { DCProceduralFrames = 16, DCProceduralFPS = 16 };
+enum { DCProceduralFrames = 8, DCProceduralFPS = 8 };
 
 static UBOOL IsAnimatedDreamcastProcedural( UTexture* Texture )
 {
