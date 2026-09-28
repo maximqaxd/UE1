@@ -18,6 +18,7 @@ Source/UnrealED/obj
 /Unreal.iso
 /Unreal.ini
 /Unreal - Copy.ini
+/research/
 
 # Generated Python and reverse-engineering output.
 __pycache__/
