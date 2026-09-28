@@ -1,133 +1,78 @@
-## What?
+# Unreal Engine 1 for Sega Dreamcast
 
-Unreal Engine 1 v200 source with modifications to make it run on modern systems.  
-Requires assets from the original Unreal v200 retail release or from the v205 demo. Other versions have not been tested.
+An Unreal Engine 1 v200 port to Sega Dreamcast. Game assets are not included. To cook the complete single-player campaign, you need an original Unreal v200 retail installation. The v205 demo is not sufficient for the full campaign cook; other releases have not been tested.
 
-## Changes from original source
+## Dreamcast: cook assets and build a CDI
 
-* Added SDL2 windowing/client driver (NSDLDrv).
-* Added GLES2 and fixed pipeline GL graphics drivers (NOpenGLESDrv and NOpenGLDrv).
-* Added OpenAL + libxmp audio driver (NOpenALDrv).
-* Added GCC support and fixed a bunch of related bugs.
-* Supported platforms: Windows (x86), Linux (x86, ARM32) and PSVita (ARM32).
-* Editor UI is not supported.
+The retail `Unreal` folder must contain `System`, `Maps`, `Textures`, `Sounds`, and `Music`. Cooking writes to a separate directory; do not use an existing `gamedata` directory.
 
-## Running
+### Prebuilt release
 
-### Linux and Windows
-1. Install the original retail v200 release of Unreal or the v205 demo.
-2. Copy over the new files:
-   * If you downloaded a ZIP from the Releases section:
-     1. Unzip said ZIP to the `Unreal` folder. Overwrite everything.
-   * If you built the game yourself:
-     1. Copy the .dll/.so/.exe/.bin files you built to `Unreal/System`. Overwrite everything.
-     2. Copy the contents of `Engine/Config` to `Unreal/System`. Overwrite everything.
-3. Run `System/Unreal.exe`.
+Place `UE1-Dreamcast-2026-09-28.zip` beside the retail `Unreal` folder and extract it there. Its top-level `Unreal/` directory merges with the retail folder, adding `DCUtil.bin`, its `.so` libraries, `Profile/`, `Unreal.elf`, `IP.BIN`, and this guide directly under `Unreal/`. It does not replace the retail packages or `System/Unreal.ini`. The Dreamcast `Unreal.ini` stays in `Profile/` until the cooker copies it into the separate `gamedata` output.
 
-### PSVita
-1. Ensure you have kubridge and libshacccg installed.
-2. Install the original retail v200 release of Unreal or the v205 demo onto your PC.
-3. Copy the contents of the `Unreal` folder to `ux0:/data/unreal/` on your PSVita.
-4. Copy the `unreal` folder from `unreal-arm-psvita-gcc.zip` to `ux0:/data/`. Overwrite everything.
-5. Install `unreal.vpk` from `unreal-arm-psvita-gcc.zip`.
-6. Run Unreal.
+From the retail folder, run:
 
-## Building
+```sh
+cd Unreal
+./DCUtil.bin --cook=everything --source=. --output=../gamedata
+mkdcdisc -e Unreal.elf -D ../gamedata -p IP.BIN -N -o ../unreal.cdi
+```
 
-### Windows x86 (MSYS2/MinGW)
-1. Install MSYS2.
-2. Open the `MINGW32` prompt. **Do not** use the `MINGW64` or `MSYS` prompts.
-3. Install dependencies: `pacman -S git make mingw-w64-i686-toolchain mingw-w64-i686-cmake mingw-w64-i686-SDL2 mingw-w64-i686-openal mingw-w64-i686-libxmp`
-4. Build:
-   ```
-   cmake -G"Unix Makefiles" -Bbuild Source
-   cmake --build build -j4 -- -O && cmake --install build
-   ```
-5. The resulting files will be in `build/RelWithDebInfo` by default.
+Wait for `DC cook complete: .../gamedata` before running `mkdcdisc`. A full cook can take roughly 20–25 minutes, depending on the machine. The output is `unreal.cdi` beside the retail folder. For another cook, choose a new output directory outside `Unreal` and pass that same directory to `mkdcdisc -D`.
 
-### Windows x86 (Visual Studio)
-1. Install VS2019 or VS2022. Dependencies are included in the repo.
-2. Build:
-   ```
-   cmake -Bbuild -G"Visual Studio 16 2019" -A Win32 Source # or -G"Visual Studio 17 2022"
-   cmake --build build && cmake --install build --config RelWithDebInfo
-   ```
-3. The resulting files will be in `build/RelWithDebInfo` by default.
+### Build the tools and Dreamcast executable from source (Linux/WSL)
 
-### Linux x86
-1. Install git, make, cmake, gcc, g++, sdl2, libopenal, libxmp.
-   * If cross-compiling from x86_64, also install 32-bit versions of the libraries and gcc-multilib/g++-multilib.
-   * On Debian x86_64 this process looks something like this:
-     ```
-     sudo dpkg --add-architecture i386
-     sudo apt-get -y update
-     sudo apt-get -y install git gcc g++ gcc-multilib g++-multilib make cmake
-     sudo apt-get -y install libsdl2-dev libopenal-dev libxmp-dev libsdl2-dev:i386 libopenal-dev:i386 libxmp-dev:i386
-     ```
-2. Build:
-   ```
-   cmake -G"Unix Makefiles" -DCMAKE_C_FLAGS=-m32 -DCMAKE_CXX_FLAGS=-m32 -Bbuild Source # if on x86_64
-   cmake -G"Unix Makefiles" -Bbuild Source # if on i686
-   cmake --build build -j4 -- -O && cmake --install build
-   ```
-3. The resulting files will be in `build/RelWithDebInfo` by default.
+On Ubuntu/WSL, install the host build and cooking dependencies. The host cooker is a 32-bit x86 program, so it needs the i386 libraries even on a 64-bit Ubuntu installation:
 
-### Linux ARM
-1. Install git, make, cmake, gcc, g++, sdl2, libopenal, libxmp.
-   * If cross-compiling from ARM64, also install armhf versions of the libraries and arm-linux-gnueabihf-gcc/g++.
-   * On Debian x86_64 or ARM64 this process looks something like this:
-     ```
-     sudo dpkg --add-architecture armhf
-     sudo apt-get -y update
-     sudo apt-get -y install git gcc g++ crossbuild-essential-armhf make cmake
-     sudo apt-get -y install libsdl2-dev libopenal-dev libxmp-dev libsdl2-dev:armhf libopenal-dev:armhf libxmp-dev:armhf
-     ```
-2. Build:
-   ```
-   cmake -G"Unix Makefiles" -DCMAKE_C_COMPILER=arm-linux-gnueabihf-gcc-12 -DCMAKE_CXX_COMPILER=arm-linux-gnueabihf-g++-12 -Bbuild Source
-   cmake --build build -j4 -- -O && cmake --install build
-   ```
-3. The resulting files will be in `build/RelWithDebInfo` by default.
+```sh
+sudo dpkg --add-architecture i386
+sudo apt update
+sudo apt install build-essential cmake gcc-multilib g++-multilib \
+  libc6-dev:i386 libsdl2-dev:i386 libgles2-mesa-dev:i386 zlib1g-dev:i386 \
+  imagemagick ffmpeg unzip
+ffmpeg -hide_banner -demuxers | grep libopenmpt
+```
 
-### PSVita (on Linux or WSL)
-1. Follow the instructions above to build the game for ARM Linux, **but** add `-DBUILD_FOR_PSVITA=ON` to the first cmake invocation, i.e.:
-   ```
-   cmake -G"Unix Makefiles" -DCMAKE_CROSSCOMPILING=ON -DCMAKE_C_COMPILER=arm-linux-gnueabihf-gcc-12 -DCMAKE_CXX_COMPILER=arm-linux-gnueabihf-g++-12 -Bbuild -DBUILD_FOR_PSVITA=ON Source
-   ```
-3. Install VitaSDK with all VDPM packages and ensure the `VITASDK` environment variable is set and `$VITASDK/bin` is in your `PATH`.
-4. Build and install vitaGL:
-   ```
-   git clone --recursive https://github.com/Rinnegatamante/vitaGL
-   make -C vitaGL HAVE_GLSL_SUPPORT=1 CIRCULAR_VERTEX_POOL=2 -j install
-   ```
-5. Build and install SDL2:
-   ```
-   git clone --recursive --branch vitagl https://github.com/Northfear/SDL
-   pushd SDL
-   cmake -S. -Bbuild -DCMAKE_TOOLCHAIN_FILE=${VITASDK}/share/vita.toolchain.cmake -DCMAKE_BUILD_TYPE=Release -DVIDEO_VITA_VGL=ON
-   cmake --build build -- -j
-   cmake --install build
-   popd
-   ```
-6. Build and install vita-rtld:
-   ```
-   git clone https://github.com/fgsfdsfgs/vita-rtld
-   pushd vita-rtld
-   cmake -S. -Bbuild -DCMAKE_TOOLCHAIN_FILE=${VITASDK}/share/vita.toolchain.cmake -DCMAKE_BUILD_TYPE=Release
-   cmake --build build -- -j
-   cmake --install build
-   popd
-   ```
-7. Build the VPK:
-   ```
-   cmake -G"Unix Makefiles" -DCMAKE_TOOLCHAIN_FILE="${VITASDK}/share/vita.toolchain.cmake" -Bbuild_psvita -DCMAKE_BUILD_TYPE=RelWithDebInfo Source/PSVitaLoader
-   cmake --build build_psvita -j
-   ```
-8. The libraries will be in `build/RelWithDebInfo` by default. They have to be copied to `ux0:/data/unreal/System`.
-9. The VPK will be in `build_psvita/`. It has to be installed on the target PSVita.
+The last command must show the `libopenmpt` demuxer; a different FFmpeg build without it cannot cook the music. The cook also uses KallistiOS utilities `pvrtex` and `wav2adpcm` (normally under `/opt/toolchains/dc/kos/utils/`). For Dreamcast builds, install the SH-4 toolchain, KallistiOS, kos-ports zlib and libsh4zam, and `mkdcdisc`. KallistiOS provides `makeip` for the CDI target. Prebuilt releases still need the KallistiOS conversion utilities and `mkdcdisc`, but not the SH-4 compiler.
+
+Before sourcing KallistiOS, check `/opt/toolchains/dc/kos/environ.sh` for the intended compiler settings:
+
+```sh
+export KOS_CFLAGS="${KOS_CFLAGS} -Os"
+export KOS_SH4_PRECISION="-m4-single-only"
+```
+
+Then build the host cooker and Dreamcast executable:
+
+```sh
+source /opt/toolchains/dc/kos/environ.sh
+
+cmake -S Source -B build_host_dcutil -G "Unix Makefiles" \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DBUILD_DCUTIL=ON -DDC_RESOURCE_COOKER=ON \
+  -DBUILD_UNREAL=OFF -DBUILD_NOPENALDRV=OFF
+cmake --build build_host_dcutil -j"$(nproc)"
+
+cmake -S Source -B build_dc -G "Unix Makefiles" \
+  -DCMAKE_TOOLCHAIN_FILE="$KOS_CMAKE_TOOLCHAIN" \
+  -DPLATFORM_DREAMCAST=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build_dc --target Unreal -j"$(nproc)"
+```
+
+This produces `build_host_dcutil/DCUtil/DCUtil.bin` and `build_dc/Unreal/Unreal.elf`. With the retail `Unreal` folder in the repository root, cook and build the disc image:
+
+```sh
+./build_host_dcutil/DCUtil/DCUtil.bin --cook=everything --source=Unreal --output=gamedata
+cmake -S Source -B build_dc \
+  -DDREAMCAST_BUILD_CDI=ON \
+  -DDREAMCAST_GAME_DATA="$PWD/gamedata" \
+  -DDREAMCAST_IP_BIN="$PWD/gamedata/IP.BIN" \
+  -DDREAMCAST_CDI_OUTPUT="$PWD/unreal.cdi"
+cmake --build build_dc --target cdi -j"$(nproc)"
+```
+
+The `cdi` target creates `gamedata/IP.BIN` from `Source/ip.txt` and calls `mkdcdisc` with the built ELF and cooked data. The cooker stages the Dreamcast `Unreal.ini` and other profile resources automatically; no manual configuration copy is needed.
 
 ## Note
 
-Unreal Engine, Unreal and any related trademarks or copyrights are owned by Epic Games. This repository is not affiliated with or endorsed by Epic Games. 
-This is based on the v200 source available elsewhere on the Internet, with assets and third party proprietary libraries removed. 
-Do not use for commercial purposes.
+Unreal Engine, Unreal, and related trademarks and copyrights are owned by Epic Games. This repository is not affiliated with or endorsed by Epic Games. It is based on the v200 source available elsewhere on the Internet, with game assets and third-party proprietary libraries removed. Do not use for commercial purposes.
