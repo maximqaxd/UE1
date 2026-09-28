@@ -18,11 +18,16 @@ cd Unreal
 mkdcdisc -e Unreal.elf -D ../gamedata -p IP.BIN -N -o ../unreal.cdi
 ```
 
-Wait for `DC cook complete: .../gamedata` before running `mkdcdisc`. A full cook can take roughly 20–25 minutes, depending on the machine. The output is `unreal.cdi` beside the retail folder. For another cook, choose a new output directory outside `Unreal` and pass that same directory to `mkdcdisc -D`.
+Wait for `DC cook complete: .../gamedata` before running `mkdcdisc`. A full cook can take roughly 20–25 minutes, depending on the machine. The output is `unreal.cdi` beside the retail folder.
 
-### Build the tools and Dreamcast executable from source (Linux/WSL)
+### Prerequisites
 
-On Ubuntu/WSL, install the host build and cooking dependencies. The host cooker is a 32-bit x86 program, so it needs the i386 libraries even on a 64-bit Ubuntu installation:
+- KallistiOS
+- zlib
+- SH4ZAM
+- mkdcdisc
+
+On Ubuntu/WSL, install the host build and cooking dependencies:
 
 ```sh
 sudo dpkg --add-architecture i386
@@ -30,10 +35,9 @@ sudo apt update
 sudo apt install build-essential cmake gcc-multilib g++-multilib \
   libc6-dev:i386 libsdl2-dev:i386 libgles2-mesa-dev:i386 zlib1g-dev:i386 \
   imagemagick ffmpeg unzip
-ffmpeg -hide_banner -demuxers | grep libopenmpt
 ```
 
-The last command must show the `libopenmpt` demuxer; a different FFmpeg build without it cannot cook the music. The cook also uses KallistiOS utilities `pvrtex` and `wav2adpcm` (normally under `/opt/toolchains/dc/kos/utils/`). For Dreamcast builds, install the SH-4 toolchain, KallistiOS, kos-ports zlib and libsh4zam, and `mkdcdisc`. KallistiOS provides `makeip` for the CDI target. Prebuilt releases still need the KallistiOS conversion utilities and `mkdcdisc`, but not the SH-4 compiler.
+### Build the tools and Dreamcast executable from source (Linux/WSL)
 
 Before sourcing KallistiOS, check `/opt/toolchains/dc/kos/environ.sh` for the intended compiler settings:
 
