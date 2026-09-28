@@ -204,6 +204,28 @@ struct Pipeline
 		Write(Work / "done" / Task, Bytes(Text.begin(), Text.end()));
 	}
 
+	fs::path WorkerBinary() const
+	{
+		const auto Flat = Build / "DCUtil.bin";
+		return fs::is_regular_file(Flat) ? Flat : Build / "DCUtil/DCUtil.bin";
+	}
+
+	std::vector<fs::path> Libraries() const
+	{
+		std::vector<fs::path> Result;
+		if (fs::is_regular_file(Build / "DCUtil.bin"))
+			return Files(Build, {".so"});
+		for (const auto& Directory : fs::directory_iterator(Build))
+			if (Directory.is_directory() && Directory.path().filename() != "RelWithDebInfo")
+			{
+				const auto Lib = Directory.path() / (Directory.path().filename().string() + ".so");
+				if (fs::is_regular_file(Lib))
+					Result.push_back(Lib);
+			}
+		std::sort(Result.begin(), Result.end());
+		return Result;
+	}
+
 	std::string Fingerprint()
 	{
 		std::string Text = "DCUtil cook v1\n" + Source.string() + "\nmap=" + Lower(OnlyMap) + "\n";
@@ -215,20 +237,11 @@ struct Pipeline
 				Add(File);
 		for (const auto& File : Files(Profile, {".ini", ".dcb"}))
 			Add(File);
-		const auto Worker = Build / "DCUtil/DCUtil.bin";
+		const auto Worker = WorkerBinary();
 		// Resume uses the preserved worker, not a newly linked executable.
 		Text += Worker.generic_string() + "\t" + Checksum(Resume ? Runner / "DCUtil.bin" : Worker) +
 		        "\n";
-		std::vector<fs::path> Libraries;
-		for (const auto& Directory : fs::directory_iterator(Build))
-			if (Directory.is_directory())
-			{
-				const auto Lib = Directory.path() / (Directory.path().filename().string() + ".so");
-				if (fs::is_regular_file(Lib))
-					Libraries.push_back(Lib);
-			}
-		std::sort(Libraries.begin(), Libraries.end());
-		for (const auto& Lib : Libraries)
+		for (const auto& Lib : Libraries())
 			Add(Lib);
 		for (const auto& Tool : {Tools.Pvrtex, Tools.Adpcm, Tools.Ffmpeg, Tools.Convert})
 		{
@@ -313,7 +326,7 @@ struct Pipeline
 		for (const char* Dir : {"System", "Maps", "Textures", "Sounds", "Music"})
 			if (!fs::is_directory(Source / Dir))
 				throw std::runtime_error(std::string("Missing source folder: ") + Dir);
-		if (!fs::is_regular_file(Build / "DCUtil/DCUtil.bin"))
+		if (!fs::is_regular_file(WorkerBinary()))
 			throw std::runtime_error("Missing host DCUtil build");
 		for (const char* Name :
 		     {"Default.ini", "Unreal.ini", "DCMover.ini", "loadbg.dcb", "loadbar.dcb"})
@@ -379,12 +392,9 @@ struct Pipeline
 			     Files(Source / Dir, {".u", ".unr", ".utx", ".uax", ".umx", ".ini", ".int"}))
 				fs::copy_file(Path, Stage / Dir / Path.filename());
 		}
-		for (const auto& Directory : fs::directory_iterator(Build))
-			if (Directory.is_directory() && Directory.path().filename() != "RelWithDebInfo")
-				for (const auto& Lib : Files(Directory.path(), {".so"}))
-					if (Lib.stem() == Directory.path().filename())
-						fs::copy_file(Lib, Runner / Lib.filename());
-		fs::copy_file(Build / "DCUtil/DCUtil.bin", Runner / "DCUtil.bin");
+		for (const auto& Lib : Libraries())
+			fs::copy_file(Lib, Runner / Lib.filename());
+		fs::copy_file(WorkerBinary(), Runner / "DCUtil.bin");
 		for (const auto& Path : Files(Profile, {".ini"}))
 		{
 			fs::copy_file(Path, Runner / Path.filename());
@@ -740,7 +750,9 @@ bool DCCookPipelineCommand(int Argc, const char** Argv, int& Result)
 		}
 		const auto Executable = fs::canonical(Argv[0]);
 		if (P.Build.empty())
-			P.Build = Executable.parent_path().parent_path();
+			P.Build = fs::is_regular_file(Executable.parent_path() / "Core.so")
+			              ? Executable.parent_path()
+			              : Executable.parent_path().parent_path();
 		if (P.Profile.empty())
 			P.Profile = Executable.parent_path() / "Profile";
 		if (P.Output.empty())
