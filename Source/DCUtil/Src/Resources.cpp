@@ -213,6 +213,8 @@ void FDCUtil::ProcessResources( const char* PackagePath, const char* ResourceDir
 
 	// Full package loading preserves script exports and resource namespaces.
 	GIsEditor = true;
+	printf( "DCCOOK loading %s\n", PackagePath );
+	fflush( stdout );
 	UPackage* Package = Cast<UPackage>( GObj.LoadPackage( NULL, PackagePath, LOAD_KeepImports | LOAD_NoFail ) );
 	if( !Package )
 	{
@@ -220,6 +222,9 @@ void FDCUtil::ProcessResources( const char* PackagePath, const char* ResourceDir
 	}
 
 	UBOOL Import = OutPath && OutPath[0];
+	printf( "DCCOOK loaded %s; %s resources\n", Package->GetName(),
+		Import ? "importing" : "exporting" );
+	fflush( stdout );
 	INT Sounds = 0;
 	INT Textures = 0;
 	INT Music = 0;
@@ -260,7 +265,14 @@ void FDCUtil::ProcessResources( const char* PackagePath, const char* ResourceDir
 			WriteResource( Path, It->Data );
 		}
 		++Sounds;
+		if( !(Sounds % 32) )
+		{
+			printf( "DCCOOK %s sounds=%d\n", Package->GetName(), Sounds );
+			fflush( stdout );
+		}
 	}
+	printf( "DCCOOK %s sounds complete=%d\n", Package->GetName(), Sounds );
+	fflush( stdout );
 
 	for( TObjectIterator<UTexture> It; It; ++It )
 	{
@@ -366,6 +378,11 @@ void FDCUtil::ProcessResources( const char* PackagePath, const char* ResourceDir
 				}
 			}
 			++Textures;
+			if( !(Textures % 32) )
+			{
+				printf( "DCCOOK %s textures=%d\n", Package->GetName(), Textures );
+				fflush( stdout );
+			}
 			continue;
 		}
 
@@ -418,13 +435,22 @@ void FDCUtil::ProcessResources( const char* PackagePath, const char* ResourceDir
 			}
 		}
 		++Textures;
+		if( !(Textures % 32) )
+		{
+			printf( "DCCOOK %s textures=%d\n", Package->GetName(), Textures );
+			fflush( stdout );
+		}
 	}
+	printf( "DCCOOK %s textures complete=%d\n", Package->GetName(), Textures );
+	fflush( stdout );
 
 	if( Import )
 	{
 		INT PackagePathLength = appStrlen(PackagePath);
 		UBOOL CompactMapBsp = PackagePathLength >= 4
 			&& !appStricmp(PackagePath + PackagePathLength - 4, ".unr");
+		printf( "DCCOOK %s cooking meshes and BSP\n", Package->GetName() );
+		fflush( stdout );
 
 		// EntryGameInfo inherits UnrealGameInfo's MaleOne fallback. The shipped
 		// Dreamcast campaign selects FemaleOne explicitly, so make the global
@@ -437,6 +463,11 @@ void FDCUtil::ProcessResources( const char* PackagePath, const char* ResourceDir
 			{
 				It->CookDCMesh();
 				++Meshes;
+				if( !(Meshes % 16) )
+				{
+					printf( "DCCOOK %s meshes=%d\n", Package->GetName(), Meshes );
+					fflush( stdout );
+				}
 			}
 		}
 
@@ -469,6 +500,8 @@ void FDCUtil::ProcessResources( const char* PackagePath, const char* ResourceDir
 				++Music;
 			}
 		}
+		printf( "DCCOOK %s meshes complete=%d models=%d\n", Package->GetName(), Meshes, Models );
+		fflush( stdout );
 
 		if( !Sounds && !Textures && !Music && !Meshes && !Models )
 		{
@@ -513,6 +546,8 @@ void FDCUtil::ProcessResources( const char* PackagePath, const char* ResourceDir
 			appErrorf( "Source package has no GUID: %s", PackagePath );
 		}
 		const FGuid SourceGuid = Source->Heritage(Source->Heritage.Num() - 1);
+		printf( "DCCOOK saving %s meshes=%d models=%d\n", Package->GetName(), Meshes, Models );
+		fflush( stdout );
 		if( !GObj.SavePackage( Package, NULL, RF_Standalone, OutPath, 0, &SourceGuid ) )
 		{
 			appErrorf( "Cannot save cooked package %s", OutPath );

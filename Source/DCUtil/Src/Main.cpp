@@ -1541,8 +1541,18 @@ void FDCUtil::Main( )
 	unguard;
 }
 
+extern bool DCCookStreamCommand(int Argc, const char** Argv, int& Result);
+extern bool DCCookPipelineCommand(int Argc, const char** Argv, int& Result);
+
 int main( int argc, const char** argv )
 {
+	int CookResult;
+	if( DCCookPipelineCommand(argc, argv, CookResult)
+		|| DCCookStreamCommand(argc, argv, CookResult) )
+	{
+		fflush(NULL);
+		_Exit(CookResult);
+	}
 	hInstance = NULL;
 	appSetCmdLine( argc, argv );
 

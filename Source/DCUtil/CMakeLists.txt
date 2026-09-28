@@ -1,8 +1,14 @@
 project(DCUtil)
 
-set(SRC_FILES "Src/Main.cpp" "Src/Texture.cpp" "Src/Resources.cpp" "Src/SplitBsp.cpp")
+set(SRC_FILES "Src/Main.cpp" "Src/Texture.cpp" "Src/Resources.cpp" "Src/SplitBsp.cpp"
+  "Src/CookStream.cpp" "Src/CookTools.cpp" "Src/CookMedia.cpp" "Src/CookLightmaps.cpp"
+  "Src/CookPipeline.cpp")
 
 add_executable(${PROJECT_NAME} ${SRC_FILES})
+target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_17)
+find_package(ZLIB REQUIRED)
+target_link_libraries(${PROJECT_NAME} ZLIB::ZLIB)
+file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/Profile" DESTINATION "${CMAKE_CURRENT_BINARY_DIR}")
 
 target_include_directories(${PROJECT_NAME}
   PUBLIC
