@@ -12,6 +12,8 @@ Source/UnrealED/obj
 # Cooked/runtime inputs and generated disc images.
 /build_cooked/
 /gamedata/
+/gamedata-new/
+/gamedata-new.cook/
 /Unreal/
 /Unreal_orig/
 /unreal.cdi
@@ -19,6 +21,7 @@ Source/UnrealED/obj
 /Unreal.ini
 /Unreal - Copy.ini
 /research/
+/release/
 
 # Generated Python and reverse-engineering output.
 __pycache__/
